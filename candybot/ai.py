@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 _SCORE_RE = re.compile(r"\{\s*\"score\"[\s\S]*?\}")
 
+# 思考段：闭合的 <think>…</think> 整块删除；未闭合（如被 max_tokens 截断）时
+# 从 <think> 起全部删除；孤立的 </think> 一并清理。思考内容绝不能参与判定或回复。
+_THINK_RE = re.compile(r"<think>[\s\S]*?</think>|<think>[\s\S]*$|</think>")
+
 # 基础 emoji 字符范围。刻意不含几何符号（U+25A0~25FF）等普通文本符号区，
 # 颜文字 (=^ω^=)、(・ω・) 与箭头 ↑ 不会误伤。
 _EMOJI_CHARS = (
@@ -127,7 +131,8 @@ class AIClient:
             model=self._judge_model,
             messages=chat,
             temperature=0.2,
-            max_tokens=200,
+            # 推理型 judge 模型的思考段会占掉不少 token，上限太小会把结论截掉
+            max_tokens=1000,
             timeout=self._generation.timeout_seconds,
         )
         raw = (response.choices[0].message.content or "").strip()
@@ -135,28 +140,17 @@ class AIClient:
 
     @staticmethod
     def _parse_verdict(raw: str) -> JudgeVerdict:
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict) and "score" in obj:
-                return JudgeVerdict(
-                    score=max(0, min(10, int(obj["score"]))),
-                    reason=str(obj.get("reason", ""))[:100],
-                )
-        except (ValueError, TypeError):
-            pass
-        match = _SCORE_RE.search(raw)
-        if match:
-            try:
-                obj = json.loads(match.group(0))
-                return JudgeVerdict(
-                    score=max(0, min(10, int(obj["score"]))),
-                    reason=str(obj.get("reason", ""))[:100],
-                )
-            except (ValueError, TypeError):
-                pass
-        num = re.search(r"\b(\d|10)\b", raw)
+        # 判定只看思考段之外的内容：推理文本里的编号、锚点分数都不能当结果
+        visible = _strip_think(raw)
+        if "<think>" in raw and "</think>" not in raw:
+            logger.warning("judge 输出含未闭合的 <think>，疑似被 max_tokens 截断")
+            return JudgeVerdict(score=0, reason="思考被截断，输出解析失败")
+        obj = _verdict_from_json(visible)
+        if obj is not None:
+            return obj
+        num = re.search(r"\b(\d|10)\b", visible)
         if num:
-            logger.warning("解析到非结构化输出，原文: %s", raw)
+            logger.warning("解析到非结构化输出，原文: %s", visible[:200])
             return JudgeVerdict(score=int(num.group(1)), reason="从非结构化输出中提取")
         logger.warning("judge 输出无法解析：%r", raw[:200])
         return JudgeVerdict(score=0, reason="输出解析失败")
@@ -245,10 +239,33 @@ class AIClient:
         return desc or None
 
 
+def _strip_think(text: str) -> str:
+    """删除 <think> 思考段（含未闭合截断的），返回剩余正文。"""
+    return _THINK_RE.sub("", text).strip()
+
+
+def _verdict_from_json(text: str) -> JudgeVerdict | None:
+    """从整段文本或其中嵌入的 {"score": …} 对象解析判定，失败返回 None。"""
+    candidates = [text]
+    match = _SCORE_RE.search(text)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict) and "score" in obj:
+            return JudgeVerdict(
+                score=max(0, min(10, int(obj["score"]))),
+                reason=str(obj.get("reason", ""))[:100],
+            )
+    return None
+
+
 def _strip_noise(text: str) -> str:
     """去掉模型偶尔加的引号包裹和 <think> 段落。"""
-    if "<think>" in text:
-        text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    text = _strip_think(text)
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'“”":
         text = text[1:-1].strip()
     return text

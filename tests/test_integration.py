@@ -53,6 +53,18 @@ def group_event(mid: int, text: str, *, at_me=False, uid=1000, group_id=42):
     }
 
 
+def recall_event(mid: int, *, uid=1000, group_id=42):
+    return {
+        "post_type": "notice",
+        "notice_type": "group_recall",
+        "group_id": group_id,
+        "user_id": uid,
+        "operator_id": uid,
+        "message_id": mid,
+        "time": int(time.time()),
+    }
+
+
 class FakeSnowluma:
     def __init__(self):
         self.sent: list[tuple[int, str]] = []
@@ -196,5 +208,40 @@ async def test_duplicate_events_processed_once(tmp_path):
         await wait_until(lambda: len(bot._snowluma.sent) == 1)
         await drain_tick()
         assert len(bot._snowluma.sent) == 1      # 只回了一次
+    finally:
+        await bot.stop()
+
+
+async def test_group_recall_removes_local_record(tmp_path):
+    bot = await build_bot(tmp_path)
+    try:
+        await bot._on_event(group_event(51, "这条稍后会被撤回"))
+        assert len(bot._memory.get(42)) == 1
+
+        await bot._on_event(recall_event(51))
+        assert len(bot._memory.get(42)) == 0
+        # 落盘文件同步清空，重启后不会复活
+        lines = (tmp_path / "data" / "memory" / "42.jsonl").read_text().splitlines()
+        assert lines == []
+    finally:
+        await bot.stop()
+
+
+async def test_recall_ignores_unknown_and_other_notices(tmp_path):
+    bot = await build_bot(tmp_path, verdict_score=2)
+    try:
+        await bot._on_event(group_event(61, "留在记忆里"))
+        # 撤回一条从未记录过的消息：不应报错，也不影响已有记录
+        await bot._on_event(recall_event(9999))
+        # 其他通知类型（如入群）应被静默忽略
+        other = {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "group_id": 42,
+            "user_id": 61,
+            "time": int(time.time()),
+        }
+        await bot._on_event(other)
+        assert [r.message_id for r in bot._memory.get(42).tail(10)] == [61]
     finally:
         await bot.stop()

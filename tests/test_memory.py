@@ -67,6 +67,27 @@ def test_find_by_message_id_includes_self_records(tmp_path):
     assert found is not None and found.is_self
 
 
+def test_remove_deletes_record_and_file_line(tmp_path):
+    mgr = MemoryManager(tmp_path)
+    mem = mgr.get(42)
+    for i in range(5):
+        mem.append(make_record(i))
+    assert mem.remove(2) is True
+    assert [r.message_id for r in mem.tail(10)] == [0, 1, 3, 4]
+
+    # 落盘已同步：新实例（模拟重启）后撤回的消息不会复活
+    mgr2 = MemoryManager(tmp_path)
+    assert [r.message_id for r in mgr2.get(42).tail(10)] == [0, 1, 3, 4]
+
+
+def test_remove_missing_returns_false(tmp_path):
+    mgr = MemoryManager(tmp_path)
+    mem = mgr.get(3)
+    mem.append(make_record(0))
+    assert mem.remove(99) is False
+    assert [r.message_id for r in mem.tail(10)] == [0]
+
+
 def test_corrupt_line_skipped(tmp_path):
     d = tmp_path / "memory"
     d.mkdir()

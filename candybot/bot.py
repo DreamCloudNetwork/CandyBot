@@ -130,6 +130,9 @@ class CandyBot:
         post_type = event.get("post_type")
         if post_type == "meta_event":
             return  # 心跳/生命周期
+        if post_type == "notice":
+            await self._on_notice(event)
+            return
         if post_type != "message":
             return
 
@@ -175,6 +178,25 @@ class CandyBot:
         except (TypeError, ValueError):
             return None
         return self._memory.get(group_id).find_by_message_id(ref_id)
+
+    async def _on_notice(self, event: dict) -> None:
+        """通知类事件：目前只处理群撤回——删除本地记录的对应消息。"""
+        if event.get("notice_type") != "group_recall":
+            return
+        try:
+            group_id = int(event["group_id"])
+            message_id = int(event["message_id"])
+        except (KeyError, TypeError, ValueError):
+            logger.debug("缺少字段的撤回事件，忽略：%r", event)
+            return
+        if self._settings.profile_for(group_id) is None:
+            return
+        if self._memory.get(group_id).remove(message_id):
+            logger.info("群 %d：消息 %d 已撤回，已删除本地记录", group_id, message_id)
+        else:
+            logger.debug(
+                "群 %d：撤回的消息 %d 不在本地记忆中", group_id, message_id
+            )
 
     # ------------------------------------------------------------ 群内串行队列
 

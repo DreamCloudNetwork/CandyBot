@@ -25,37 +25,37 @@ uv run main.py                   # 启动
 
 ## 配置项说明（config.json）
 
-| 段 | 字段 | 说明 |
-|---|---|---|
-| bot | self_qq | 机器人自己的 QQ 号，用于识别 @我 / 回复我 / 过滤自己消息 |
-| | listen_host / listen_port | 事件上报服务监听地址（默认仅本机） |
-| | event_secret | 非 null 时校验上报请求的 HMAC-SHA1 签名（OneBot v11 标准） |
-| | data_dir | 记忆等运行时数据的目录 |
-| | log_level | 日志级别：DEBUG/INFO/WARNING/ERROR/CRITICAL（默认 INFO）。设 DEBUG 可查看每次 LLM 请求的完整 prompt 与收到的消息 |
-| groups | （群号为键） | **白名单**。只有列出的群会被服务；条目内可覆盖 persona/threshold/cooldown/context_size，留空/-1/null 表示继承 groups_default；`enabled: false` 单独禁用该群 |
-| | — 特例 | `groups` 为空对象且 `groups_default.enabled=true` 时服务所有群（不建议） |
-| groups_default | … | 兜底人设与参数；groups 为空时即全群配置 |
-| ai_backend | base_url / api_key | OpenAI 兼容 API 地址与密钥 |
-| models | judge | 判断是否参与话题的模型（建议便宜快速的，如 glm-4-flash） |
-| | reply | 参与回答生成回复的模型 |
-| | vision | describe 多模态模式用的视觉模型，其他模式可不填 |
-| generation | reply_max_tokens / temperature | 回复生成长度与随机性 |
-| | max_context_chars | 喂给模型的历史上下文总字符上限 |
-| | timeout_seconds | 单次 LLM 调用超时 |
-| multimodal | mode | `placeholder` 图片→"[图片]"；`describe` 视觉模型转文字；`direct` 图片 base64 直传（要求 reply 模型多模态） |
-| | download_media | 是否下载图片（direct/describe 需要） |
-| rate_limit | global_daily_limit | 全局每日主动发言上限，null 不限（@必答不受限） |
-| snowluma | mcp_command / mcp_args | MCP server 启动命令（默认 npx -y @snowluma/mcp） |
-| | endpoint | SnowLuma OneBot HTTP 端点；**允许私网需显式设置 allow_private_endpoint=true** |
-| | api_key | accessToken，作为 Bearer token 传给 MCP |
-| | mode | 必须 `"write"`，否则无法发言 |
+| 段             | 字段                           | 说明                                                                                                                                                        |
+|----------------|--------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| bot            | self_qq                        | 机器人自己的 QQ 号，用于识别 @我 / 回复我 / 过滤自己消息                                                                                                    |
+|                | listen_host / listen_port      | 事件上报服务监听地址（默认仅本机）                                                                                                                          |
+|                | event_secret                   | 非 null 时校验上报请求的 HMAC-SHA1 签名（OneBot v11 标准）                                                                                                  |
+|                | data_dir                       | 记忆等运行时数据的目录                                                                                                                                      |
+|                | log_level                      | 日志级别：DEBUG/INFO/WARNING/ERROR/CRITICAL（默认 INFO）。设 DEBUG 可查看每次 LLM 请求的完整 prompt 与收到的消息                                            |
+| groups         | （群号为键）                   | **白名单**。只有列出的群会被服务；条目内可覆盖 persona/threshold/cooldown/context_size，留空/-1/null 表示继承 groups_default；`enabled: false` 单独禁用该群 |
+|                | — 特例                         | `groups` 为空对象且 `groups_default.enabled=true` 时服务所有群（不建议）                                                                                    |
+| groups_default | …                              | 兜底人设与参数；groups 为空时即全群配置                                                                                                                     |
+| ai_backend     | base_url / api_key             | OpenAI 兼容 API 地址与密钥                                                                                                                                  |
+| models         | judge                          | 判断是否参与话题的模型（建议便宜快速的，如 glm-4-flash）                                                                                                    |
+|                | reply                          | 参与回答生成回复的模型                                                                                                                                      |
+|                | vision                         | describe 多模态模式用的视觉模型，其他模式可不填                                                                                                             |
+| generation     | reply_max_tokens / temperature | 回复生成长度与随机性                                                                                                                                        |
+|                | max_context_chars              | 喂给模型的历史上下文总字符上限                                                                                                                              |
+|                | timeout_seconds                | 单次 LLM 调用超时                                                                                                                                           |
+| multimodal     | mode                           | `placeholder` 图片→"[图片]"；`describe` 视觉模型转文字；`direct` 图片 base64 直传（要求 reply 模型多模态）                                                  |
+|                | download_media                 | 是否下载图片（direct/describe 需要）                                                                                                                        |
+| rate_limit     | global_daily_limit             | 全局每日主动发言上限，null 不限（@必答不受限）                                                                                                              |
+| snowluma       | mcp_command / mcp_args         | MCP server 启动命令（默认 npx -y @snowluma/mcp）                                                                                                            |
+|                | endpoint                       | SnowLuma OneBot HTTP 端点；**允许私网需显式设置 allow_private_endpoint=true**                                                                               |
+|                | api_key                        | accessToken，作为 Bearer token 传给 MCP                                                                                                                     |
+|                | mode                           | 必须 `"write"`，否则无法发言                                                                                                                                |
 
 `bot.self_qq` 也可在机器人名字上体现——发送的记忆里机器人昵称固定为「糖糖」，若你在 persona 里另取了名字请保持一致或修改 `candybot/bot.py` 中的昵称常量。
 
 ## 行为逻辑
 
 ```
-事件上报 → 过滤链(非群聊/白名单外/自己/重复 → 丢弃)
+事件上报 → 过滤链(非群聊/白名单外/自己/重复 → 丢弃；群撤回通知 → 从该群记忆删除对应消息)
         → 归一化(@/回复/图片处理，写入该群记忆并落盘 JSONL)
         → 决策：
             @我或回复我的消息 ──────────────► 必答

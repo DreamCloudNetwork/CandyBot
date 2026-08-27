@@ -127,6 +127,20 @@ class GroupMemory:
                 return record
         return None
 
+    def remove(self, message_id: int) -> bool:
+        """按 message_id 删除记录（内存与落盘同步），返回是否真的删了。
+
+        JSONL 是纯追加的，删除只能整文件重放；撤回是低频操作，可接受。
+        """
+        if self.find_by_message_id(message_id) is None:
+            return False
+        self._records = deque(
+            (r for r in self._records if r.message_id != message_id),
+            maxlen=self.capacity,
+        )
+        self._rewrite()
+        return True
+
     def __len__(self) -> int:
         return len(self._records)
 
