@@ -119,6 +119,8 @@ class GenerationSettings:
     temperature: float
     max_context_chars: int
     timeout_seconds: float
+    emoji_chance: float = 0.25   # 每条回复允许保留 emoji 的概率，0~1
+    emoji_max: int = 2           # 允许保留时的最大 emoji 个数
 
 
 @dataclass(frozen=True)
@@ -309,11 +311,23 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError("config.json → models.judge / models.reply 必须指定模型名")
 
     gen_cfg = _require_section(cfg, "generation")
+    emoji_chance = float(_get(gen_cfg, "emoji_chance", 0.25))
+    if not 0 <= emoji_chance <= 1:
+        raise ValueError(
+            f"配置项 `generation.emoji_chance` 应在 0~1 之间，实际是 {emoji_chance!r}"
+        )
+    emoji_max = _parse_int(gen_cfg, "emoji_max", 2)
+    if emoji_max < 0:
+        raise ValueError(
+            f"配置项 `generation.emoji_max` 不能为负数，实际是 {emoji_max!r}"
+        )
     generation_settings = GenerationSettings(
         reply_max_tokens=_parse_int(gen_cfg, "reply_max_tokens", 500),
         temperature=float(_get(gen_cfg, "temperature", 0.8)),
         max_context_chars=_parse_int(gen_cfg, "max_context_chars", 8000),
         timeout_seconds=float(_get(gen_cfg, "timeout_seconds", 60)),
+        emoji_chance=emoji_chance,
+        emoji_max=emoji_max,
     )
 
     mm_cfg = _require_section(cfg, "multimodal")

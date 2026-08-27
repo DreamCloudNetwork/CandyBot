@@ -16,7 +16,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 # 屏蔽依赖库自身的 DEBUG 噪音，只保留 CandyBot 的调试输出
-for noisy in ("openai", "httpx", "httpcore", "asyncio"):
+for noisy in ("openai", "httpx", "httpcore", "httpcore2", "asyncio"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 logger = logging.getLogger("candybot")
 
@@ -32,7 +32,7 @@ def apply_log_level(level_name: str) -> None:
     logging.getLogger().setLevel(getattr(logging, level))
     if level == "DEBUG":
         # DEBUG 下依赖库的连接级日志仍然太吵，维持压制
-        for noisy in ("openai", "httpx", "httpcore", "asyncio"):
+        for noisy in ("openai", "httpx", "httpcore", "httpcore2", "asyncio"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

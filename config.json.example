@@ -35,7 +35,9 @@
         "reply_max_tokens": 500,
         "temperature": 0.8,
         "max_context_chars": 8000,
-        "timeout_seconds": 60
+        "timeout_seconds": 60,
+        "emoji_chance": 0.25,
+        "emoji_max": 2
     },
     "multimodal": {
         "mode": "placeholder",

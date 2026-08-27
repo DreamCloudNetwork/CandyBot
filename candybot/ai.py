@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass
 
@@ -20,6 +21,21 @@ from .prompts import (
 logger = logging.getLogger(__name__)
 
 _SCORE_RE = re.compile(r"\{\s*\"score\"[\s\S]*?\}")
+
+# 基础 emoji 字符范围。刻意不含几何符号（U+25A0~25FF）等普通文本符号区，
+# 颜文字 (=^ω^=)、(・ω・) 与箭头 ↑ 不会误伤。
+_EMOJI_CHARS = (
+    "\U0001F000-\U0001FAFF"  # 象形符号/表情/补充表情各区
+    "\u2600-\u27BF"          # 杂项符号与装饰符（☀ ✅ ❤）
+    "\u2B00-\u2BFF"          # 星形与常见聊天箭头（⭐ ⭕ ⬛）
+)
+# emoji 序列：国旗按成对区域指示符算一个，键帽含数字本身，
+# 其余为单个基础字符 + 变体选择符/肤色修饰 + ZWJ 组合的完整序列。
+_EMOJI_RE = re.compile(
+    "[\U0001F1E6-\U0001F1FF]{2}"
+    "|[1-9#*]\uFE0F?\u20E3"
+    f"|[{_EMOJI_CHARS}](?:[\uFE0F\U0001F3FB-\U0001F3FF]|\u200D[{_EMOJI_CHARS}])*"
+)
 
 
 @dataclass(frozen=True)
@@ -140,6 +156,7 @@ class AIClient:
                 pass
         num = re.search(r"\b(\d|10)\b", raw)
         if num:
+            logger.warning("解析到非结构化输出，原文: %s", raw)
             return JudgeVerdict(score=int(num.group(1)), reason="从非结构化输出中提取")
         logger.warning("judge 输出无法解析：%r", raw[:200])
         return JudgeVerdict(score=0, reason="输出解析失败")
@@ -194,6 +211,8 @@ class AIClient:
         )
         reply = (response.choices[0].message.content or "").strip()
         reply = _strip_noise(reply)
+        roll_ok = random.random() < self._generation.emoji_chance
+        reply = _cap_emojis(reply, self._generation.emoji_max if roll_ok else 0)
         return reply or None
 
     # --------------------------------------------------------------- vision
@@ -233,3 +252,33 @@ def _strip_noise(text: str) -> str:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'“”":
         text = text[1:-1].strip()
     return text
+
+
+def _cap_emojis(text: str, limit: int) -> str:
+    """把 emoji 序列的数量压到 limit 以内，保留最先出现的那些。
+
+    超额的序列连同紧随其后的空白一起删除，避免中文里残留双空格；
+    limit <= 0 时全部剔除。删完为空由调用方按"无话可说"处理。
+    """
+    dropped: list[tuple[int, int]] = []
+    kept = 0
+    for match in _EMOJI_RE.finditer(text):
+        if kept < limit:
+            kept += 1
+            continue
+        start, end = match.span()
+        # 键帽序列里的数字本身不是 emoji，只删修饰部分
+        if match.group()[0] in "123456789#*":
+            start += 1
+        while end < len(text) and text[end].isspace():
+            end += 1
+        dropped.append((start, end))
+    if not dropped:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in dropped:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces).strip()

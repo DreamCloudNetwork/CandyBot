@@ -146,3 +146,28 @@ def test_log_level_default_and_validation():
     # 非法值启动即报错
     with pytest.raises(ValueError):
         load_settings(DictCfg(base_cfg(bot={"log_level": "VERBOSE"})))
+
+
+def test_generation_emoji_defaults():
+    """两个 emoji 键缺失时走默认值：概率 0.25，上限 2。"""
+    s = load_settings(DictCfg(base_cfg()))
+    assert s.generation.emoji_chance == 0.25
+    assert s.generation.emoji_max == 2
+
+
+def test_generation_emoji_boundary_values_accepted():
+    cfg = base_cfg(generation={"emoji_chance": 0, "emoji_max": 0})
+    s = load_settings(DictCfg(cfg))
+    assert s.generation.emoji_chance == 0
+    assert s.generation.emoji_max == 0
+    s2 = load_settings(DictCfg(base_cfg(generation={"emoji_chance": 1})))
+    assert s2.generation.emoji_chance == 1
+
+
+def test_generation_emoji_validation():
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(generation={"emoji_chance": 1.5})))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(generation={"emoji_chance": -0.1})))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(generation={"emoji_max": -1})))
