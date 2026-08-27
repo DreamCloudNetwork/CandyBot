@@ -358,9 +358,9 @@ def _require_section(cfg: Any, name: str) -> dict[str, Any]:
     try:
         section = getattr(cfg, name)
     except (AttributeError, KeyError) as exc:
-        raise ValueError(f"config.json 缺少必需的配置段 `{name}`") from exc
+        raise ValueError(f"config.json5 缺少必需的配置段 `{name}`") from exc
     if not isinstance(section, dict):
-        raise ValueError(f"config.json 中 `{name}` 应为对象")
+        raise ValueError(f"config.json5 中 `{name}` 应为对象")
     return section
 
 
@@ -414,13 +414,13 @@ def load_settings(cfg: Any) -> Settings:
     bot_cfg = _require_section(cfg, "bot")
     self_qq = _parse_int(bot_cfg, "self_qq", 0)
     if self_qq <= 0:
-        raise ValueError("config.json → bot.self_qq 必须配置为机器人的 QQ 号")
+        raise ValueError("config.json5 → bot.self_qq 必须配置为机器人的 QQ 号")
     listen_host = _parse_str(bot_cfg, "listen_host", "127.0.0.1")
     listen_port = _parse_int(bot_cfg, "listen_port", 5700)
     log_level = _parse_str(bot_cfg, "log_level", "INFO").upper()
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         raise ValueError(
-            "config.json → bot.log_level 只能是 DEBUG/INFO/WARNING/ERROR/CRITICAL，"
+            "config.json5 → bot.log_level 只能是 DEBUG/INFO/WARNING/ERROR/CRITICAL，"
             f"实际是 {log_level!r}"
         )
 
@@ -452,7 +452,7 @@ def load_settings(cfg: Any) -> Settings:
         vision=_parse_optional_str(models_cfg, "vision"),
     )
     if not model_settings.judge or not model_settings.reply:
-        raise ValueError("config.json → models.judge / models.reply 必须指定模型名")
+        raise ValueError("config.json5 → models.judge / models.reply 必须指定模型名")
 
     gen_cfg = _require_section(cfg, "generation")
     emoji_chance = float(_get(gen_cfg, "emoji_chance", 0.25))

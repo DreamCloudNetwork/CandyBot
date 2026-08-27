@@ -21,9 +21,9 @@ uv run main.py                   # 启动
    - **HTTP 服务端**已启用（默认 `http://127.0.0.1:3000/`），记下 accessToken；
    - **HTTP 上报（client）** 新增一条，URL 填 `http://127.0.0.1:5700/onebot/event`，勾选消息事件。
 3. Node.js ≥ 22（MCP 子进程需要）。
-4. 编辑 `config.json`（见下文逐项说明），至少改掉 `bot.self_qq`、`ai_backend.api_key`、`snowluma.api_key`，并把要服务的群号写进 `groups` 且 `enabled: true`。
+4. 编辑 `config.json5`（JSON5 格式，支持 `//` 注释；见下文逐项说明），至少改掉 `bot.self_qq`、`ai_backend.api_key`、`snowluma.api_key`，并把要服务的群号写进 `groups` 且 `enabled: true`。
 
-## 配置项说明（config.json）
+## 配置项说明（config.json5）
 
 | 段             | 字段                           | 说明                                                                                                                                      |
 |----------------|--------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
@@ -115,7 +115,7 @@ uv run main.py                   # 启动
    ```bash
    uv run main.py
    ```
-   日志应依次出现：「SnowLuma MCP 会话已建立」→ 工具列表含 `invoke_action` → 「事件服务已启动」→ 「CandyBot 已就绪」。若报配置错误按提示改 config.json。
+   日志应依次出现：「SnowLuma MCP 会话已建立」→ 工具列表含 `invoke_action` → 「事件服务已启动」→ 「CandyBot 已就绪」。若报配置错误按提示改 config.json5。
 
 2. **@必答**：在白名单群里 @机器人 说一句话 → 几秒内收到回复，日志无「兴趣评分」行（judge 未被调用）。
 
@@ -140,10 +140,13 @@ uv run pytest -k names  # 单测命名过滤
 
 ### 查看每次请求的完整 Prompt
 
-把 config.json 的 `bot.log_level` 设为 `"DEBUG"` 后重启即可在日志里看到 judge / reply / vision 每次请求的完整消息数组（含分层内容；多模态图片只显示长度和头部片段），以及每条收到消息、冷却跳过等细节：
+把 config.json5 的 `bot.log_level` 设为 `"DEBUG"` 后重启即可在日志里看到 judge / reply / vision 每次请求的完整消息数组（含分层内容；多模态图片只显示长度和头部片段），以及每条收到消息、冷却跳过等细节：
 
-```json
-"bot": { "log_level": "DEBUG", ... }
+```json5
+"bot": {
+    "log_level": "DEBUG",
+    // ...
+}
 ```
 
 配置错误（非法级别名）会在启动时直接报错，便于及时发现。

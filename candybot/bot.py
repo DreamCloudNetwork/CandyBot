@@ -526,9 +526,9 @@ class CandyBot:
         return True
 
 
-def build_bot(config_file: str = "config.json") -> CandyBot:
+def build_bot(config_file: str = "config.json5") -> CandyBot:
     """从项目根目录 config.py 的 ConfigClass 构造 CandyBot。"""
-    from config import Config  # 用户已有的 JSON 配置单例
+    from config import Config  # 用户已有的 JSON5 配置单例
 
     Config._config_file = config_file
     Config.load_config()

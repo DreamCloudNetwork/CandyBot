@@ -1,6 +1,6 @@
 .venv/
 .idea/
-config.json
+config.json5
 __pycache__/
 *.pyc
 data/

@@ -1,0 +1,82 @@
+// CandyBot 配置模板（JSON5 格式：支持 // 与 /* */ 注释、尾逗号）
+// 复制为 config.json5 后，至少修改：
+//   bot.self_qq、ai_backend.api_key、snowluma.api_key，
+//   并把要服务的群号写入 groups 且 enabled 为 true。
+
+{
+    "bot": {
+        "self_qq": 10000,                 // 机器人自己的 QQ 号
+        "listen_host": "127.0.0.1",       // 事件服务监听地址
+        "listen_port": 5700,              // 事件服务监听端口
+        // "event_secret": "xxx",         // 事件推送签名密钥；注释掉表示不校验签名
+        "data_dir": "data",               // 数据目录（记忆等持久化文件）
+        // "log_level": "INFO",           // 默认 INFO；排查问题可改为 DEBUG
+    },
+
+    // 白名单：每个 key 是群号。列表为空时，若 groups_default.enabled 为 true 则服务所有群
+    "groups": {
+        "123456789": {
+            "enabled": false,
+            // 以下字段不写（或写哨兵值 -1 / ""）时继承 groups_default
+            "persona": "",
+            "proactivity_threshold": -1,
+            "cooldown_seconds": -1,
+            "context_size": -1,
+            "min_gap_messages": -1,
+            "busy_rate_per_min": -1,
+        },
+    },
+
+    // 群级默认值
+    "groups_default": {
+        "enabled": true,
+        "persona": "你叫糖糖，是一个混迹在QQ群里的真人感群友：热爱编程与二次元，说话口语化、简短，偶尔用颜文字，会调侃但不过火；不确定的事情直接说不知道，绝不编造事实。",
+        "proactivity_threshold": 8,       // 兴趣评分达到该值才主动回复（0~10）
+        "cooldown_seconds": 600,          // 主动回复后每群冷却秒数
+        "context_size": 20,               // 送入模型的每群历史消息条数
+        "min_gap_messages": 3,            // 两次主动回复之间至少间隔的群消息数
+        "busy_rate_per_min": 6,           // 群消息超过该频率时视为繁忙、抑制主动回复
+    },
+
+    "ai_backend": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "api_key": "<Your API Key>",
+    },
+
+    "models": {
+        "judge": "glm-4-flash",           // 兴趣评分模型
+        "reply": "glm-4-flash",           // 生成回复模型
+        // "vision": "glm-4v-xxx",        // 视觉模型；注释掉表示禁用图片理解
+    },
+
+    "generation": {
+        "reply_max_tokens": 500,
+        "temperature": 0.8,
+        "max_context_chars": 8000,        // 上下文总字符数上限
+        "timeout_seconds": 60,
+        // "recheck_enabled": true,       // 是否对回复做二次评分（默认 true）
+        // "recheck_min_score": 5,        // 二次评分低于该值则放弃回复（默认 5）
+        "emoji_chance": 0.25,             // 随机附加 emoji 的概率（0~1）
+        "emoji_max": 2,                   // 单条回复最多 emoji 数
+        // "max_history_images": 8,      // 历史中最多携带的图片数（默认 8）
+    },
+
+    "multimodal": {
+        "mode": "placeholder",            // direct = 发原图给视觉模型；placeholder = 仅占位
+        "download_media": true,
+    },
+
+    "rate_limit": {
+        "global_daily_limit": null,       // 全局每日回复上限；null / 注释掉表示不限制
+    },
+
+    "snowluma": {
+        "mcp_command": "npx",
+        "mcp_args": ["-y", "@snowluma/mcp"],
+        "endpoint": "http://127.0.0.1:3000/",
+        "api_key": "<Your API Key>",
+        "mode": "write",                  // read / write / all
+        "timeout_ms": 30000,
+        "allow_private_endpoint": true,   // 允许内网地址（本地部署需为 true）
+    },
+}
