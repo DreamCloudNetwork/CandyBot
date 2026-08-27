@@ -5,7 +5,8 @@ API 侧的前缀缓存按 token 精确匹配自前往后命中，因此本模块
 
 L1 system·静态层   persona 与行为守则，字节级不变（不插值任何动态信息）；
 L2 system·状态层   群号、上下文昵称表、今天的日期——同一天内不变；
-L3 历史层          只追加、整块淘汰的群聊记录，映射为连续 user/assistant；
+L3 历史层          只追加、整块淘汰的群聊记录，映射为连续 user/assistant
+                   （direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
 L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分）与本次指令。
 
 任何时刻都不得把易变字段（秒级时间、计数、分数）塞进 L1/L2，也不得重排或
@@ -18,7 +19,12 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from .models import ChatRecord
+from .models import (
+    IMAGE_STATE_PLACEHOLDER,
+    IMAGE_STATE_SHOW,
+    IMAGE_STATE_SUMMARIZED,
+    ChatRecord,
+)
 
 Role = str  # "user" | "assistant"
 
@@ -27,10 +33,15 @@ Message = dict  # OpenAI chat message
 
 @dataclass(frozen=True)
 class HistoryTurn:
-    """历史层的一个回合（群友发言为 user，机器人自己的发言为 assistant）。"""
+    """历史层的一个回合（群友发言为 user，机器人自己的发言为 assistant）。
+
+    images 仅在 direct 多模态的回复调用里非空：需要继续展示原图的回合
+    会把这些 data URL 作为内容块拼在文本之后。
+    """
 
     role: Role
     content: str
+    images: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------- L1 静态层
@@ -43,7 +54,10 @@ _RULES_TAIL = """
 4. 输出就是你要发送到群里的消息本身，不要加引号、前缀、署名或任何舞台指示。
 5. 你发送到群里的消息应该像是一个真实的人类说的，而不是作为助手说的。
 6. Markdown是**绝对禁用**的，没有人会在实际回答中使用Markdown.
-7. 真实的人打字时极少使用Emoji，你的回复绝大多数时候应完全不含Emoji；即使偶尔想用也不要超过一个"""
+7. 真实的人打字时极少使用Emoji，你的回复绝大多数时候应完全不含Emoji；即使偶尔想用也不要超过一个
+8. 历史消息以「昵称(QQ号)：内容」呈现，每条开头还有 #数字 消息编号。带编号消息里的图片可能以原图、「[图片：一句话总结]」或「[图片]」占位符三种形态出现。
+9. 如果历史里某张以原图出现的图片你确定以后用不到了，在回复最末尾另起一行输出 <drop_img 消息编号>，之后系统只为你保留它的总结或占位符；该标记会被剥除，不会发到群里。
+10. 如果你需要查看某张此前已变成总结或占位符的旧图，在回复最末尾另起一行输出 <recall_img 消息编号>，随后你会重新看到那张原图（本次回复会基于它重写）；同样不会发到群里。两个标记都不要滥用。"""
 
 
 def static_system_prompt(persona: str, kind: str) -> str:
@@ -136,6 +150,77 @@ def history_to_turns(
         total -= len(turns[start].content)
         start += 1
     return turns[start:], start > 0
+
+
+def _reply_turn(record: ChatRecord) -> HistoryTurn:
+    """direct 多模态下回复历史的一回合。
+
+    每张图按其展示形态渲染：show 附上原图块；summarized 写成
+    「[图片：总结]」；placeholder 保持「[图片]」。当全部图片均不需要
+    额外表达时退化为与 record_to_turn 完全一致的纯文本回合。
+    """
+    if record.is_self:
+        return HistoryTurn("assistant", record.text or "[空]")
+    show: list[str] = []
+    notes: list[str] = []
+    for index, data_url in enumerate(record.images):
+        state = record.state_of(index)
+        if state == IMAGE_STATE_SHOW:
+            show.append(data_url)
+        elif state == IMAGE_STATE_SUMMARIZED:
+            summary = record.summary_of(index)
+            notes.append(f"[图片：{summary}]" if summary else "[图片]")
+        elif state == IMAGE_STATE_PLACEHOLDER:
+            notes.append("[图片]")
+    plain = HistoryTurn("user", f"{record_label(record)}：{record.text}")
+    if not show and not notes:
+        return plain
+    # 正文里入站时留下的 [图片] 行按各图实际形态重新落位，避免重复展示
+    body = "\n".join(
+        ln
+        for ln in record.text.splitlines()
+        if ln.strip() and ln.strip() != "[图片]"
+    ).strip()
+    head = f"{record_label(record)}：{body or '[图片]'}"
+    content = "\n".join([head, *notes]) if notes else head
+    return HistoryTurn("user", content, tuple(show))
+
+
+def reply_history_turns(
+    records: Iterable[ChatRecord], max_chars: int, max_images: int
+) -> tuple[list[HistoryTurn], bool]:
+    """回复调用的历史层：文本预算之外再叠加一个全局原图张数上限。
+
+    先按与 history_to_turns 相同的规则从头整块淘汰；随后统计超出的原图
+    张数，从最旧的开始整体/部分摘除附图（单条多图时保留较新的尾部），
+    保证越新的图越可能完整保留。文本内容不受影响，只看文字的前缀缓存
+    依旧稳定。
+    """
+    turns = [_reply_turn(r) for r in records]
+    total = sum(len(t.content) for t in turns)
+    start = 0
+    while start < len(turns) and total > max_chars and start < len(turns) - 1:
+        total -= len(turns[start].content)
+        start += 1
+    turns = turns[start:]
+    overflow = max(0, sum(len(t.images) for t in turns) - max(0, max_images))
+    kept: list[HistoryTurn] = []
+    for turn in turns:
+        if not turn.images:
+            kept.append(turn)
+            continue
+        if overflow >= len(turn.images):
+            overflow -= len(turn.images)
+            kept.append(HistoryTurn(turn.role, turn.content, ()))
+        else:
+            attach = turn.images[overflow:] if overflow else turn.images
+            overflow = 0
+            kept.append(
+                HistoryTurn(turn.role, turn.content, attach)
+                if len(attach) != len(turn.images)
+                else turn
+            )
+    return kept, start > 0
 
 
 # ---------------------------------------------------------------- L4 指令层

@@ -10,7 +10,7 @@
 
 ```bash
 uv sync                          # 安装依赖
-uv run pytest                    # 跑测试（82 个）
+uv run pytest                    # 跑测试
 uv run main.py                   # 启动
 ```
 
@@ -43,13 +43,14 @@ uv run main.py                   # 启动
 | ai_backend     | base_url / api_key             | OpenAI 兼容 API 地址与密钥                                                                                                                |
 | models         | judge                          | 判断是否参与话题的模型（建议便宜快速的，如 glm-4-flash）                                                                                  |
 |                | reply                          | 参与回答生成回复的模型                                                                                                                    |
-|                | vision                         | describe 多模态模式用的视觉模型，其他模式可不填                                                                                           |
+|                | vision                         | 视觉模型：describe 模式的转述、direct 模式收图入库时的总结/保留判定都靠它                                                                  |
 | generation     | reply_max_tokens / temperature | 回复生成长度与随机性                                                                                                                      |
 |                | max_context_chars              | 喂给模型的历史上下文总字符上限                                                                                                            |
 |                | timeout_seconds                | 单次 LLM 调用超时                                                                                                                         |
 |                | recheck_enabled / recheck_min_score | 门槛复核（复评）开关与触发下限：首评分严格高于下限却未达群门槛时把真实门槛告知 judge 再裁一次（默认开 / 下限 5，范围 0-10）               |
-| multimodal     | mode                           | `placeholder` 图片→"[图片]"；`describe` 视觉模型转文字；`direct` 图片 base64 直传（要求 reply 模型多模态）                                |
-|                | download_media                 | 是否下载图片（direct/describe 需要）                                                                                                      |
+|                | max_history_images             | direct 模式下历史层最多同时传入的原图张数，超出从最旧的开始摘除（默认 8）                                                                  |
+| multimodal     | mode                           | `placeholder` 图片→"[图片]"；`describe` 视觉模型转文字；`direct` 图片 base64 直传并支持图片记忆管理（要求 reply 模型多模态）。三种模式下图片 base64 都会随聊天记录落盘，重启不丢失 |
+|                | download_media                 | 是否下载图片。关掉后连本地存档也没有，所有模式一律只见占位符                                                                               |
 | rate_limit     | global_daily_limit             | 全局每日主动发言上限，null 不限（@必答不受限）                                                                                            |
 | snowluma       | mcp_command / mcp_args         | MCP server 启动命令（默认 npx -y @snowluma/mcp）                                                                                          |
 |                | endpoint                       | SnowLuma OneBot HTTP 端点；**允许私网需显式设置 allow_private_endpoint=true**                                                             |
@@ -75,6 +76,25 @@ uv run main.py                   # 启动
 - judge 会为每条普通消息同时给出分数和「是否在和我说话」（to_me）标记：被判为对话延续的消息视为接话而非插话，绕过全部护栏放行，也不刷新冷却；只有主动插话受三层结构性节制（都可通过配置调整或关闭，@必答不受限）——主动发言后的 `cooldown_seconds` 冷却 → 发言后至少隔 `min_gap_messages` 条他人消息 → 近一分钟消息量超过 `busy_rate_per_min` 时静默。
 - judge 失败按不发言处理；reply 失败重试 2 次；发送失败重试 3 次。
 - 重启后每群记忆自动从 `data/memory/<群号>.jsonl` 恢复最近上下文。
+
+## 图片记忆管理
+
+无论 `multimodal.mode` 是哪种（`download_media` 开启时），收到的图片都会转 base64 写进该群的 JSONL 记忆文件，作为永久的本地存档；区别只在于「后续对话里模型看到什么」：
+
+- **placeholder**：模型永远只见 `[图片]` 占位符，base64 只落盘备查；
+- **describe**：入库时视觉模型把图转成文字描述写进正文（现有行为）；
+- **direct**：收图时 vision 模型一次性给出总结并判定「后续对话是否还需要看这张原图」。判定保留则下次起历史层把原图以内容块形式继续传给 reply 模型；否则转为 `[图片：<总结>]` 的文字历史。要求 reply 模型多模态、vision 模型已配置（两者缺一时保守退回继续展示原图）。
+
+在 direct 模式下 reply 模型还能自己管理图片的生命周期（标记只在回复末尾出现、发送前会被剥除）：
+
+| 标记 | 作用 |
+|------|------|
+| `<drop_img 消息编号>` | 认为某条历史消息的原图之后用不到了 → 收起原图，改为展示它的总结（没有总结则用占位符） |
+| `<recall_img 消息编号>` | 需要重新查看某张此前已被收起的旧图 → 该图恢复原图展示；若本轮就用到，会基于召回后的上下文重写一次回复 |
+
+消息编号即历史里每行开头的 `#数字`。降级与召回都会同步落盘，重启不丢；`generation.max_history_images` 限制历史层最多同时携带多少张原图（超出从最旧的摘除），防止 token 失控。撤回带图消息时，随记录删除的还有其存档。
+
+图片在本地按内容去重：同一群里内容完全相同的图（含同一条消息里的重复图）以整条 data URL 的 SHA-256 为指纹，只有最早出现的记录保存原始 base64，其余位置写 `ref:sha256:<指纹>` 引用，加载时自动还原；最早那条记录被撤回后，重写时会自动把原图补挂到幸存的最早副本上，不会留下悬空引用。
 
 ## KV Cache 优化
 
@@ -107,7 +127,9 @@ uv run main.py                   # 启动
 
 6. **多模态**：切 `multimodal.mode=describe` 并配 vision 模型 → 发一张图，日志里该消息文本变为 `[图片：<描述>]`。
 
-7. **调积极性**：觉得它话太少就把 `proactivity_threshold` 从 8 调到 6-7、缩短冷却或关掉护栏（对应参数设 0）；太吵则反向调整——加大 `cooldown_seconds`、`min_gap_messages` 调到 5-8、`busy_rate_per_min` 调低。
+7. **图片记忆（direct）**：切 `multimodal.mode=direct` 并配 vision → 发一张信息量大的图（如截图文字），DEBUG 日志里图片评估输出 `"keep": true`，后续对话历史层持续携带原图；再发一张表情包则 `"keep": false`，历史只剩 `[图片：<总结>]`。对话中让它「把刚才那张图收起来」→ 日志出现「已按模型指令收起」且落盘文件中该消息的 `image_states` 变为 summarized/placeholder；说「把之前那张图翻出来看看」→ 出现召回日志、回复基于原图重写。placeholder 模式下发图：记忆 JSONL 里仍有 base64 字段，但 DEBUG 的 prompt 里只有 `[图片]`。
+
+8. **调积极性**：觉得它话太少就把 `proactivity_threshold` 从 8 调到 6-7、缩短冷却或关掉护栏（对应参数设 0）；太吵则反向调整——加大 `cooldown_seconds`、`min_gap_messages` 调到 5-8、`busy_rate_per_min` 调低。
 
 ## 开发
 

@@ -2,8 +2,9 @@
 
 text/face/at/reply/image 等 segment 转为内部 ChatRecord；
 @ 或回复机器人时标记 mentioned_me；图片按配置的 multimodal.mode 处理：
-- placeholder：替换为 ``[图片]`` 占位符（默认）；
-- direct：下载图片转 base64 data URL，附在 record.images 供直传模型；
+- placeholder：文本只留 ``[图片]`` 占位符（默认），但 base64 仍随记录落盘；
+- direct：下载图片转 base64 data URL，附在 record.images 供直传模型，
+  入库时由视觉模型判定后续对话继续展示原图还是只用总结；
 - describe：下载后调用视觉模型转文字描述，写进正文。
 """
 
@@ -15,6 +16,8 @@ import logging
 import aiohttp
 
 from .models import (
+    IMAGE_STATE_SHOW,
+    IMAGE_STATE_SUMMARIZED,
     ChatRecord,
     MultimodalSettings,
     NormalizedMessage,
@@ -89,11 +92,14 @@ async def normalize_group_message(
     find_by_message_id,
     http_session: aiohttp.ClientSession | None = None,
     describe_image=None,
+    assess_image=None,
 ) -> NormalizedMessage | None:
     """把一条 group 消息事件转为 NormalizedMessage。
 
     find_by_message_id: Callable[[int], ChatRecord | None]，通常传 GroupMemory.find_by_message_id；
-    describe_image: 仅 describe 模式需要，Callable[[str dataurl], Awaitable[str]]。
+    describe_image: 仅 describe 模式需要，Callable[[str dataurl], Awaitable[str]]；
+    assess_image: 仅 direct 模式需要，Callable[[str dataurl], Awaitable[ImageAssessment]]，
+    用于入库时判定该图后续继续展示原图还是只保留总结。
     """
     if event.get("post_type") != "message" or event.get("message_type") != "group":
         return None
@@ -160,8 +166,11 @@ async def normalize_group_message(
 
     text = "\n".join(p for p in parts if p)
 
-    # 图片增强：direct 下载转 data URL；describe 转文字并入正文
+    # 图片增强：direct 下载转 data URL 并入库判定；describe 转文字并入正文；
+    # placeholder 不给模型看图，但 base64 照常随记忆落盘备查。
     images: tuple[str, ...] = ()
+    image_states: tuple[str, ...] = ()
+    image_summaries: dict[int, str] | None = None
     if image_urls and multimodal.download_media and http_session is not None:
         data_urls: list[str] = []
         descriptions: list[str] = []
@@ -183,9 +192,32 @@ async def normalize_group_message(
                 text += "\n[图片]"
         elif multimodal.mode == "direct":
             images = tuple(data_urls)
+            states: list[str] = []
+            summaries: dict[int, str] = {}
+            for index, data_url in enumerate(images):
+                summary: str | None = None
+                keep_raw = True
+                if assess_image is not None:
+                    try:
+                        assessment = await assess_image(data_url)
+                        summary = assessment.summary
+                        keep_raw = assessment.keep_raw
+                    except Exception as exc:
+                        logger.warning("图片入库评估失败，默认保留原图：%s", exc)
+                state = IMAGE_STATE_SHOW
+                # 判定无需继续展示原图：能总结就转为总结，否则保守保留原图
+                if not keep_raw and summary:
+                    state = IMAGE_STATE_SUMMARIZED
+                if summary:
+                    summaries[index] = summary
+                states.append(state)
+            image_states = tuple(states)
+            image_summaries = summaries or None
             if not images:
                 text = text.replace("[图片]", "").strip()
                 text = (text + "\n[图片]").strip()
+        else:  # placeholder：一律只展示占位符，图本身仍要写进本地记忆
+            images = tuple(data_urls)
 
     if not text.strip() and not images:
         return None
@@ -198,6 +230,8 @@ async def normalize_group_message(
         text=text.strip(),
         ts=float(event.get("time") or 0),
         images=images,
+        image_states=image_states,
+        image_summaries=image_summaries,
     )
     return NormalizedMessage(record=record, mentioned_me=mentioned_me)
 

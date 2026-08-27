@@ -15,7 +15,7 @@ from datetime import date
 
 import aiohttp
 
-from .ai import AIClient
+from .ai import AIClient, ImageOp, split_image_ops
 from .dedup import MessageDedup
 from .events_server import EventsServer
 from .memory import MemoryManager
@@ -82,6 +82,7 @@ class CandyBot:
             reply_model=settings.models.reply,
             vision_model=settings.models.vision,
             generation=settings.generation,
+            multimodal_mode=settings.multimodal.mode,
         )
         self._snowluma = SnowlumaClient(settings.snowluma)
         self._server = EventsServer(
@@ -150,6 +151,7 @@ class CandyBot:
             return
 
         try:
+            assess = getattr(self._ai, "assess_image", None)
             normalized = await normalize_group_message(
                 event,
                 self_qq=self._settings.bot.self_qq,
@@ -160,6 +162,9 @@ class CandyBot:
                     self._ai.describe_image
                     if self._settings.multimodal.mode == "describe"
                     else None
+                ),
+                assess_image=(
+                    assess if self._settings.multimodal.mode == "direct" else None
                 ),
             )
         except Exception:
@@ -242,25 +247,7 @@ class CandyBot:
         if not decision.should_reply:
             return
 
-        memory = self._memory.get(group_id)
-        recent = memory.tail(profile.context_size)
-        static_system = runtime.static_system("reply", profile.persona)
-        nicknames = nickname_list_from_history([record_to_turn(r) for r in recent[:-1]])
-        runtime_system = runtime_system_prompt(
-            group_id, date.today().isoformat(), nicknames
-        )
-
-        reply_text = await self._generate_with_retry(
-            static_system,
-            runtime_system,
-            recent,
-            msg.record,
-            fmt_now_text(),
-            forced=decision.forced,
-            engaged=decision.engaged,
-            score=decision.score,
-            reason=decision.reason,
-        )
+        reply_text = await self._compose_reply(group_id, msg, profile, runtime, decision)
         if not reply_text:
             logger.info("群 %d 回复生成为空，放弃发送", group_id)
             return
@@ -288,7 +275,78 @@ class CandyBot:
             ts=time.time(),
             is_self=True,
         )
-        memory.append(sent_record)
+        self._memory.get(group_id).append(sent_record)
+
+    async def _compose_reply(
+        self,
+        group_id: int,
+        msg: NormalizedMessage,
+        profile: GroupProfile,
+        runtime: GroupRuntime,
+        decision: Decision,
+    ) -> str | None:
+        """生成回复并处理其中的图片生命周期标记。
+
+        首稿解析 <drop_img>/<recall_img> 标记：立即把操作落到记忆；
+        若发生过成功的召回（模型想重新查看某张旧图），重建上下文后再
+        生成一次，让召回的原图进入本轮对话。二稿只剥标记、不再重试，
+        保证每条消息至多两次生成调用。
+        """
+        memory = self._memory.get(group_id)
+        for attempt in range(2):
+            recent = memory.tail(profile.context_size)
+            static_system = runtime.static_system("reply", profile.persona)
+            nicknames = nickname_list_from_history(
+                [record_to_turn(r) for r in recent[:-1]]
+            )
+            runtime_system = runtime_system_prompt(
+                group_id, date.today().isoformat(), nicknames
+            )
+            draft = await self._generate_with_retry(
+                static_system,
+                runtime_system,
+                recent,
+                msg.record,
+                fmt_now_text(),
+                forced=decision.forced,
+                engaged=decision.engaged,
+                score=decision.score,
+                reason=decision.reason,
+            )
+            if not draft:
+                return None
+            draft, ops = split_image_ops(draft)
+            changed = self._apply_image_ops(group_id, memory, ops)
+            recalled = any(op.action == "recall_img" for op in ops)
+            if attempt == 0 and changed and recalled:
+                logger.info("群 %d 模型召回历史图片，基于新上下文重写回复", group_id)
+                continue
+            return draft
+        return None
+
+    def _apply_image_ops(
+        self, group_id: int, memory, ops: list[ImageOp]
+    ) -> bool:
+        """把回复里的图片降级/召回操作写入记忆；非 direct 模式一律忽略。"""
+        if not ops or self._settings.multimodal.mode != "direct":
+            return False
+        changed = False
+        for op in ops:
+            direction = "recall" if op.action == "recall_img" else "drop"
+            try:
+                applied = memory.transition_images(op.message_id, direction)
+            except Exception:
+                logger.exception("群 %d 图片状态切换失败：%r", group_id, op)
+                continue
+            if applied:
+                changed = True
+                logger.info(
+                    "群 %d 消息 %d 的图片已按模型指令%s",
+                    group_id,
+                    op.message_id,
+                    "召回为原图展示" if direction == "recall" else "收起（转为总结/占位符）",
+                )
+        return changed
 
     async def _make_decision(
         self, group_id: int, msg: NormalizedMessage, profile: GroupProfile, runtime: GroupRuntime

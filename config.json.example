@@ -43,7 +43,8 @@
         "recheck_enabled": true,
         "recheck_min_score": 5,
         "emoji_chance": 0.25,
-        "emoji_max": 2
+        "emoji_max": 2,
+        "max_history_images": 8
     },
     "multimodal": {
         "mode": "placeholder",

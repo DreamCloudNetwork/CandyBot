@@ -17,11 +17,20 @@ from .prompts import (
     final_user_prompt_judge_recheck,
     final_user_prompt_reply,
     history_to_turns,
+    reply_history_turns,
 )
 
 logger = logging.getLogger(__name__)
 
-_SCORE_RE = re.compile(r"\{\s*\"score\"[\s\S]*?\}")
+_SCORE_RE = re.compile(r"\{\s*\"score\"[\s\S]*?}")
+
+# 收图入库评估输出的扁平 JSON 对象（summary + keep）
+_ASSESS_RE = re.compile(r"\{[^{}]*\}")
+
+# 回复末尾的图片生命周期标记：<drop_img 消息编号> / <recall_img 消息编号>
+_IMAGE_OP_VALID_RE = re.compile(r"<(drop_img|recall_img)\s+(\d+)\s*>")
+# 剥除一切形如标签的残留（含模型写歪的未闭合片段），防止泄进群里
+_IMAGE_OP_ANY_RE = re.compile(r"</?(?:drop_img|recall_img)\b[^<>]*>")
 
 # 思考段：闭合的 <think>…</think> 整块删除；未闭合（如被 max_tokens 截断）时
 # 从 <think> 起全部删除；孤立的 </think> 一并清理。思考内容绝不能参与判定或回复。
@@ -48,6 +57,22 @@ class JudgeVerdict:
     score: int
     reason: str
     to_me: bool = False  # 这条消息是否在对我说、延续与我相关的对话
+
+
+@dataclass(frozen=True)
+class ImageAssessment:
+    """收图入库时视觉模型的判定：总结文本 + 是否继续向模型展示原图。"""
+
+    summary: str | None
+    keep_raw: bool
+
+
+@dataclass(frozen=True)
+class ImageOp:
+    """回复模型给出的图片生命周期操作（动作名, 目标消息编号）。"""
+
+    action: str
+    message_id: int
 
 
 _IMAGE_HEAD = 48  # debug 日志中图片 data URL 只保留头部字符数
@@ -79,6 +104,38 @@ def format_messages_for_log(messages: list[Message]) -> str:
     return "\n".join(parts)
 
 
+def _turn_to_message(turn) -> Message:
+    """HistoryTurn → OpenAI 消息；带附图的回合转成 text + image_url 块。"""
+    if turn.images:
+        return {
+            "role": turn.role,
+            "content": [
+                {"type": "text", "text": turn.content},
+                *[
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                    for data_url in turn.images
+                ],
+            ],
+        }
+    return {"role": turn.role, "content": turn.content}
+
+
+def split_image_ops(text: str) -> tuple[str, list[ImageOp]]:
+    """剥除回复里的图片生命周期标记，返回（干净正文, 按序操作列表）。
+
+    接受 <drop_img 编号> / <recall_img 编号> 两种闭合写法；无论是否合法，
+    一切形似的标签片段都会被剥除，保证不会发进群里。操作允许出现在正文
+    任意位置，重复操作交由记忆层幂等处理。
+    """
+    ops = [
+        ImageOp(action=action, message_id=int(num))
+        for action, num in _IMAGE_OP_VALID_RE.findall(text)
+    ]
+    clean = _IMAGE_OP_ANY_RE.sub("", text)
+    lines = [ln for ln in clean.splitlines() if ln.strip()]
+    return "\n".join(lines).strip(), ops
+
+
 class AIClient:
     """封装三种 LLM 调用。所有方法都可能抛出 openai 库异常，由上层决定重试。"""
 
@@ -91,12 +148,15 @@ class AIClient:
         reply_model: str,
         vision_model: str | None,
         generation: GenerationSettings,
+        multimodal_mode: str = "placeholder",
     ):
         self._client = AsyncOpenAI(base_url=base_url or None, api_key=api_key)
         self._judge_model = judge_model
         self._reply_model = reply_model
         self._vision_model = vision_model
         self._generation = generation
+        # 只有 direct 模式才允许任何图片（历史层或当前消息）进入请求
+        self._multimodal_mode = multimodal_mode
 
     # ---------------------------------------------------------------- judge
 
@@ -193,13 +253,22 @@ class AIClient:
         score: int | None = None,
         reason: str = "",
     ) -> str | None:
-        """回复模型生成一句群聊回应；direct 模式下附带图片内容块。"""
-        turns, _ = history_to_turns(recent_records[:-1], self._generation.max_context_chars)
+        """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。"""
+        if self._multimodal_mode == "direct":
+            turns, _ = reply_history_turns(
+                recent_records[:-1],
+                self._generation.max_context_chars,
+                self._generation.max_history_images,
+            )
+            history_messages = [_turn_to_message(t) for t in turns]
+        else:
+            turns, _ = history_to_turns(recent_records[:-1], self._generation.max_context_chars)
+            history_messages = [{"role": t.role, "content": t.content} for t in turns]
         text_part = final_user_prompt_reply(
             now_text, current_message, forced=forced, engaged=engaged, score=score, reason=reason
         )
         final_user: str | list[dict]
-        if current_message.images:
+        if self._multimodal_mode == "direct" and current_message.images:
             blocks: list[dict] = [{"type": "text", "text": text_part}]
             for data_url in current_message.images:
                 blocks.append({"type": "image_url", "image_url": {"url": data_url}})
@@ -207,7 +276,6 @@ class AIClient:
         else:
             final_user = text_part
 
-        history_messages = [{"role": t.role, "content": t.content} for t in turns]
         chat: list[Message] = [
             {"role": "system", "content": static_system},
             {"role": "system", "content": runtime_system},
@@ -261,6 +329,66 @@ class AIClient:
         )
         desc = (response.choices[0].message.content or "").strip()
         return desc or None
+
+    async def assess_image(self, data_url: str) -> ImageAssessment:
+        """视觉模型一次性完成「总结 + 是否值得长期保留原图」的入库判定。
+
+        未配置 vision 模型或调用/解析失败时安全侧返回保留原图：宁可
+        多花些 token 也不凭空丢信息，后续仍可通过 <drop_img> 标记降级。
+        """
+        if not self._vision_model:
+            return ImageAssessment(summary=None, keep_raw=True)
+        logger.debug(
+            "[vision·assess] model=%s 图片 %d 字符",
+            self._vision_model,
+            len(data_url),
+        )
+        response = await self._client.chat.completions.create(
+            model=self._vision_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "这是一张群聊里发来的图片。请先用不超过40个字总结它的内容要点，"
+                                "再判断后续对话是否还需要继续查看这张原图：只有当图片包含未来"
+                                "可能被反复引用的具体信息（文字截图、代码、表格、关键画面细节等）"
+                                "才值得保留原图；表情包、梗图之类的总结即可。\n"
+                                '只输出一个 JSON 对象：{"summary": "一句话总结",'
+                                ' "keep": true 或 false}'
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            temperature=0.2,
+            max_tokens=400,
+            timeout=self._generation.timeout_seconds,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        return self._parse_assessment(raw)
+
+    @staticmethod
+    def _parse_assessment(raw: str) -> ImageAssessment:
+        visible = _strip_think(raw)
+        match = _ASSESS_RE.search(visible)
+        if match:
+            try:
+                obj = json.loads(match.group(0))
+            except (ValueError, TypeError):
+                obj = None
+            if isinstance(obj, dict):
+                summary = obj.get("summary")
+                summary = str(summary).strip()[:200] if isinstance(summary, str) else None
+                # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图
+                return ImageAssessment(
+                    summary=summary or None, keep_raw=obj.get("keep") is not False
+                )
+        logger.warning("图片入库评估输出无法解析：%r", raw[:200])
+        return ImageAssessment(summary=None, keep_raw=True)
 
 
 def _strip_think(text: str) -> str:

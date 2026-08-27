@@ -15,6 +15,24 @@ from urllib.parse import urlparse
 
 MULTIMODAL_MODES = ("direct", "describe", "placeholder")
 
+# 单张图片在后续对话中的展示形态：
+# show        继续把原图 base64 作为内容块传给回复模型；
+# summarized  只传总结文字「[图片：…]」；
+# placeholder 只展示 [图片] 占位符。
+IMAGE_STATE_SHOW = "show"
+IMAGE_STATE_SUMMARIZED = "summarized"
+IMAGE_STATE_PLACEHOLDER = "placeholder"
+IMAGE_STATES = (IMAGE_STATE_SHOW, IMAGE_STATE_SUMMARIZED, IMAGE_STATE_PLACEHOLDER)
+
+
+def _aligned_image_states(count: int, states: Any) -> tuple[str, ...]:
+    """把任意外部输入整理成长度恰为 count 的合法状态表，缺省补 show。"""
+    if not isinstance(states, (list, tuple)):
+        states = ()
+    aligned = [s if s in IMAGE_STATES else IMAGE_STATE_SHOW for s in states]
+    aligned += [IMAGE_STATE_SHOW] * (count - len(aligned))
+    return tuple(aligned[:count])
+
 
 # ---------------------------------------------------------------- 运行时模型
 
@@ -23,7 +41,10 @@ MULTIMODAL_MODES = ("direct", "describe", "placeholder")
 class ChatRecord:
     """一条群聊消息（含机器人自己发出的）。
 
-    持久化到 JSONL 时只保留小字段；images（base64 大块）不落盘也不进历史。
+    images 是 base64 data URL 元组，无论 multimodal 模式如何都会随 JSONL
+    落盘（撤回/压缩时随记录一起消亡）；image_states 与 images 对齐，描述
+    每张图在后续对话中的展示形态；image_summaries 保存视觉模型给的总结，
+    供展示与降级时复用。image_states 缺省视为全部 show。
     """
 
     message_id: int
@@ -34,9 +55,24 @@ class ChatRecord:
     ts: float
     is_self: bool = False
     images: tuple[str, ...] = field(default=(), repr=False)
+    image_states: tuple[str, ...] = field(default=(), repr=False)
+    image_summaries: dict[int, str] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        # 防御性对齐：外部构造（含 from_json）长度不一致时以 images 为准
+        self.image_states = _aligned_image_states(len(self.images), self.image_states)
+        clean: dict[int, str] = {}
+        for key, value in (self.image_summaries or {}).items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, str):
+                clean[idx] = value
+        self.image_summaries = clean
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        obj: dict[str, Any] = {
             "message_id": self.message_id,
             "group_id": self.group_id,
             "user_id": self.user_id,
@@ -45,9 +81,29 @@ class ChatRecord:
             "ts": self.ts,
             "is_self": self.is_self,
         }
+        if self.images:
+            obj["images"] = list(self.images)
+            obj["image_states"] = list(self.image_states)
+            if self.image_summaries:
+                obj["image_summaries"] = {str(k): v for k, v in sorted(self.image_summaries.items())}
+        return obj
 
     @classmethod
     def from_json(cls, obj: dict[str, Any]) -> ChatRecord:
+        raw_images = obj.get("images")
+        images: tuple[str, ...] = ()
+        if isinstance(raw_images, list):
+            images = tuple(u for u in raw_images if isinstance(u, str))
+        summaries: dict[int, str] | None = None
+        raw_sums = obj.get("image_summaries")
+        if isinstance(raw_sums, dict):
+            summaries = {}
+            for key, value in raw_sums.items():
+                if isinstance(value, str):
+                    try:
+                        summaries[int(key)] = value
+                    except (TypeError, ValueError):
+                        continue
         return cls(
             message_id=int(obj["message_id"]),
             group_id=int(obj["group_id"]),
@@ -56,7 +112,39 @@ class ChatRecord:
             text=str(obj.get("text", "")),
             ts=float(obj.get("ts", time.time())),
             is_self=bool(obj.get("is_self", False)),
+            images=images,
+            image_states=_aligned_image_states(
+                len(images), obj.get("image_states") or ()
+            ),
+            image_summaries=summaries or None,
         )
+
+    # ------------------------------------------------------------ 图片形态
+
+    def state_of(self, index: int) -> str:
+        if 0 <= index < len(self.image_states):
+            return self.image_states[index]
+        return IMAGE_STATE_SHOW
+
+    def summary_of(self, index: int) -> str | None:
+        summary = (self.image_summaries or {}).get(index)
+        return summary or None
+
+    def set_image_state(self, index: int, state: str, *, summary: str | None = None) -> None:
+        """更新第 index 张图的展示形态；给 summary 时同步保存总结文本。"""
+        if state not in IMAGE_STATES:
+            raise ValueError(f"非法的图片状态：{state!r}")
+        states = list(
+            self.image_states
+            if len(self.image_states) == len(self.images)
+            else _aligned_image_states(len(self.images), self.image_states)
+        )
+        states[index] = state
+        self.image_states = tuple(states)
+        if summary:
+            sums = dict(self.image_summaries or {})
+            sums[index] = summary
+            self.image_summaries = sums
 
 
 @dataclass(slots=True)
@@ -163,6 +251,8 @@ class GenerationSettings:
     # 把真实门槛告知 judge 再裁一次；enabled=False 时直接采信首评。
     recheck_enabled: bool = True
     recheck_min_score: int = 5
+    # direct 模式下整个历史层最多同时传入的原图张数，超出从最旧的开始摘除
+    max_history_images: int = 8
 
 
 @dataclass(frozen=True)
@@ -381,6 +471,11 @@ def load_settings(cfg: Any) -> Settings:
             f"配置项 `generation.recheck_min_score` 应在 0~10 之间，"
             f"实际是 {recheck_min_score!r}"
         )
+    max_history_images = _parse_int(gen_cfg, "max_history_images", 8)
+    if max_history_images < 0:
+        raise ValueError(
+            f"配置项 `generation.max_history_images` 不能为负数，实际是 {max_history_images!r}"
+        )
     generation_settings = GenerationSettings(
         reply_max_tokens=_parse_int(gen_cfg, "reply_max_tokens", 500),
         temperature=float(_get(gen_cfg, "temperature", 0.8)),
@@ -392,6 +487,7 @@ def load_settings(cfg: Any) -> Settings:
             gen_cfg.get("recheck_enabled", True), "recheck_enabled"
         ),
         recheck_min_score=recheck_min_score,
+        max_history_images=max_history_images,
     )
 
     mm_cfg = _require_section(cfg, "multimodal")
