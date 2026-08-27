@@ -69,10 +69,15 @@ class NormalizedMessage:
 
 @dataclass(slots=True)
 class Decision:
-    """一次发言决策的结果。"""
+    """一次发言决策的结果。
+
+    forced = @必答；engaged = 判定消息在延续与机器人的对话——两者都不受
+    冷却与护栏限制，区别在于 engaged 仍消耗每日主动发言配额、且不刷新冷却。
+    """
 
     should_reply: bool
     forced: bool = False
+    engaged: bool = False
     score: int | None = None
     reason: str = ""
 
@@ -98,6 +103,39 @@ class GroupProfile:
     proactivity_threshold: int
     cooldown_seconds: int
     context_size: int
+    # 结构性反插嘴护栏：-1/缺省 = 内置默认，0 = 关闭
+    min_gap_messages: int = -1
+    busy_rate_per_min: int = -1
+
+
+# 护栏内置默认：发言后至少隔这么多条他人消息才再评估；近一分钟消息达到
+# 该条数即整体静默（只答 @）。0 均可显式关闭。
+MIN_GAP_MESSAGES_DEFAULT = 3
+BUSY_RATE_PER_MIN_DEFAULT = 6
+
+
+def _apply_guardrail_defaults(profile: GroupProfile) -> GroupProfile:
+    """把 groups_default 里缺省(-1)的护栏字段替换为内置默认值。"""
+    if profile.min_gap_messages >= 0 and profile.busy_rate_per_min >= 0:
+        return profile
+    return GroupProfile(
+        group_id=profile.group_id,
+        enabled=profile.enabled,
+        persona=profile.persona,
+        proactivity_threshold=profile.proactivity_threshold,
+        cooldown_seconds=profile.cooldown_seconds,
+        context_size=profile.context_size,
+        min_gap_messages=(
+            profile.min_gap_messages
+            if profile.min_gap_messages >= 0
+            else MIN_GAP_MESSAGES_DEFAULT
+        ),
+        busy_rate_per_min=(
+            profile.busy_rate_per_min
+            if profile.busy_rate_per_min >= 0
+            else BUSY_RATE_PER_MIN_DEFAULT
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -121,6 +159,10 @@ class GenerationSettings:
     timeout_seconds: float
     emoji_chance: float = 0.25   # 每条回复允许保留 emoji 的概率，0~1
     emoji_max: int = 2           # 允许保留时的最大 emoji 个数
+    # 门槛复核（复评）：首评分数严格高于 recheck_min_score 又低于本群门槛时，
+    # 把真实门槛告知 judge 再裁一次；enabled=False 时直接采信首评。
+    recheck_enabled: bool = True
+    recheck_min_score: int = 5
 
 
 @dataclass(frozen=True)
@@ -204,6 +246,16 @@ class Settings:
             ),
             context_size=(
                 profile.context_size if profile.context_size > 0 else base.context_size
+            ),
+            min_gap_messages=(
+                profile.min_gap_messages
+                if profile.min_gap_messages >= 0
+                else base.min_gap_messages
+            ),
+            busy_rate_per_min=(
+                profile.busy_rate_per_min
+                if profile.busy_rate_per_min >= 0
+                else base.busy_rate_per_min
             ),
         )
 
@@ -289,8 +341,10 @@ def load_settings(cfg: Any) -> Settings:
         gid = _coerce_group_id(key)
         groups[gid] = _parse_group_profile(raw, f"groups.{key}", gid)
 
-    default_profile = _parse_group_profile(
-        _require_section(cfg, "groups_default"), "groups_default", None
+    default_profile = _apply_guardrail_defaults(
+        _parse_group_profile(
+            _require_section(cfg, "groups_default"), "groups_default", None
+        )
     )
     if not default_profile.persona:
         raise ValueError("groups_default.persona 不能为空")
@@ -321,6 +375,12 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError(
             f"配置项 `generation.emoji_max` 不能为负数，实际是 {emoji_max!r}"
         )
+    recheck_min_score = _parse_int(gen_cfg, "recheck_min_score", 5)
+    if not 0 <= recheck_min_score <= 10:
+        raise ValueError(
+            f"配置项 `generation.recheck_min_score` 应在 0~10 之间，"
+            f"实际是 {recheck_min_score!r}"
+        )
     generation_settings = GenerationSettings(
         reply_max_tokens=_parse_int(gen_cfg, "reply_max_tokens", 500),
         temperature=float(_get(gen_cfg, "temperature", 0.8)),
@@ -328,6 +388,10 @@ def load_settings(cfg: Any) -> Settings:
         timeout_seconds=float(_get(gen_cfg, "timeout_seconds", 60)),
         emoji_chance=emoji_chance,
         emoji_max=emoji_max,
+        recheck_enabled=_parse_bool(
+            gen_cfg.get("recheck_enabled", True), "recheck_enabled"
+        ),
+        recheck_min_score=recheck_min_score,
     )
 
     mm_cfg = _require_section(cfg, "multimodal")
@@ -403,6 +467,8 @@ def _parse_group_profile(raw: Any, label: str, group_id: int | None) -> GroupPro
         proactivity_threshold=_parse_int(raw, "proactivity_threshold", -1),
         cooldown_seconds=_parse_int(raw, "cooldown_seconds", -1),
         context_size=_parse_int(raw, "context_size", -1),
+        min_gap_messages=_parse_int(raw, "min_gap_messages", -1),
+        busy_rate_per_min=_parse_int(raw, "busy_rate_per_min", -1),
     )
 
 

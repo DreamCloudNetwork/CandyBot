@@ -11,6 +11,16 @@ def test_plain_json():
     v = parse('{"score": 8, "reason": "对方在等我"}')
     assert v.score == 8
     assert v.reason == "对方在等我"
+    assert v.to_me is False                # 缺省 to_me 视为非对话延续
+
+
+def test_to_me_flag_parsing():
+    v = parse('{"score": 9, "to_me": true, "reason": "在追问刚才的话"}')
+    assert v.score == 9
+    assert v.to_me is True
+    # 非布尔值按假处理，绝不因脏数据误判为"在和我说话"
+    assert parse('{"score": 9, "to_me": "yes"}').to_me is False
+    assert parse('{"score": 4, "to_me": false, "reason": "路人话题"}').to_me is False
 
 
 def test_json_after_closed_think():

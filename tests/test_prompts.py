@@ -6,6 +6,7 @@ from candybot.models import ChatRecord
 from candybot.prompts import (
     build_messages,
     final_user_prompt_judge,
+    final_user_prompt_judge_recheck,
     history_to_turns,
     nickname_list_from_history,
     record_to_turn,
@@ -120,7 +121,7 @@ def test_prefix_property_between_two_calls():
     assert msg_v1[-1] != msg_v2[-1]
 
 
-def test_judge_prompt_has_anchors_and_threshold_calibration():
+def test_judge_prompt_has_anchors_and_never_reveals_threshold():
     """judge 静态层必须有评分锚点与一致性要求；reply 静态层则不需要。"""
     judge_static = static_system_prompt(PERSONA, "judge")
     reply_static = static_system_prompt(PERSONA, "reply")
@@ -128,13 +129,30 @@ def test_judge_prompt_has_anchors_and_threshold_calibration():
     assert "一致性要求" in judge_static
     assert "评分锚点" not in reply_static
 
-    # 门槛校准只应出现在传入 threshold 的指令层
-    rec1 = rec(1, 5, "小明", "在吗")
-    without = final_user_prompt_judge("2026-08-27 10:00:00", rec1)
-    with_thr = final_user_prompt_judge("2026-08-27 10:00:00", rec1, threshold=8)
-    assert "发言门槛" not in without
-    assert "【本次发言门槛】8 分" in with_thr
-    assert "不低于 8" in with_thr
+    # 首评指令层绝不能透露发言门槛，否则模型会围绕门槛打分
+    prompt = final_user_prompt_judge("2026-08-27 10:00:00", rec(1, 5, "小明", "在吗"))
+    assert "发言门槛" not in prompt
+
+
+def test_recheck_prompt_reveals_threshold_and_quotes_first_verdict():
+    """复核指令层告知真实门槛与触发下限并引用首评结论，同时强调禁止凑分。"""
+    prompt = final_user_prompt_judge_recheck(
+        "2026-08-27 10:00:00",
+        rec(1, 5, "小明", "在吗"),
+        prev_score=7,
+        prev_reason="话题开放能接话",
+        threshold=8,
+        min_score=4,
+    )
+    assert "判定是 7 分" in prompt and "话题开放能接话" in prompt
+    assert "高于 4 分" in prompt
+    assert "发言门槛" in prompt and "8 分（满分 10）" in prompt
+    assert "不低于 8" in prompt and "低于 8" in prompt
+    assert "凑" in prompt  # 明确提醒不要为过线抬分
+
+    # 关键语义：主动参与开放话题本身就是正当理由，不能暗示「没人在等就不能说」
+    assert "开口的理由并非只有「有人在等我回应」" in prompt
+    assert "话题向整个群开放" in prompt
 
 
 def test_nickname_list_from_history():

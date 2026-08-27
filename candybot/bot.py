@@ -1,7 +1,8 @@
 """核心编排：事件过滤链、决策、回复与发送。
 
-每群一个串行 asyncio 队列保证决策顺序；@ 必答不受冷却与每日限额约束之外
-的判断环节，直接进入回复流程。
+每群一个串行 asyncio 队列保证决策顺序。@ 必答与「对方正在和我说话」的
+消息（judge 判定为延续与本机器人的对话）不受冷却和护栏限制；其余主动
+插话需依次通过冷却、发言间隔、热闹静默三道护栏及判定门槛。
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import date
 
 import aiohttp
@@ -44,6 +45,11 @@ class GroupRuntime:
 
     def __init__(self) -> None:
         self.last_proactive_ts: float = 0.0
+        # 反插嘴护栏的记账：上次自己发言以来的他人消息数（含当前待判定消息），
+        # 初值为大数表示「从未发言」不被间隔约束，发送后归零重新累积；
+        # 近一分钟的群消息时间戳（含 @ 必答的消息，反映真实热闹程度）。
+        self.msgs_since_reply: int = 10**9
+        self.recent_msg_times: deque[float] = deque()
         self._static_cache_key: tuple[int, str] | None = None
         self._static_cache: str = ""
 
@@ -251,6 +257,7 @@ class CandyBot:
             msg.record,
             fmt_now_text(),
             forced=decision.forced,
+            engaged=decision.engaged,
             score=decision.score,
             reason=decision.reason,
         )
@@ -266,8 +273,11 @@ class CandyBot:
             logger.error("群 %d 发送失败：%s", group_id, exc)
             return
 
-        if not decision.forced:
-            runtime.last_proactive_ts = time.time()  # 只有主动发言消耗冷却
+        # 只有主动插话消耗并刷新冷却；@ 必答和对话延续都不该把正在进行的
+        # 交流掐断。无论哪种触发，间隔都从本条发言后重新累计。
+        if not decision.forced and not decision.engaged:
+            runtime.last_proactive_ts = time.time()
+        runtime.msgs_since_reply = 0
 
         sent_record = ChatRecord(
             message_id=-time.time_ns(),  # 合成负 id，绝不与他人冲突
@@ -283,15 +293,20 @@ class CandyBot:
     async def _make_decision(
         self, group_id: int, msg: NormalizedMessage, profile: GroupProfile, runtime: GroupRuntime
     ) -> Decision:
+        # 结构性护栏的记账先于一切判断：即使消息最终不触发回复，
+        # 也要计入间隔与热闹统计
+        runtime.msgs_since_reply += 1
+        now = time.time()
+        window = runtime.recent_msg_times
+        window.append(now)
+        while window and window[0] < now - 60.0:
+            window.popleft()
+
         if msg.mentioned_me:
             return Decision(should_reply=True, forced=True)
-        elapsed = time.time() - runtime.last_proactive_ts
-        if runtime.last_proactive_ts > 0 and elapsed < profile.cooldown_seconds:
-            logger.debug(
-                "群 %d 冷却中（剩 %.0fs），跳过判断", group_id, profile.cooldown_seconds - elapsed
-            )
-            return Decision(should_reply=False)
 
+        # 每条普通消息都过一遍 judge：除了打分，还要识别「这条消息是否在对
+        # 我说」——正和我聊天的场景里，任何时间窗口都不应该把对话掐断。
         recent = self._memory.get(group_id).tail(profile.context_size)
         static_system = runtime.static_system("judge", profile.persona)
         nicknames = nickname_list_from_history([record_to_turn(r) for r in recent[:-1]])
@@ -311,13 +326,101 @@ class CandyBot:
             logger.warning("judge 调用失败，按不发言处理：%s", exc)
             return Decision(should_reply=False)
         logger.info(
-            "群 %d 回复判定 %d/阈值 %d（%s）：%s",
+            "群 %d 回复判定 %d/阈值 %d%s（%s）：%s",
             group_id,
             verdict.score,
             profile.proactivity_threshold,
+            "[与我对话]" if verdict.to_me else "",
             msg.record.nickname,
             verdict.reason,
         )
+
+        # 对方在延续与我的对话 → 这是接话而不是插话：绕过全部护栏放行，
+        # 且不刷新主动冷却，否则下一句对话又会被掐断
+        if verdict.to_me:
+            return Decision(
+                should_reply=True,
+                engaged=True,
+                score=verdict.score,
+                reason=verdict.reason,
+            )
+
+        elapsed = time.time() - runtime.last_proactive_ts
+        if runtime.last_proactive_ts > 0 and elapsed < profile.cooldown_seconds:
+            logger.debug(
+                "群 %d 冷却中（剩 %.0fs），跳过判断", group_id, profile.cooldown_seconds - elapsed
+            )
+            return Decision(should_reply=False, score=verdict.score, reason=verdict.reason)
+
+        # 护栏一：刚主动发过言，需攒够 min_gap_messages 条他人消息后再评估
+        if (
+            profile.min_gap_messages > 0
+            and runtime.msgs_since_reply <= profile.min_gap_messages
+        ):
+            logger.debug(
+                "群 %d 距上次发言仅 %d 条他人消息（要求超过 %d 条），跳过判断",
+                group_id,
+                runtime.msgs_since_reply,
+                profile.min_gap_messages,
+            )
+            return Decision(should_reply=False, score=verdict.score, reason=verdict.reason)
+
+        # 护栏二：近一分钟消息量达到阈值说明群里正热闹（多人在接龙），
+        # 此时插话最容易被嫌弃，保持安静
+        if profile.busy_rate_per_min > 0 and len(window) >= profile.busy_rate_per_min:
+            logger.debug(
+                "群 %d 近 60 秒已有 %d 条消息（≥%d），热闹期保持安静",
+                group_id,
+                len(window),
+                profile.busy_rate_per_min,
+            )
+            return Decision(should_reply=False, score=verdict.score, reason=verdict.reason)
+
+        # 首评时模型不知道本群门槛，可能把「自己有点想插话」高估到门槛下方
+        # 却没过线。这类分数不直接采信：把门槛告知 judge 请其复核，确信值得
+        # 开口才维持高分区，否则如实下调（复评的 to_me 不再单独放行——首评已
+        # 认定并非在与我对话，即使翻转也按普通插话处理）。复核开关与触发下限
+        # 由 generation.recheck_enabled / recheck_min_score 配置。
+        gen = self._settings.generation
+        if (
+            gen.recheck_enabled
+            and gen.recheck_min_score < verdict.score < profile.proactivity_threshold
+        ):
+            try:
+                rechecked = await self._ai.judge_interest(
+                    static_system,
+                    runtime_system,
+                    recent,
+                    msg.record,
+                    fmt_now_text(),
+                    threshold=profile.proactivity_threshold,
+                    prev_verdict=verdict,
+                    min_score=gen.recheck_min_score,
+                )
+            except Exception as exc:
+                logger.warning("群 %d judge 复核失败，按首评不达标处理：%s", group_id, exc)
+            else:
+                logger.info(
+                    "群 %d 回复复核 首评 %d → 复评 %d/阈值 %d%s：%s",
+                    group_id,
+                    verdict.score,
+                    rechecked.score,
+                    profile.proactivity_threshold,
+                    "[与我对话]" if rechecked.to_me else "",
+                    rechecked.reason,
+                )
+                if rechecked.score >= profile.proactivity_threshold:
+                    return Decision(
+                        should_reply=True,
+                        score=rechecked.score,
+                        reason=rechecked.reason,
+                    )
+                return Decision(
+                    should_reply=False,
+                    score=rechecked.score,
+                    reason=rechecked.reason,
+                )
+
         if verdict.score >= profile.proactivity_threshold:
             return Decision(
                 should_reply=True, score=verdict.score, reason=verdict.reason

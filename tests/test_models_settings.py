@@ -78,6 +78,27 @@ def test_profile_strict_whitelist_and_override():
     assert p_over.cooldown_seconds == 60      # 哨兵 -1 继承默认
 
 
+def test_guardrail_defaults_override_and_disable():
+    """反插嘴护栏：缺省走内置默认值；单群可覆盖，显式 0 表示关闭。"""
+    cfg = base_cfg(
+        groups={
+            "111": {"min_gap_messages": 5},
+            "222": {"busy_rate_per_min": 0},
+        }
+    )
+    s = load_settings(DictCfg(cfg))
+    assert s.groups_default.min_gap_messages == 3     # 内置默认
+    assert s.groups_default.busy_rate_per_min == 6
+    assert s.profile_for(111).min_gap_messages == 5   # 单群覆盖生效
+    assert s.profile_for(111).busy_rate_per_min == 6  # 未覆盖项继承默认
+    assert s.profile_for(222).busy_rate_per_min == 0  # 显式关闭
+
+    # 缺省键的哨兵值 -1 也应落到内置默认
+    cfg2 = base_cfg(groups_default={"min_gap_messages": -1})
+    s2 = load_settings(DictCfg(cfg2))
+    assert s2.groups_default.min_gap_messages == 3
+
+
 def test_whitelist_empty_allows_all_when_default_enabled():
     """groups 为空 + groups_default.enabled=True → 全量兜底模式。"""
     s = load_settings(DictCfg(base_cfg()))    # base_cfg 里 groups={} 且 enabled=True
@@ -171,3 +192,26 @@ def test_generation_emoji_validation():
         load_settings(DictCfg(base_cfg(generation={"emoji_chance": -0.1})))
     with pytest.raises(ValueError):
         load_settings(DictCfg(base_cfg(generation={"emoji_max": -1})))
+
+
+def test_generation_recheck_defaults():
+    """复核键缺失时走默认值：开关打开，触发下限 5。"""
+    s = load_settings(DictCfg(base_cfg()))
+    assert s.generation.recheck_enabled is True
+    assert s.generation.recheck_min_score == 5
+
+
+def test_generation_recheck_custom_values():
+    cfg = base_cfg(generation={"recheck_enabled": False, "recheck_min_score": 3})
+    s = load_settings(DictCfg(cfg))
+    assert s.generation.recheck_enabled is False
+    assert s.generation.recheck_min_score == 3
+
+
+def test_generation_recheck_validation():
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(generation={"recheck_min_score": -1})))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(generation={"recheck_min_score": 11})))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(generation={"recheck_enabled": "yes"})))

@@ -14,6 +14,7 @@ from .models import ChatRecord, GenerationSettings
 from .prompts import (
     Message,
     final_user_prompt_judge,
+    final_user_prompt_judge_recheck,
     final_user_prompt_reply,
     history_to_turns,
 )
@@ -46,6 +47,7 @@ _EMOJI_RE = re.compile(
 class JudgeVerdict:
     score: int
     reason: str
+    to_me: bool = False  # 这条消息是否在对我说、延续与我相关的对话
 
 
 _IMAGE_HEAD = 48  # debug 日志中图片 data URL 只保留头部字符数
@@ -107,22 +109,43 @@ class AIClient:
         now_text: str,
         *,
         threshold: int | None = None,
+        prev_verdict: JudgeVerdict | None = None,
+        min_score: int | None = None,
     ) -> JudgeVerdict:
-        """判断模型评估是否回复该消息；解析失败按 0 分处理并记日志。"""
+        """判断模型评估是否回复该消息；解析失败按 0 分处理并记日志。
+
+        prev_verdict 传入首评的判定时进入复核模式：本次调用会把本群真实
+        门槛与复核下限 min_score 告知模型，请其针对「高于下限却未达门槛」
+        的首评结论重新裁定。首评与复核共用相同的 L1-L3 前缀，KVCache 可
+        直接复用。
+        """
         # 历史层不含当前消息本身（它单独出现在指令层，保证历史层前缀稳定）
         turns, _ = history_to_turns(recent_records[:-1], self._generation.max_context_chars)
         history_messages = [{"role": t.role, "content": t.content} for t in turns]
+        if prev_verdict is not None:
+            assert threshold is not None, "复核模式必须提供 threshold 以告知门槛"
+            assert min_score is not None, "复核模式必须提供 min_score 以告知触发下限"
+            final_user = final_user_prompt_judge_recheck(
+                now_text,
+                current_message,
+                prev_score=prev_verdict.score,
+                prev_reason=prev_verdict.reason,
+                threshold=threshold,
+                min_score=min_score,
+            )
+            tag = "[judge·复核]"
+        else:
+            final_user = final_user_prompt_judge(now_text, current_message)
+            tag = "[judge]"
         chat: list[Message] = [
             {"role": "system", "content": static_system},
             {"role": "system", "content": runtime_system},
             *history_messages,
-            {
-                "role": "user",
-                "content": final_user_prompt_judge(now_text, current_message, threshold),
-            },
+            {"role": "user", "content": final_user},
         ]
         logger.debug(
-            "[judge] model=%s 消息数=%d\n%s",
+            "%s model=%s 消息数=%d\n%s",
+            tag,
             self._judge_model,
             len(chat),
             format_messages_for_log(chat),
@@ -166,13 +189,14 @@ class AIClient:
         now_text: str,
         *,
         forced: bool,
+        engaged: bool = False,
         score: int | None = None,
         reason: str = "",
     ) -> str | None:
         """回复模型生成一句群聊回应；direct 模式下附带图片内容块。"""
         turns, _ = history_to_turns(recent_records[:-1], self._generation.max_context_chars)
         text_part = final_user_prompt_reply(
-            now_text, current_message, forced=forced, score=score, reason=reason
+            now_text, current_message, forced=forced, engaged=engaged, score=score, reason=reason
         )
         final_user: str | list[dict]
         if current_message.images:
@@ -256,8 +280,12 @@ def _verdict_from_json(text: str) -> JudgeVerdict | None:
         except (ValueError, TypeError):
             continue
         if isinstance(obj, dict) and "score" in obj:
+            # to_me 只认 JSON 布尔：字符串/数字等脏数据一律视为 False，
+            # 绝不因解析歧义误判「在和我说话」
+            to_me = obj.get("to_me") is True
             return JudgeVerdict(
                 score=max(0, min(10, int(obj["score"]))),
+                to_me=to_me,
                 reason=str(obj.get("reason", ""))[:100],
             )
     return None

@@ -12,7 +12,9 @@
             "persona": "",
             "proactivity_threshold": -1,
             "cooldown_seconds": -1,
-            "context_size": -1
+            "context_size": -1,
+            "min_gap_messages": -1,
+            "busy_rate_per_min": -1
         }
     },
     "groups_default": {
@@ -20,7 +22,9 @@
         "persona": "你叫糖糖，是一个混迹在QQ群里的真人感群友：热爱编程与二次元，说话口语化、简短，偶尔用颜文字，会调侃但不过火；不确定的事情直接说不知道，绝不编造事实。",
         "proactivity_threshold": 8,
         "cooldown_seconds": 600,
-        "context_size": 20
+        "context_size": 20,
+        "min_gap_messages": 3,
+        "busy_rate_per_min": 6
     },
     "ai_backend": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4/",
@@ -36,6 +40,8 @@
         "temperature": 0.8,
         "max_context_chars": 8000,
         "timeout_seconds": 60,
+        "recheck_enabled": true,
+        "recheck_min_score": 5,
         "emoji_chance": 0.25,
         "emoji_max": 2
     },
