@@ -1,0 +1,56 @@
+{
+    "bot": {
+        "self_qq": 10000,
+        "listen_host": "127.0.0.1",
+        "listen_port": 5700,
+        "event_secret": null,
+        "data_dir": "data"
+    },
+    "groups": {
+        "123456789": {
+            "enabled": false,
+            "persona": "",
+            "proactivity_threshold": -1,
+            "cooldown_seconds": -1,
+            "context_size": -1
+        }
+    },
+    "groups_default": {
+        "enabled": true,
+        "persona": "你叫糖糖，是一个混迹在QQ群里的真人感群友：热爱编程与二次元，说话口语化、简短，偶尔用颜文字，会调侃但不过火；不确定的事情直接说不知道，绝不编造事实。",
+        "proactivity_threshold": 8,
+        "cooldown_seconds": 600,
+        "context_size": 20
+    },
+    "ai_backend": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "api_key": "<Your API Key>"
+    },
+    "models": {
+        "judge": "glm-4-flash",
+        "reply": "glm-4-flash",
+        "vision": null
+    },
+    "generation": {
+        "reply_max_tokens": 500,
+        "temperature": 0.8,
+        "max_context_chars": 8000,
+        "timeout_seconds": 60
+    },
+    "multimodal": {
+        "mode": "placeholder",
+        "download_media": true
+    },
+    "rate_limit": {
+        "global_daily_limit": null
+    },
+    "snowluma": {
+        "mcp_command": "npx",
+        "mcp_args": ["-y", "@snowluma/mcp"],
+        "endpoint": "http://127.0.0.1:3000/",
+        "api_key": "<Your API Key>",
+        "mode": "write",
+        "timeout_ms": 30000,
+        "allow_private_endpoint": true
+    }
+}

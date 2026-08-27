@@ -1,3 +1,7 @@
 .venv/
 .idea/
 config.json
+__pycache__/
+*.pyc
+data/
+.pytest_cache/

@@ -3,6 +3,7 @@ name = "candybot"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "aiohttp>=3.14.3",
     "mcp>=2.1.1",
     "openai>=3.5.0",
 ]
@@ -10,3 +11,13 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
