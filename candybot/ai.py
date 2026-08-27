@@ -1,16 +1,21 @@
-"""OpenAI 兼容 API 的三个调用角色：judge（打分）、reply（回复）、vision（转述）。"""
+"""OpenAI 兼容 API 的三个调用角色：judge（打分）、reply（回复）、vision（转述）。
+
+每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
+上下文窗口与输出上限（见 models.ModelConfig）。
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
-from .models import ChatRecord, GenerationSettings
+from .models import ChatRecord, GenerationSettings, ModelConfig, ModelSettings
 from .prompts import (
     Message,
     final_user_prompt_judge,
@@ -77,6 +82,14 @@ class ImageOp:
 
 _IMAGE_HEAD = 48  # debug 日志中图片 data URL 只保留头部字符数
 
+# judge 需要输出思考段，上限太小会把结论截掉；models.judge.max_output_tokens 可覆盖
+_JUDGE_MAX_TOKENS = 1000
+# 视觉两个调用各自的输出上限；models.vision.max_output_tokens 可统一覆盖
+_DESCRIBE_MAX_TOKENS = 80
+_ASSESS_MAX_TOKENS = 400
+# 上下文窗口预算中为消息 role 标记等固定格式开销预留的 token 数
+_CONTEXT_OVERHEAD_TOKENS = 128
+
 
 def format_messages_for_log(messages: list[Message]) -> str:
     """把每次请求的消息数组转成可读文本（debug 用）。
@@ -137,26 +150,48 @@ def split_image_ops(text: str) -> tuple[str, list[ImageOp]]:
 
 
 class AIClient:
-    """封装三种 LLM 调用。所有方法都可能抛出 openai 库异常，由上层决定重试。"""
+    """封装三种 LLM 调用。所有方法都可能抛出 openai 库异常，由上层决定重试。
+
+    每个角色一个 ModelConfig：可指向不同提供商并携带各自的窗口/输出限额；
+    相同 (base_url, api_key) 的角色共享同一个 AsyncOpenAI 连接池。
+    """
 
     def __init__(
         self,
         *,
-        base_url: str,
-        api_key: str,
-        judge_model: str,
-        reply_model: str,
-        vision_model: str | None,
+        models: ModelSettings,
         generation: GenerationSettings,
         multimodal_mode: str = "placeholder",
     ):
-        self._client = AsyncOpenAI(base_url=base_url or None, api_key=api_key)
-        self._judge_model = judge_model
-        self._reply_model = reply_model
-        self._vision_model = vision_model
+        self._judge = models.judge
+        self._reply = models.reply
+        self._vision = models.vision
         self._generation = generation
         # 只有 direct 模式才允许任何图片（历史层或当前消息）进入请求
         self._multimodal_mode = multimodal_mode
+        self._clients: dict[tuple[str, str], AsyncOpenAI] = {}
+
+    def _client_for(self, cfg: ModelConfig) -> AsyncOpenAI:
+        key = (cfg.base_url, cfg.api_key)
+        client = self._clients.get(key)
+        if client is None:
+            # api_key 留空表示端点无需密钥：先取环境变量，再退本地服务通用的占位符
+            api_key = cfg.api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
+            client = AsyncOpenAI(base_url=cfg.base_url or None, api_key=api_key)
+            self._clients[key] = client
+        return client
+
+    def _history_chars(self, cfg: ModelConfig, prompt_chars: int) -> int:
+        """结合模型上下文窗口推算历史层的字符预算。
+
+        窗口按 token 计而历史裁剪按字符计，中文场景保守按 1 token ≈ 1 char
+        折算，并预留本次输出与固定格式开销；未配置窗口时沿用全局字符上限。
+        direct 模式原图的 token 开销因提供商而异，不参与估算。
+        """
+        if cfg.context_window is None:
+            return self._generation.max_context_chars
+        reserved = (cfg.max_output_tokens or 0) + prompt_chars + _CONTEXT_OVERHEAD_TOKENS
+        return max(0, min(self._generation.max_context_chars, cfg.context_window - reserved))
 
     # ---------------------------------------------------------------- judge
 
@@ -180,8 +215,7 @@ class AIClient:
         直接复用。
         """
         # 历史层不含当前消息本身（它单独出现在指令层，保证历史层前缀稳定）
-        turns, _ = history_to_turns(recent_records[:-1], self._generation.max_context_chars)
-        history_messages = [{"role": t.role, "content": t.content} for t in turns]
+        # 预算需扣除 L4 文本本身，故先构造指令层再裁历史
         if prev_verdict is not None:
             assert threshold is not None, "复核模式必须提供 threshold 以告知门槛"
             assert min_score is not None, "复核模式必须提供 min_score 以告知触发下限"
@@ -197,6 +231,11 @@ class AIClient:
         else:
             final_user = final_user_prompt_judge(now_text, current_message)
             tag = "[judge]"
+        prompt_chars = len(static_system) + len(runtime_system) + len(final_user)
+        turns, _ = history_to_turns(
+            recent_records[:-1], self._history_chars(self._judge, prompt_chars)
+        )
+        history_messages = [{"role": t.role, "content": t.content} for t in turns]
         chat: list[Message] = [
             {"role": "system", "content": static_system},
             {"role": "system", "content": runtime_system},
@@ -206,16 +245,16 @@ class AIClient:
         logger.debug(
             "%s model=%s 消息数=%d\n%s",
             tag,
-            self._judge_model,
+            self._judge.model,
             len(chat),
             format_messages_for_log(chat),
         )
-        response = await self._client.chat.completions.create(
-            model=self._judge_model,
+        response = await self._client_for(self._judge).chat.completions.create(
+            model=self._judge.model,
             messages=chat,
             temperature=0.2,
             # 推理型 judge 模型的思考段会占掉不少 token，上限太小会把结论截掉
-            max_tokens=1000,
+            max_tokens=self._judge.max_output_tokens or _JUDGE_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
         raw = (response.choices[0].message.content or "").strip()
@@ -254,19 +293,22 @@ class AIClient:
         reason: str = "",
     ) -> str | None:
         """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。"""
+        text_part = final_user_prompt_reply(
+            now_text, current_message, forced=forced, engaged=engaged, score=score, reason=reason
+        )
+        # 预算需扣除 L4 文本本身，故先构造指令层再裁历史；原图 token 开销不参与估算
+        prompt_chars = len(static_system) + len(runtime_system) + len(text_part)
+        budget = self._history_chars(self._reply, prompt_chars)
         if self._multimodal_mode == "direct":
             turns, _ = reply_history_turns(
                 recent_records[:-1],
-                self._generation.max_context_chars,
+                budget,
                 self._generation.max_history_images,
             )
             history_messages = [_turn_to_message(t) for t in turns]
         else:
-            turns, _ = history_to_turns(recent_records[:-1], self._generation.max_context_chars)
+            turns, _ = history_to_turns(recent_records[:-1], budget)
             history_messages = [{"role": t.role, "content": t.content} for t in turns]
-        text_part = final_user_prompt_reply(
-            now_text, current_message, forced=forced, engaged=engaged, score=score, reason=reason
-        )
         final_user: str | list[dict]
         if self._multimodal_mode == "direct" and current_message.images:
             blocks: list[dict] = [{"type": "text", "text": text_part}]
@@ -284,15 +326,15 @@ class AIClient:
         ]
         logger.debug(
             "[reply] model=%s 消息数=%d\n%s",
-            self._reply_model,
+            self._reply.model,
             len(chat),
             format_messages_for_log(chat),
         )
-        response = await self._client.chat.completions.create(
-            model=self._reply_model,
+        response = await self._client_for(self._reply).chat.completions.create(
+            model=self._reply.model,
             messages=chat,
             temperature=self._generation.temperature,
-            max_tokens=self._generation.reply_max_tokens,
+            max_tokens=self._reply.max_output_tokens or self._generation.reply_max_tokens,
             timeout=self._generation.timeout_seconds,
         )
         reply = (response.choices[0].message.content or "").strip()
@@ -305,15 +347,15 @@ class AIClient:
 
     async def describe_image(self, data_url: str) -> str | None:
         """视觉模型把图片转成一句话描述；未配置 vision 模型时返回 None。"""
-        if not self._vision_model:
+        if not self._vision:
             return None
         logger.debug(
             "[vision] model=%s 图片 %d 字符",
-            self._vision_model,
+            self._vision.model,
             len(data_url),
         )
-        response = await self._client.chat.completions.create(
-            model=self._vision_model,
+        response = await self._client_for(self._vision).chat.completions.create(
+            model=self._vision.model,
             messages=[
                 {
                     "role": "user",
@@ -324,7 +366,7 @@ class AIClient:
                 }
             ],
             temperature=0.3,
-            max_tokens=80,
+            max_tokens=self._vision.max_output_tokens or _DESCRIBE_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
         desc = (response.choices[0].message.content or "").strip()
@@ -336,15 +378,15 @@ class AIClient:
         未配置 vision 模型或调用/解析失败时安全侧返回保留原图：宁可
         多花些 token 也不凭空丢信息，后续仍可通过 <drop_img> 标记降级。
         """
-        if not self._vision_model:
+        if not self._vision:
             return ImageAssessment(summary=None, keep_raw=True)
         logger.debug(
             "[vision·assess] model=%s 图片 %d 字符",
-            self._vision_model,
+            self._vision.model,
             len(data_url),
         )
-        response = await self._client.chat.completions.create(
-            model=self._vision_model,
+        response = await self._client_for(self._vision).chat.completions.create(
+            model=self._vision.model,
             messages=[
                 {
                     "role": "user",
@@ -365,7 +407,7 @@ class AIClient:
                 }
             ],
             temperature=0.2,
-            max_tokens=400,
+            max_tokens=self._vision.max_output_tokens or _ASSESS_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
         raw = (response.choices[0].message.content or "").strip()

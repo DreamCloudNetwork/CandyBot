@@ -200,11 +200,18 @@ class GroupProfile:
 # 该条数即整体静默（只答 @）。0 均可显式关闭。
 MIN_GAP_MESSAGES_DEFAULT = 3
 BUSY_RATE_PER_MIN_DEFAULT = 6
+# 历史条数内置默认：groups_default 未写 context_size（哨兵 -1）时兜底。
+# 不允许 ≤0 生效——memory.tail 对非正数返回空列表，等于静默失忆。
+CONTEXT_SIZE_DEFAULT = 20
 
 
-def _apply_guardrail_defaults(profile: GroupProfile) -> GroupProfile:
-    """把 groups_default 里缺省(-1)的护栏字段替换为内置默认值。"""
-    if profile.min_gap_messages >= 0 and profile.busy_rate_per_min >= 0:
+def _apply_builtin_defaults(profile: GroupProfile) -> GroupProfile:
+    """把 groups_default 里缺省(-1)的字段替换为内置默认值。"""
+    if (
+        profile.min_gap_messages >= 0
+        and profile.busy_rate_per_min >= 0
+        and profile.context_size > 0
+    ):
         return profile
     return GroupProfile(
         group_id=profile.group_id,
@@ -212,7 +219,11 @@ def _apply_guardrail_defaults(profile: GroupProfile) -> GroupProfile:
         persona=profile.persona,
         proactivity_threshold=profile.proactivity_threshold,
         cooldown_seconds=profile.cooldown_seconds,
-        context_size=profile.context_size,
+        context_size=(
+            profile.context_size
+            if profile.context_size > 0
+            else CONTEXT_SIZE_DEFAULT
+        ),
         min_gap_messages=(
             profile.min_gap_messages
             if profile.min_gap_messages >= 0
@@ -228,15 +239,33 @@ def _apply_guardrail_defaults(profile: GroupProfile) -> GroupProfile:
 
 @dataclass(frozen=True)
 class AISettings:
+    """全局默认提供商：models 里未写 base_url / api_key 的模型继承这里。"""
+
     base_url: str
     api_key: str
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    """单个模型角色的生效配置（base_url / api_key 已按继承规则解析完毕）。
+
+    context_window 为该模型的上下文窗口（token），运行时据此约束送入的
+    历史长度；max_output_tokens 为该模型单次调用的输出上限（token），
+    未配置时各角色回落到自己的内置/全局默认值。
+    """
+
+    model: str
+    base_url: str
+    api_key: str  # 可为空：本地服务等无密钥端点（运行时回退环境变量/占位符）
+    context_window: int | None
+    max_output_tokens: int | None
+
+
+@dataclass(frozen=True)
 class ModelSettings:
-    judge: str
-    reply: str
-    vision: str | None
+    judge: ModelConfig
+    reply: ModelConfig
+    vision: ModelConfig | None
 
 
 @dataclass(frozen=True)
@@ -364,6 +393,17 @@ def _require_section(cfg: Any, name: str) -> dict[str, Any]:
     return section
 
 
+def _optional_section(cfg: Any, name: str) -> dict[str, Any]:
+    """同 _require_section，但段整体缺省时返回空对象（条目级校验另行兜底）。"""
+    try:
+        section = getattr(cfg, name)
+    except (AttributeError, KeyError):
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError(f"config.json5 中 `{name}` 应为对象")
+    return section
+
+
 def _get(section: dict[str, Any], key: str, default: Any) -> Any:
     value = section.get(key, default)
     return default if value is None else value
@@ -431,7 +471,7 @@ def load_settings(cfg: Any) -> Settings:
         gid = _coerce_group_id(key)
         groups[gid] = _parse_group_profile(raw, f"groups.{key}", gid)
 
-    default_profile = _apply_guardrail_defaults(
+    default_profile = _apply_builtin_defaults(
         _parse_group_profile(
             _require_section(cfg, "groups_default"), "groups_default", None
         )
@@ -439,7 +479,7 @@ def load_settings(cfg: Any) -> Settings:
     if not default_profile.persona:
         raise ValueError("groups_default.persona 不能为空")
 
-    ai_cfg = _require_section(cfg, "ai_backend")
+    ai_cfg = _optional_section(cfg, "ai_backend")
     ai_settings = AISettings(
         base_url=_parse_str(ai_cfg, "base_url", ""),
         api_key=_parse_str(ai_cfg, "api_key", ""),
@@ -447,12 +487,14 @@ def load_settings(cfg: Any) -> Settings:
 
     models_cfg = _require_section(cfg, "models")
     model_settings = ModelSettings(
-        judge=_parse_str(models_cfg, "judge", ""),
-        reply=_parse_str(models_cfg, "reply", ""),
-        vision=_parse_optional_str(models_cfg, "vision"),
+        judge=_parse_model_config(models_cfg.get("judge"), "models.judge", ai_settings),
+        reply=_parse_model_config(models_cfg.get("reply"), "models.reply", ai_settings),
+        vision=(
+            _parse_model_config(models_cfg["vision"], "models.vision", ai_settings)
+            if models_cfg.get("vision") is not None
+            else None
+        ),
     )
-    if not model_settings.judge or not model_settings.reply:
-        raise ValueError("config.json5 → models.judge / models.reply 必须指定模型名")
 
     gen_cfg = _require_section(cfg, "generation")
     emoji_chance = float(_get(gen_cfg, "emoji_chance", 0.25))
@@ -551,6 +593,52 @@ def _coerce_group_id(key: str) -> int:
         return int(key)
     except ValueError as exc:
         raise ValueError(f"groups 中的群号必须是整数字符串，实际是 {key!r}") from exc
+
+
+def _parse_model_config(raw: Any, label: str, defaults: AISettings) -> ModelConfig:
+    """解析 models 里的单个角色条目，缺省项继承全局默认提供商。
+
+    raw 允许两种写法：模型名字符串（等价于只写 model 字段），或对象
+    （可覆盖 base_url / api_key 并配置 context_window / max_output_tokens）。
+    """
+    if raw is None:
+        raise ValueError(f"config.json5 → `{label}` 必须指定模型名")
+    if isinstance(raw, str):
+        raw = {"model": raw}
+    if not isinstance(raw, dict):
+        raise ValueError(f"`{label}` 应为模型名字符串或配置对象")
+    model = _parse_str(raw, "model", "")
+    if not model:
+        raise ValueError(f"config.json5 → `{label}.model` 必须指定模型名")
+    context_window = _parse_optional_int(raw, "context_window")
+    if context_window is not None and context_window <= 0:
+        raise ValueError(
+            f"配置项 `{label}.context_window` 必须为正整数，实际是 {context_window!r}"
+        )
+    max_output = _parse_optional_int(raw, "max_output_tokens")
+    if max_output is not None and max_output <= 0:
+        raise ValueError(
+            f"配置项 `{label}.max_output_tokens` 必须为正整数，实际是 {max_output!r}"
+        )
+    if context_window is not None and max_output is not None and max_output >= context_window:
+        raise ValueError(
+            f"配置项 `{label}.max_output_tokens`（{max_output}）必须小于 "
+            f"`{label}.context_window`（{context_window}），否则模型装不下任何输入"
+        )
+    base_url = _parse_str(raw, "base_url", "") or defaults.base_url
+    api_key = _parse_str(raw, "api_key", "") or defaults.api_key
+    if not base_url:
+        raise ValueError(
+            f"`{label}` 未配置 base_url，且 ai_backend.base_url 为空："
+            "两者至少要有一处给出 OpenAI 兼容 API 地址"
+        )
+    return ModelConfig(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        context_window=context_window,
+        max_output_tokens=max_output,
+    )
 
 
 def _parse_group_profile(raw: Any, label: str, group_id: int | None) -> GroupProfile:

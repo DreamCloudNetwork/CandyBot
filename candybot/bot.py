@@ -76,11 +76,7 @@ class CandyBot:
         )
         self._http = aiohttp.ClientSession()
         self._ai = AIClient(
-            base_url=settings.ai_backend.base_url,
-            api_key=settings.ai_backend.api_key,
-            judge_model=settings.models.judge,
-            reply_model=settings.models.reply,
-            vision_model=settings.models.vision,
+            models=settings.models,
             generation=settings.generation,
             multimodal_mode=settings.multimodal.mode,
         )

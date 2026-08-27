@@ -37,14 +37,14 @@ uv run main.py                   # 启动
 | groups_default | persona                        | 人设；以下护栏参数缺省(-1)时使用内置默认值：                                                                                              |
 |                | proactivity_threshold          | judge 打分达到该值才主动发言（0-10）                                                                                                      |
 |                | cooldown_seconds               | 主动发言后的冷却秒数，冷却期内直接跳过判定（@必答不受限）                                                                                 |
-|                | context_size                   | 喂给模型的上下文消息条数                                                                                                                  |
+|                | context_size                   | 喂给模型的上下文消息条数（默认 20）                                                                                                       |
 |                | min_gap_messages               | 自己上次发言后需攒够这么多条他人消息才会再次评估主动发言（默认 3）；0 关闭                                                                |
 |                | busy_rate_per_min              | 最近 60 秒群内消息达到该条数即整体静默（默认 6），避免在多人接龙时硬插话；0 关闭                                                          |
-| ai_backend     | base_url / api_key             | OpenAI 兼容 API 地址与密钥                                                                                                                |
-| models         | judge                          | 判断是否参与话题的模型（建议便宜快速的，如 glm-4-flash）                                                                                  |
-|                | reply                          | 参与回答生成回复的模型                                                                                                                    |
-|                | vision                         | 视觉模型：describe 模式的转述、direct 模式收图入库时的总结/保留判定都靠它                                                                  |
-| generation     | reply_max_tokens / temperature | 回复生成长度与随机性                                                                                                                      |
+| ai_backend     | base_url / api_key             | 全局默认提供商：models 条目未写 base_url / api_key 时继承这里；api_key 也可留空改经环境变量 OPENAI_API_KEY 提供（本地无密钥端点自动用占位符） |
+| models         | judge                          | 判断是否参与话题的模型（建议便宜快速的，如 glm-4-flash）。三种角色可来自不同提供商，见下行 |
+|                | reply                          | 参与回答生成回复的模型。每个角色既可写模型名字符串（继承 ai_backend），也可写对象覆盖 `base_url` / `api_key`，并配置 `context_window`（上下文窗口，token，用于约束历史长度）与 `max_output_tokens`（单次输出上限） |
+|                | vision                         | 视觉模型：describe 模式的转述、direct 模式收图入库时的总结/保留判定都靠它；同样支持按模型覆盖提供商与限额 |
+| generation     | reply_max_tokens / temperature | 回复生成长度与随机性（reply 模型配置了 max_output_tokens 时以其为准）                     |
 |                | max_context_chars              | 喂给模型的历史上下文总字符上限                                                                                                            |
 |                | timeout_seconds                | 单次 LLM 调用超时                                                                                                                         |
 |                | recheck_enabled / recheck_min_score | 门槛复核（复评）开关与触发下限：首评分严格高于下限却未达群门槛时把真实门槛告知 judge 再裁一次（默认开 / 下限 5，范围 0-10）               |

@@ -33,24 +33,37 @@
         "persona": "你叫糖糖，是一个混迹在QQ群里的真人感群友：热爱编程与二次元，说话口语化、简短，偶尔用颜文字，会调侃但不过火；不确定的事情直接说不知道，绝不编造事实。",
         "proactivity_threshold": 8,       // 兴趣评分达到该值才主动回复（0~10）
         "cooldown_seconds": 600,          // 主动回复后每群冷却秒数
-        "context_size": 20,               // 送入模型的每群历史消息条数
+        "context_size": 20,               // 送入模型的每群历史消息条数（不写时同样取 20）
         "min_gap_messages": 3,            // 两次主动回复之间至少间隔的群消息数
         "busy_rate_per_min": 6,           // 群消息超过该频率时视为繁忙、抑制主动回复
     },
 
+    // AI 提供商全局默认：下面 models 条目未写 base_url / api_key 时继承这里
     "ai_backend": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4/",
-        "api_key": "<Your API Key>",
+        "api_key": "<Your API Key>",      // 也可留空并经环境变量 OPENAI_API_KEY 提供
     },
 
+    // 每个角色独立选模型，三者可来自不同提供商。
+    // 字符串写法 = 仅模型名，提供商与限额继承 ai_backend（向后兼容旧配置）。
+    // 对象写法可按模型覆盖：
+    //   base_url / api_key   该模型的 OpenAI 兼容端点与密钥（缺省继承 ai_backend）
+    //   context_window       上下文窗口（token），用于约束送入的历史长度
+    //   max_output_tokens    该模型单次调用的最大输出 token
     "models": {
         "judge": "glm-4-flash",           // 兴趣评分模型
-        "reply": "glm-4-flash",           // 生成回复模型
-        // "vision": "glm-4v-xxx",        // 视觉模型；注释掉表示禁用图片理解
+        "reply": {
+            "model": "glm-4-flash",
+            // "base_url": "https://api.deepseek.com/v1",
+            // "api_key": "<Another Provider API Key>",
+            // "context_window": 64000,
+            // "max_output_tokens": 800,
+        },
+        // "vision": "glm-4v-flash",      // 视觉模型；注释掉表示禁用图片理解
     },
 
     "generation": {
-        "reply_max_tokens": 500,
+        "reply_max_tokens": 500,          // reply 模型未配置 max_output_tokens 时生效
         "temperature": 0.8,
         "max_context_chars": 8000,        // 上下文总字符数上限
         "timeout_seconds": 60,

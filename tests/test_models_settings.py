@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from candybot.models import (
+    CONTEXT_SIZE_DEFAULT,
     GroupProfile,
     Settings,
     load_settings,
@@ -97,6 +98,30 @@ def test_guardrail_defaults_override_and_disable():
     cfg2 = base_cfg(groups_default={"min_gap_messages": -1})
     s2 = load_settings(DictCfg(cfg2))
     assert s2.groups_default.min_gap_messages == 3
+
+
+def test_context_size_builtin_default():
+    """groups_default 缺省/哨兵 -1 的 context_size 落到内置默认，绝不静默清空历史。"""
+    # 整个键不写
+    cfg = base_cfg()
+    del cfg["groups_default"]["context_size"]
+    s = load_settings(DictCfg(cfg))
+    assert s.groups_default.context_size == CONTEXT_SIZE_DEFAULT
+    # 全量兜底模式（groups 为空）解析出的每群条数同样带上默认值
+    assert s.profile_for(88888).context_size == CONTEXT_SIZE_DEFAULT
+
+    # 显式写哨兵 -1 与不写等价
+    cfg2 = base_cfg(groups_default={"context_size": -1})
+    assert load_settings(DictCfg(cfg2)).groups_default.context_size == CONTEXT_SIZE_DEFAULT
+
+    # 单群条目：哨兵继承 groups_default，显式值覆盖
+    cfg3 = base_cfg(
+        groups_default={"context_size": -1},
+        groups={"111": {"context_size": 5}, "222": {}},
+    )
+    s3 = load_settings(DictCfg(cfg3))
+    assert s3.profile_for(111).context_size == 5
+    assert s3.profile_for(222).context_size == CONTEXT_SIZE_DEFAULT
 
 
 def test_whitelist_empty_allows_all_when_default_enabled():
@@ -215,3 +240,100 @@ def test_generation_recheck_validation():
         load_settings(DictCfg(base_cfg(generation={"recheck_min_score": 11})))
     with pytest.raises(ValueError):
         load_settings(DictCfg(base_cfg(generation={"recheck_enabled": "yes"})))
+
+
+# ---------------------------------------------------------------- 多提供商模型
+
+
+def test_models_string_form_inherits_backend():
+    """字符串写法 = 仅模型名，提供商继承 ai_backend（向后兼容）。"""
+    s = load_settings(DictCfg(base_cfg(models={"judge": "j", "reply": "r"})))
+    assert s.models.judge.model == "j"
+    assert s.models.judge.base_url == "https://api.example.com/v1"
+    assert s.models.judge.api_key == "k"
+    assert s.models.judge.context_window is None
+    assert s.models.judge.max_output_tokens is None
+    assert s.models.reply.model == "r"
+    assert s.models.vision is None
+
+
+def test_models_object_form_per_provider():
+    """对象写法可按模型覆盖 base_url / api_key 与限额。"""
+    cfg = base_cfg(
+        models={
+            "judge": {
+                "model": "glm-4-flash",
+                "context_window": 8192,
+                "max_output_tokens": 1000,
+            },
+            "reply": {
+                "model": "deepseek-chat",
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": "kr",
+                "context_window": 64000,
+                "max_output_tokens": 800,
+            },
+            "vision": {"model": "glm-4v-flash", "api_key": "kv"},
+        }
+    )
+    s = load_settings(DictCfg(cfg))
+    assert s.models.judge.base_url == "https://api.example.com/v1"   # 未写 → 继承
+    assert s.models.judge.context_window == 8192
+    assert s.models.judge.max_output_tokens == 1000
+    assert s.models.reply.base_url == "https://api.deepseek.com/v1"  # 覆盖
+    assert s.models.reply.api_key == "kr"
+    assert s.models.reply.context_window == 64000
+    assert s.models.reply.max_output_tokens == 800
+    assert s.models.vision.model == "glm-4v-flash"
+    assert s.models.vision.api_key == "kv"                           # 单项覆盖，其余继承
+    assert s.models.vision.base_url == "https://api.example.com/v1"
+
+
+def test_models_without_ai_backend_section():
+    """三个模型都自带提供商时，ai_backend 段可整个省略。"""
+    cfg = base_cfg()
+    del cfg["ai_backend"]
+    cfg["models"] = {
+        "judge": {"model": "j", "base_url": "https://j.example.com/v1", "api_key": "kj"},
+        "reply": {"model": "r", "base_url": "https://r.example.com/v1", "api_key": "kr"},
+    }
+    s = load_settings(DictCfg(cfg))
+    assert s.models.judge.base_url == "https://j.example.com/v1"
+    assert s.models.reply.base_url == "https://r.example.com/v1"
+
+
+def test_models_missing_base_url_rejected():
+    """模型与其继承的 ai_backend 都没有 base_url 时启动即报错。"""
+    cfg = base_cfg(ai_backend={"base_url": "", "api_key": ""})
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(cfg))
+    # api_key 可以为空（本地无密钥端点），base_url 不行
+    ok = base_cfg(ai_backend={"base_url": "https://api.example.com/v1", "api_key": ""})
+    s = load_settings(DictCfg(ok))
+    assert s.models.reply.api_key == ""
+
+
+def test_models_entry_validation():
+    missing_judge = base_cfg()
+    del missing_judge["models"]["judge"]
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(missing_judge))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(models={"judge": "", "reply": "r"})))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(models={"judge": 123, "reply": "r"})))
+    with pytest.raises(ValueError):
+        load_settings(DictCfg(base_cfg(models={"judge": {"base_url": "https://x/v1"}})))
+
+
+def test_models_limits_validation():
+    """窗口/输出上限必须为正，且输出上限必须小于窗口。"""
+    for bad in (
+        {"model": "r", "context_window": 0},
+        {"model": "r", "context_window": -100},
+        {"model": "r", "max_output_tokens": 0},
+        {"model": "r", "context_window": 100, "max_output_tokens": 100},
+        {"model": "r", "context_window": 100, "max_output_tokens": 500},
+    ):
+        with pytest.raises(ValueError):
+            load_settings(DictCfg(base_cfg(models={"reply": bad})))
