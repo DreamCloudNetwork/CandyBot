@@ -66,6 +66,10 @@ _EMOJI_RE = re.compile(
     f"|[{_EMOJI_CHARS}](?:[\uFE0F\U0001F3FB-\U0001F3FF]|\u200D[{_EMOJI_CHARS}])*"
 )
 
+# 概率掷点统一用加密安全随机源：emoji 掷点本身没有安全属性，但安全扫描
+# 会把 random.random() 按「不安全随机数」告警，走 SystemRandom 消除噪音。
+_RNG = random.SystemRandom()
+
 
 @dataclass(frozen=True)
 class JudgeVerdict:
@@ -652,7 +656,7 @@ class AIClient:
             # 回退/纯文本协议：按旧约定从正文解析（标记写在末尾）
             text, ops = split_image_ops(response.choices[0].message.content or "")
         text = _strip_noise(text)
-        roll_ok = random.random() < self._generation.emoji_chance
+        roll_ok = _RNG.random() < self._generation.emoji_chance
         text = _cap_emojis(text, self._generation.emoji_max if roll_ok else 0)
         if not text:
             return None
