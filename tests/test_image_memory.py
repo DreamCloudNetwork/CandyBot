@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import time
+
+import pytest
 
 from candybot.ai import ImageAssessment, AIClient, split_image_ops
 from candybot.memory import MemoryManager
@@ -32,46 +32,25 @@ def img_record(mid: int, *, images=(IMG_A,), states=(), summaries=None, text="�
     )
 
 
-# ---------------------------------------------------------------- 模型与落盘
+# ---------------------------------------------------------------- 模型与入库
 
 
-def test_record_roundtrip_persists_base64_and_states(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mem = mgr.get(42)
+async def test_record_roundtrip_persists_base64_and_states(tmp_path):
+    manager = MemoryManager(tmp_path)
+    mem = await manager.get(42)
     rec = img_record(1, images=(IMG_A, IMG_B), states=("show", "summarized"),
                      summaries={1: "一张猫图"})
-    mem.append(rec)
+    await mem.append(rec)
 
     # 重启后 base64、状态、总结全部原样恢复
     mgr2 = MemoryManager(tmp_path)
-    loaded = mgr2.get(42).find_by_message_id(1)
+    loaded = await (await mgr2.get(42)).find_by_message_id(1)
     assert loaded is not None
     assert loaded.images == (IMG_A, IMG_B)
     assert [loaded.state_of(i) for i in range(2)] == ["show", "summarized"]
     assert loaded.summary_of(1) == "一张猫图"
-
-
-def test_record_jsonl_contains_base64(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mgr.get(42).append(img_record(3))
-    line = json.loads((tmp_path / "memory" / "42.jsonl").read_text().splitlines()[0])
-    assert IMG_A in line["images"]
-    assert line["image_states"] == ["show"]
-
-
-def test_record_from_json_tolerates_bad_fields():
-    obj = {
-        "message_id": 5,
-        "group_id": 42,
-        "user_id": 1,
-        "images": [IMG_A, 123],
-        "image_states": ["bogus"],
-        "image_summaries": {"0": "总结", "x": "脏数据", 2: None},
-    }
-    rec = ChatRecord.from_json(obj)
-    assert rec.images == (IMG_A,)          # 非字符串项被丢弃
-    assert rec.state_of(0) == "show"       # 非法状态回落默认
-    assert rec.summary_of(0) == "总结" and rec.summary_of(2) is None
+    await manager.close()
+    await mgr2.close()
 
 
 def test_set_image_state_and_placeholder_default():
@@ -104,6 +83,21 @@ def test_reply_turn_renders_each_image_shape():
     assert "[图片：一只猫]" in body_lines[1:]
     assert "[图片]" in body_lines[1:]
     assert turn.content.count("[图片]") == 1  # 占位行不再重复出现
+
+
+def test_reply_turn_renders_pruned_image_slots():
+    """保留期回收后的槽位（数据为空）按总结/占位符渲染，绝不进入原图块。"""
+    rec = img_record(
+        6,
+        images=("", IMG_B),
+        states=("summarized", "show"),
+        summaries={0: "回收的猫图"},
+        text="看图",
+    )
+    turns, _ = reply_history_turns([rec], max_chars=10**6, max_images=8)
+    (turn,) = turns
+    assert turn.images == (IMG_B,)
+    assert "[图片：回收的猫图]" in turn.content
 
 
 def test_reply_turn_plain_when_no_extra_notes():
@@ -179,6 +173,9 @@ def test_parse_assessment_variants():
 async def _normalize_with_assess(mode: str, assessor):
     from candybot.models import MultimodalSettings
 
+    async def no_ref(_i):
+        return None
+
     mm = MultimodalSettings(mode=mode, download_media=True)
     event = {
         "post_type": "message",
@@ -194,7 +191,7 @@ async def _normalize_with_assess(mode: str, assessor):
         event,
         self_qq=99,
         multimodal=mm,
-        find_by_message_id=lambda _i: None,
+        find_by_message_id=no_ref,
         # 会话对象仅作非空标记：下载已被 monkeypatch，不会真正使用
         http_session=object(),
         assess_image=assessor,
@@ -259,121 +256,47 @@ def test_placeholder_mode_persists_base64_but_no_states(monkeypatch):
 # ---------------------------------------------------------------- 记忆层切换
 
 
-def make_mem(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mem = mgr.get(42)
-    mem.append(
+async def make_mem(tmp_path):
+    manager = MemoryManager(tmp_path)
+    mem = await manager.get(42)
+    await mem.append(
         img_record(31, images=(IMG_A, IMG_B),
                    states=("show", "summarized"), summaries={1: "已有总结"})
     )
-    return tmp_path, mem
+    return manager, mem
 
 
-# ---------------------------------------------------------------- 相同图片去重
-
-
-def read_lines(tmp_path):
-    return [
-        json.loads(line)
-        for line in (tmp_path / "memory" / "42.jsonl").read_text().splitlines()
-    ]
-
-
-def test_identical_image_stored_once_as_ref(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mem = mgr.get(42)
-    mem.append(img_record(1))
-    mem.append(img_record(2))  # 同一张图再来一帖
-
-    lines = read_lines(tmp_path)
-    assert lines[0]["images"] == [IMG_A]
-    assert lines[1]["images"][0].startswith("ref:sha256:")
-    # 全文件只有一份原始 base64
-    raw_text = (tmp_path / "memory" / "42.jsonl").read_text()
-    assert raw_text.count(IMG_A) == 1
-
-    # 重启加载后引用全部还原为完整原图
-    loaded = MemoryManager(tmp_path).get(42)
-    assert [r.images for r in loaded.tail(10)] == [(IMG_A,), (IMG_A,)]
-
-
-def test_same_message_duplicates_also_deduped(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mgr.get(42).append(
-        img_record(5, images=(IMG_A, IMG_B, IMG_A),
-                   states=("show",) * 3, summaries={})
-    )
-    expected_ref = "ref:sha256:" + hashlib.sha256(IMG_A.encode()).hexdigest()
-    images = read_lines(tmp_path)[0]["images"]
-    assert images == [IMG_A, IMG_B, expected_ref]
-
-    rec = MemoryManager(tmp_path).get(42).find_by_message_id(5)
-    assert rec.images == (IMG_A, IMG_B, IMG_A)
-
-
-def test_dedupe_reanchors_after_anchor_removed(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mem = mgr.get(42)
-    mem.append(img_record(1))
-    mem.append(img_record(2))
-    # 最早挂靠原图的记录被撤回 → 重写时后一条自动补上原始 base64
-    assert mem.remove(1) is True
-    raw_text = (tmp_path / "memory" / "42.jsonl").read_text()
-    assert raw_text.count(IMG_A) == 1
-    assert not any("ref:sha256:" in json.dumps(obj) for obj in read_lines(tmp_path))
-
-    fresh = MemoryManager(tmp_path).get(42).find_by_message_id(2)
-    assert fresh is not None and fresh.images == (IMG_A,)
-
-
-def test_mixed_unique_and_repeat_roundtrip(tmp_path):
-    mgr = MemoryManager(tmp_path)
-    mem = mgr.get(42)
-    mem.append(img_record(10, images=(IMG_A,)))
-    mem.append(img_record(11, images=(IMG_B,)))
-    mem.append(img_record(12, images=(IMG_B,)))   # 重复 B
-
-    loaded = MemoryManager(tmp_path).get(42)
-    got = loaded.tail(10)
-    assert [r.images for r in got] == [(IMG_A,), (IMG_B,), (IMG_B,)]
-    # 追加一张全新图 + 再来一次重复，指纹表在加载后依然生效
-    mem2 = loaded
-    mem2.append(img_record(13, images=(IMG_C,)))
-    mem2.append(img_record(14, images=(IMG_A,)))
-    lines = read_lines(tmp_path)
-    assert lines[-1]["images"][0].startswith("ref:sha256:")  # 引用回第 10 条的原图
-    assert MemoryManager(tmp_path).get(42).find_by_message_id(14).images == (IMG_A,)
-
-
-def test_transition_drop_keeps_summary_else_placeholder(tmp_path):
-    _, mem = make_mem(tmp_path)
-    assert mem.transition_images(31, "drop") is True
-    rec = mem.find_by_message_id(31)
+async def test_transition_drop_keeps_summary_else_placeholder(tmp_path):
+    manager, mem = await make_mem(tmp_path)
+    assert await mem.transition_images(31, "drop") is True
+    rec = await mem.find_by_message_id(31)
     assert rec.state_of(0) == "placeholder"   # 无总结 → 占位符
     assert rec.state_of(1) == "summarized"    # 有总结 → 总结
     # 幂等：再 drop 无变化
-    assert mem.transition_images(31, "drop") is False
+    assert await mem.transition_images(31, "drop") is False
+    await manager.close()
 
 
-def test_transition_recall_restores_original(tmp_path):
-    path, mem = make_mem(tmp_path)
-    mem.transition_images(31, "drop")
-    assert mem.transition_images(31, "recall") is True
-    rec = mem.find_by_message_id(31)
+async def test_transition_recall_restores_original(tmp_path):
+    manager, mem = await make_mem(tmp_path)
+    await mem.transition_images(31, "drop")
+    assert await mem.transition_images(31, "recall") is True
+    rec = await mem.find_by_message_id(31)
     assert all(rec.state_of(i) == "show" for i in range(len(rec.images)))
-    # 落盘已同步：新实例读到的也是召回后的形态
-    fresh = MemoryManager(path).get(42).find_by_message_id(31)
-    assert all(fresh.state_of(i) == "show" for i in range(len(fresh.images)))
+    # 库已同步：新实例读到的也是召回后的形态
+    fresh = MemoryManager(tmp_path)
+    reloaded = await (await fresh.get(42)).find_by_message_id(31)
+    assert all(reloaded.state_of(i) == "show" for i in range(len(reloaded.images)))
+    await fresh.close()
+    await manager.close()
 
 
-def test_transition_unknown_message_or_direction(tmp_path):
-    _, mem = make_mem(tmp_path)
-    assert mem.transition_images(999, "drop") is False
-    try:
-        mem.transition_images(31, "nonsense")
-        raise AssertionError("应拒绝未知方向")
-    except ValueError:
-        pass
+async def test_transition_unknown_message_or_direction(tmp_path):
+    manager, mem = await make_mem(tmp_path)
+    assert await mem.transition_images(999, "drop") is False
+    with pytest.raises(ValueError):
+        await mem.transition_images(31, "nonsense")
+    await manager.close()
 
 
 # ---------------------------------------------------------------- bot 链路（假 AI）
@@ -484,12 +407,13 @@ async def wait_until(cond, timeout=2.0):
 
 async def test_bot_applies_drop_marker_and_sends_clean_text(tmp_path):
     bot = await build_marker_bot(tmp_path, "direct", ["好可爱\n<drop_img 51>"])
-    bot._memory.get(42).append(img_record(51, summaries={0: "一只橘猫"}))
+    mem = await bot._memory.get(42)
+    await mem.append(img_record(51, summaries={0: "一只橘猫"}))
     try:
         await bot._on_event(at_event(52, "这张图太搞笑了"))
         await wait_until(lambda: bool(bot._snowluma.sent))
         assert bot._snowluma.sent == ["好可爱"]            # 标记未泄进群里
-        rec = bot._memory.get(42).find_by_message_id(51)
+        rec = await mem.find_by_message_id(51)
         assert rec.state_of(0) == "summarized"             # 已降级为总结
     finally:
         await bot.stop()
@@ -499,7 +423,8 @@ async def test_bot_recalls_image_and_regenerates_once(tmp_path):
     bot = await build_marker_bot(
         tmp_path, "direct", ["先看看<recall_img 9>", "看到了"]
     )
-    bot._memory.get(42).append(img_record(9, states=("placeholder",)))
+    mem = await bot._memory.get(42)
+    await mem.append(img_record(9, states=("placeholder",)))
     try:
         await bot._on_event(at_event(10, "把之前那张图翻出来看看"))
         await wait_until(lambda: len(bot._ai.calls) >= 2)
@@ -516,12 +441,29 @@ async def test_bot_recalls_image_and_regenerates_once(tmp_path):
 
 async def test_bot_ignores_markers_outside_direct_mode(tmp_path):
     bot = await build_marker_bot(tmp_path, "placeholder", ["哈哈<drop_img 9>"])
-    bot._memory.get(42).append(img_record(9, states=("show",)))
+    mem = await bot._memory.get(42)
+    await mem.append(img_record(9, states=("show",)))
     try:
         await bot._on_event(at_event(11, "随便说说"))
         await wait_until(lambda: bool(bot._snowluma.sent))
         assert bot._snowluma.sent == ["哈哈"]              # 标记照样剥除
-        assert bot._memory.get(42).find_by_message_id(9).state_of(0) == "show"
+        assert (await mem.find_by_message_id(9)).state_of(0) == "show"
         assert len(bot._ai.calls) == 1                     # 未触发重生成
+    finally:
+        await bot.stop()
+
+
+async def test_self_message_id_strictly_decreasing_under_clock_rollback(
+    tmp_path, monkeypatch
+):
+    """时钟回拨时合成负 id 仍严格递减，不会撞 (group_id, message_id) 唯一键。"""
+    bot = await build_marker_bot(tmp_path, "direct", [])
+    try:
+        first = bot._next_self_message_id()
+        assert first < 0
+        # 模拟回拨：time_ns 返回比第一次更早的时刻 → 候选 id 反而更大
+        monkeypatch.setattr(time, "time_ns", lambda: -first - 10**9)
+        assert bot._next_self_message_id() == first - 1
+        assert bot._next_self_message_id() == first - 2
     finally:
         await bot.stop()

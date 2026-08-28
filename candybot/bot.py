@@ -66,13 +66,16 @@ class CandyBot:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._dedup = MessageDedup()
-        # 记忆文件容量取全局最大上下文需求的 2 倍（服务后续调参，仍有界）
+        # 内存热缓存容量取全局最大上下文需求的 2 倍（仍有界）；文本历史
+        # 在 candy.db 里全量保留，图片按 storage.image_retention_days 回收
         max_context = max(
             [p.context_size for p in settings.groups.values()]
             + [settings.groups_default.context_size]
         )
         self._memory = MemoryManager(
-            settings.bot.data_dir, default_capacity=max(max_context * 2, 64)
+            settings.bot.data_dir,
+            default_capacity=max(max_context * 2, 64),
+            image_retention_days=settings.storage.image_retention_days,
         )
         self._http = aiohttp.ClientSession()
         self._ai = AIClient(
@@ -92,6 +95,7 @@ class CandyBot:
         self._queue_workers: dict[int, asyncio.Task[None]] = {}
         self._daily_date: date = date.today()
         self._daily_replies: int = 0
+        self._last_self_message_id: int = 0
         self._stopping = False
 
     # ------------------------------------------------------------ 生命周期
@@ -102,6 +106,7 @@ class CandyBot:
         return self._settings.bot.log_level
 
     async def start(self) -> None:
+        await self._memory.start()  # 建表 + 每日图片回收循环
         await self._snowluma.start()
         await self._snowluma.probe()
         login = await self._snowluma.query_login_info()
@@ -124,6 +129,7 @@ class CandyBot:
         await self._server.stop()
         await self._http.close()
         await self._snowluma.stop()
+        await self._memory.close()
 
     # ------------------------------------------------------------ 事件入口
 
@@ -152,6 +158,7 @@ class CandyBot:
                 event,
                 self_qq=self._settings.bot.self_qq,
                 multimodal=self._settings.multimodal,
+                # 传协程回调，normalize 解析 reply 段时会 await 它
                 find_by_message_id=lambda ref_id: self._find_record(event, ref_id),
                 http_session=self._http,
                 describe_image=(
@@ -174,17 +181,18 @@ class CandyBot:
             logger.debug("群 %d 不在白名单，忽略", group_id)
             return
 
-        memory = self._memory.get(group_id)
-        memory.append(normalized.record)
+        memory = await self._memory.get(group_id)
+        await memory.append(normalized.record)
         logger.debug("收到消息 %s : %s",group_id,normalized)
         await self._enqueue(group_id, normalized)
 
-    def _find_record(self, event: dict, ref_id: int) -> ChatRecord | None:
+    async def _find_record(self, event: dict, ref_id: int) -> ChatRecord | None:
         try:
             group_id = int(event.get("group_id"))
         except (TypeError, ValueError):
             return None
-        return self._memory.get(group_id).find_by_message_id(ref_id)
+        memory = await self._memory.get(group_id)
+        return await memory.find_by_message_id(ref_id)
 
     async def _on_notice(self, event: dict) -> None:
         """通知类事件：目前只处理群撤回——删除本地记录的对应消息。"""
@@ -198,7 +206,8 @@ class CandyBot:
             return
         if self._settings.profile_for(group_id) is None:
             return
-        if self._memory.get(group_id).remove(message_id):
+        memory = await self._memory.get(group_id)
+        if await memory.remove(message_id):
             logger.info("群 %d：消息 %d 已撤回，已删除本地记录", group_id, message_id)
         else:
             logger.debug(
@@ -263,7 +272,7 @@ class CandyBot:
         runtime.msgs_since_reply = 0
 
         sent_record = ChatRecord(
-            message_id=-time.time_ns(),  # 合成负 id，绝不与他人冲突
+            message_id=self._next_self_message_id(),
             group_id=group_id,
             user_id=self._settings.bot.self_qq,
             nickname="糖糖",
@@ -271,7 +280,8 @@ class CandyBot:
             ts=time.time(),
             is_self=True,
         )
-        self._memory.get(group_id).append(sent_record)
+        memory = await self._memory.get(group_id)
+        await memory.append(sent_record)
 
     async def _compose_reply(
         self,
@@ -288,7 +298,7 @@ class CandyBot:
         生成一次，让召回的原图进入本轮对话。二稿只剥标记、不再重试，
         保证每条消息至多两次生成调用。
         """
-        memory = self._memory.get(group_id)
+        memory = await self._memory.get(group_id)
         for attempt in range(2):
             recent = memory.tail(profile.context_size)
             static_system = runtime.static_system("reply", profile.persona)
@@ -312,7 +322,7 @@ class CandyBot:
             if not draft:
                 return None
             draft, ops = split_image_ops(draft)
-            changed = self._apply_image_ops(group_id, memory, ops)
+            changed = await self._apply_image_ops(group_id, memory, ops)
             recalled = any(op.action == "recall_img" for op in ops)
             if attempt == 0 and changed and recalled:
                 logger.info("群 %d 模型召回历史图片，基于新上下文重写回复", group_id)
@@ -320,7 +330,7 @@ class CandyBot:
             return draft
         return None
 
-    def _apply_image_ops(
+    async def _apply_image_ops(
         self, group_id: int, memory, ops: list[ImageOp]
     ) -> bool:
         """把回复里的图片降级/召回操作写入记忆；非 direct 模式一律忽略。"""
@@ -330,7 +340,7 @@ class CandyBot:
         for op in ops:
             direction = "recall" if op.action == "recall_img" else "drop"
             try:
-                applied = memory.transition_images(op.message_id, direction)
+                applied = await memory.transition_images(op.message_id, direction)
             except Exception:
                 logger.exception("群 %d 图片状态切换失败：%r", group_id, op)
                 continue
@@ -361,7 +371,8 @@ class CandyBot:
 
         # 每条普通消息都过一遍 judge：除了打分，还要识别「这条消息是否在对
         # 我说」——正和我聊天的场景里，任何时间窗口都不应该把对话掐断。
-        recent = self._memory.get(group_id).tail(profile.context_size)
+        memory = await self._memory.get(group_id)
+        recent = memory.tail(profile.context_size)
         static_system = runtime.static_system("judge", profile.persona)
         nicknames = nickname_list_from_history([record_to_turn(r) for r in recent[:-1]])
         runtime_system = runtime_system_prompt(
@@ -509,6 +520,16 @@ class CandyBot:
                 logger.warning("发送第 %d 次失败：%s", attempt + 1, exc)
                 await asyncio.sleep(delay)
                 delay *= 2
+
+    def _next_self_message_id(self) -> int:
+        """自发言的合成负 id：绝不与真实消息的正 id 冲突，且进程内严格
+        递减——时钟回拨时退化为减一序列，避免撞 (group_id, message_id)
+        唯一键导致已发送的回复进不了历史。"""
+        candidate = -time.time_ns()
+        if candidate >= self._last_self_message_id:
+            candidate = self._last_self_message_id - 1
+        self._last_self_message_id = candidate
+        return candidate
 
     def _consume_daily_quota(self) -> bool:
         today = date.today()

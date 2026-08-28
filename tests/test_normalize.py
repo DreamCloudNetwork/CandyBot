@@ -31,7 +31,10 @@ MM = MultimodalSettings(mode="placeholder", download_media=False)
 
 
 def norm(event, **kw):
-    defaults = dict(self_qq=99, multimodal=MM, find_by_message_id=lambda _id: None)
+    async def no_ref(_id):
+        return None
+
+    defaults = dict(self_qq=99, multimodal=MM, find_by_message_id=no_ref)
     defaults.update(kw)
     return run(normalize_group_message(event, **defaults))
 
@@ -66,7 +69,7 @@ def test_at_other_no_mention():
 
 def test_reply_to_self_via_memory():
     class FakeMem:
-        def find_by_message_id(self, mid):
+        async def find_by_message_id(self, mid):
             from candybot.models import ChatRecord
 
             return ChatRecord(1, 42, 99, "糖糖", "我之前说的话", 0.0, is_self=True)
@@ -82,7 +85,7 @@ def test_reply_to_self_via_memory():
 
 def test_reply_to_other_shows_snippet():
     class FakeMem:
-        def find_by_message_id(self, mid):
+        async def find_by_message_id(self, mid):
             from candybot.models import ChatRecord
 
             return ChatRecord(2, 42, 1234, "小红", "原始内容abc", 0.0)

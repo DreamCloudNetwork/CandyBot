@@ -96,7 +96,8 @@ async def normalize_group_message(
 ) -> NormalizedMessage | None:
     """把一条 group 消息事件转为 NormalizedMessage。
 
-    find_by_message_id: Callable[[int], ChatRecord | None]，通常传 GroupMemory.find_by_message_id；
+    find_by_message_id: Callable[[int], Awaitable[ChatRecord | None]]，通常传
+    GroupMemory.find_by_message_id（库里有全量历史，早于启动的消息也可引用）；
     describe_image: 仅 describe 模式需要，Callable[[str dataurl], Awaitable[str]]；
     assess_image: 仅 direct 模式需要，Callable[[str dataurl], Awaitable[ImageAssessment]]，
     用于入库时判定该图后续继续展示原图还是只保留总结。
@@ -146,7 +147,9 @@ async def normalize_group_message(
             elif target.isdigit():
                 parts.append(f"@QQ{target}")
         elif seg_type == "reply":
-            ref_text, is_self_ref = _resolve_reply(data, find_by_message_id, self_qq)
+            ref_text, is_self_ref = await _resolve_reply(
+                data, find_by_message_id, self_qq
+            )
             if ref_text:
                 parts.append(ref_text)
                 mentioned_me = mentioned_me or is_self_ref
@@ -236,7 +239,7 @@ async def normalize_group_message(
     return NormalizedMessage(record=record, mentioned_me=mentioned_me)
 
 
-def _resolve_reply(
+async def _resolve_reply(
     reply_data: dict, find_by_message_id, self_qq: int
 ) -> tuple[str | None, bool]:
     """构造回复引用文本，返回 (文本, 是否引用了机器人自己的消息)。"""
@@ -245,7 +248,7 @@ def _resolve_reply(
     except (TypeError, ValueError):
         return None, False
     try:
-        referenced = find_by_message_id(ref_id)
+        referenced = await find_by_message_id(ref_id)
     except Exception:  # 记忆层异常不该影响消息解析
         referenced = None
     if referenced is not None:

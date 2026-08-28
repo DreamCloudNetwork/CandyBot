@@ -20,9 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .models import (
-    IMAGE_STATE_PLACEHOLDER,
     IMAGE_STATE_SHOW,
-    IMAGE_STATE_SUMMARIZED,
     ChatRecord,
 )
 
@@ -155,9 +153,10 @@ def history_to_turns(
 def _reply_turn(record: ChatRecord) -> HistoryTurn:
     """direct 多模态下回复历史的一回合。
 
-    每张图按其展示形态渲染：show 附上原图块；summarized 写成
-    「[图片：总结]」；placeholder 保持「[图片]」。当全部图片均不需要
-    额外表达时退化为与 record_to_turn 完全一致的纯文本回合。
+    每张图按其展示形态渲染：show 且原图还在的附上原图块；summarized 写成
+    「[图片：总结]」；placeholder 或原图已被保留期回收的（数据为空）写
+    「[图片]」。当全部图片均不需要额外表达时退化为与 record_to_turn 完全
+    一致的纯文本回合。
     """
     if record.is_self:
         return HistoryTurn("assistant", record.text or "[空]")
@@ -165,13 +164,12 @@ def _reply_turn(record: ChatRecord) -> HistoryTurn:
     notes: list[str] = []
     for index, data_url in enumerate(record.images):
         state = record.state_of(index)
-        if state == IMAGE_STATE_SHOW:
+        if state == IMAGE_STATE_SHOW and data_url:
             show.append(data_url)
-        elif state == IMAGE_STATE_SUMMARIZED:
+        else:
+            # 非展示形态，或形态为 show 但原图已被回收（防御：按占位处理）
             summary = record.summary_of(index)
             notes.append(f"[图片：{summary}]" if summary else "[图片]")
-        elif state == IMAGE_STATE_PLACEHOLDER:
-            notes.append("[图片]")
     plain = HistoryTurn("user", f"{record_label(record)}：{record.text}")
     if not show and not notes:
         return plain

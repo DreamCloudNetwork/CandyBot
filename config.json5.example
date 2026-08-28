@@ -67,11 +67,11 @@
         "temperature": 0.8,
         "max_context_chars": 8000,        // 上下文总字符数上限
         "timeout_seconds": 60,
-        // "recheck_enabled": true,       // 是否对回复做二次评分（默认 true）
-        // "recheck_min_score": 5,        // 二次评分低于该值则放弃回复（默认 5）
+        "recheck_enabled": true,       // 是否对回复做二次评分（默认 true）
+        "recheck_min_score": 5,        // 二次评分低于该值则放弃回复（默认 5）
         "emoji_chance": 0.25,             // 随机附加 emoji 的概率（0~1）
         "emoji_max": 2,                   // 单条回复最多 emoji 数
-        // "max_history_images": 8,      // 历史中最多携带的图片数（默认 8）
+        "max_history_images": 8,      // 历史中最多携带的图片数（默认 8）
     },
 
     "multimodal": {
@@ -81,6 +81,11 @@
 
     "rate_limit": {
         "global_daily_limit": null,       // 全局每日回复上限；null / 注释掉表示不限制
+    },
+
+    // 聊天存储（data/candy.db，SQLite）：文本历史永久保留，原图按保留期回收
+    "storage": {
+        "image_retention_days": 7,        // 聊天原图保留天数；超期降级为总结/占位符
     },
 
     "snowluma": {

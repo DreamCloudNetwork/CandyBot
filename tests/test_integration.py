@@ -7,6 +7,7 @@ import time
 from dataclasses import replace as dc_replace
 
 from candybot.bot import CandyBot
+from candybot.memory import MemoryManager
 from candybot.models import load_settings
 from candybot.ai import JudgeVerdict
 from tests.test_models_settings import DictCfg
@@ -167,7 +168,8 @@ async def test_mention_triggers_forced_reply(tmp_path):
         assert call["forced"] is True
         assert "用户1000" in call["current"]
         # 自己的发言已写入记忆（is_self）
-        assert bot._memory.get(42).last().is_self
+        memory = await bot._memory.get(42)
+        assert memory.last().is_self
     finally:
         await bot.stop()
 
@@ -300,7 +302,7 @@ async def test_low_score_no_reply(tmp_path):
         assert bot._ai.judge_calls == 1
         assert bot._snowluma.sent == []
         # 但消息本身已进上下文
-        assert len(bot._memory.get(42)) == 1
+        assert len(await bot._memory.get(42)) == 1
     finally:
         await bot.stop()
 
@@ -347,7 +349,7 @@ async def test_recheck_downgrade_keeps_silent(tmp_path):
 
         assert bot._ai.judge_calls == 2
         assert bot._snowluma.sent == []
-        assert len(bot._memory.get(42)) == 1
+        assert len(await bot._memory.get(42)) == 1
     finally:
         await bot.stop()
 
@@ -419,7 +421,7 @@ async def test_recheck_disabled_by_config(tmp_path):
 
         assert bot._ai.judge_calls == 1
         assert bot._snowluma.sent == []
-        assert len(bot._memory.get(42)) == 1
+        assert len(await bot._memory.get(42)) == 1
     finally:
         await bot.stop()
 
@@ -482,13 +484,15 @@ async def test_group_recall_removes_local_record(tmp_path):
     bot = await build_bot(tmp_path)
     try:
         await bot._on_event(group_event(51, "这条稍后会被撤回"))
-        assert len(bot._memory.get(42)) == 1
-
+        await drain_tick()  # 决策链路跑完（高分消息会合成回复入记忆）
         await bot._on_event(recall_event(51))
-        assert len(bot._memory.get(42)) == 0
-        # 落盘文件同步清空，重启后不会复活
-        lines = (tmp_path / "data" / "memory" / "42.jsonl").read_text().splitlines()
-        assert lines == []
+        memory = await bot._memory.get(42)
+        assert all(r.message_id != 51 for r in memory.tail(20))
+        # 库里同步删除，重启后不会复活
+        mgr2 = MemoryManager(tmp_path / "data")
+        mem2 = await mgr2.get(42)
+        assert all(r.message_id != 51 for r in mem2.tail(20))
+        await mgr2.close()
     finally:
         await bot.stop()
 
@@ -508,6 +512,7 @@ async def test_recall_ignores_unknown_and_other_notices(tmp_path):
             "time": int(time.time()),
         }
         await bot._on_event(other)
-        assert [r.message_id for r in bot._memory.get(42).tail(10)] == [61]
+        memory = await bot._memory.get(42)
+        assert [r.message_id for r in memory.tail(10)] == [61]
     finally:
         await bot.stop()

@@ -8,7 +8,6 @@ endpoint 的 SSRF 校验也在本模块。
 from __future__ import annotations
 
 import ipaddress
-import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -41,10 +40,13 @@ def _aligned_image_states(count: int, states: Any) -> tuple[str, ...]:
 class ChatRecord:
     """一条群聊消息（含机器人自己发出的）。
 
-    images 是 base64 data URL 元组，无论 multimodal 模式如何都会随 JSONL
-    落盘（撤回/压缩时随记录一起消亡）；image_states 与 images 对齐，描述
-    每张图在后续对话中的展示形态；image_summaries 保存视觉模型给的总结，
-    供展示与降级时复用。image_states 缺省视为全部 show。
+    images 是 base64 data URL 元组，无论 multimodal 模式如何都会入库
+    （撤回时随记录一起消亡；超过保留期的原图由图片回收清空数据）；
+    image_states 与 images 对齐，描述每张图在后续对话中的展示形态；
+    image_summaries 保存视觉模型给的总结，供展示与降级时复用。
+    image_states 缺省视为全部 show。
+    槽位语义：images 中的空串表示该图原图已按保留期回收，此时状态必为
+    summarized/placeholder（加载层保证不会以 show 出现），总结仍保留。
     """
 
     message_id: int
@@ -59,7 +61,7 @@ class ChatRecord:
     image_summaries: dict[int, str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        # 防御性对齐：外部构造（含 from_json）长度不一致时以 images 为准
+        # 防御性对齐：外部构造长度不一致时以 images 为准
         self.image_states = _aligned_image_states(len(self.images), self.image_states)
         clean: dict[int, str] = {}
         for key, value in (self.image_summaries or {}).items():
@@ -70,54 +72,6 @@ class ChatRecord:
             if isinstance(value, str):
                 clean[idx] = value
         self.image_summaries = clean
-
-    def to_json(self) -> dict[str, Any]:
-        obj: dict[str, Any] = {
-            "message_id": self.message_id,
-            "group_id": self.group_id,
-            "user_id": self.user_id,
-            "nickname": self.nickname,
-            "text": self.text,
-            "ts": self.ts,
-            "is_self": self.is_self,
-        }
-        if self.images:
-            obj["images"] = list(self.images)
-            obj["image_states"] = list(self.image_states)
-            if self.image_summaries:
-                obj["image_summaries"] = {str(k): v for k, v in sorted(self.image_summaries.items())}
-        return obj
-
-    @classmethod
-    def from_json(cls, obj: dict[str, Any]) -> ChatRecord:
-        raw_images = obj.get("images")
-        images: tuple[str, ...] = ()
-        if isinstance(raw_images, list):
-            images = tuple(u for u in raw_images if isinstance(u, str))
-        summaries: dict[int, str] | None = None
-        raw_sums = obj.get("image_summaries")
-        if isinstance(raw_sums, dict):
-            summaries = {}
-            for key, value in raw_sums.items():
-                if isinstance(value, str):
-                    try:
-                        summaries[int(key)] = value
-                    except (TypeError, ValueError):
-                        continue
-        return cls(
-            message_id=int(obj["message_id"]),
-            group_id=int(obj["group_id"]),
-            user_id=int(obj["user_id"]),
-            nickname=str(obj.get("nickname", "")),
-            text=str(obj.get("text", "")),
-            ts=float(obj.get("ts", time.time())),
-            is_self=bool(obj.get("is_self", False)),
-            images=images,
-            image_states=_aligned_image_states(
-                len(images), obj.get("image_states") or ()
-            ),
-            image_summaries=summaries or None,
-        )
 
     # ------------------------------------------------------------ 图片形态
 
@@ -291,6 +245,17 @@ class MultimodalSettings:
 
 
 @dataclass(frozen=True)
+class StorageSettings:
+    """聊天存储（candy.db）策略。
+
+    image_retention_days：聊天原图的保留天数；超过后原图数据被回收，
+    记录降级为总结/占位符但文本与总结永久保留。
+    """
+
+    image_retention_days: int
+
+
+@dataclass(frozen=True)
 class RateLimitSettings:
     global_daily_limit: int | None
 
@@ -315,6 +280,7 @@ class Settings:
     models: ModelSettings
     generation: GenerationSettings
     multimodal: MultimodalSettings
+    storage: StorageSettings
     rate_limit: RateLimitSettings
     snowluma: SnowlumaSettings
 
@@ -543,6 +509,16 @@ def load_settings(cfg: Any) -> Settings:
         download_media=_parse_bool(mm_cfg.get("download_media", True), "download_media"),
     )
 
+    # storage 段可整体省略（全部走默认值）
+    storage_cfg = _optional_section(cfg, "storage")
+    image_retention_days = _parse_int(storage_cfg, "image_retention_days", 7)
+    if image_retention_days < 1:
+        raise ValueError(
+            f"配置项 `storage.image_retention_days` 不能小于 1，实际是 "
+            f"{image_retention_days!r}"
+        )
+    storage_settings = StorageSettings(image_retention_days=image_retention_days)
+
     rate_cfg = _require_section(cfg, "rate_limit")
     rate_limit_settings = RateLimitSettings(
         global_daily_limit=_parse_optional_int(rate_cfg, "global_daily_limit")
@@ -583,6 +559,7 @@ def load_settings(cfg: Any) -> Settings:
         models=model_settings,
         generation=generation_settings,
         multimodal=multimodal_settings,
+        storage=storage_settings,
         rate_limit=rate_limit_settings,
         snowluma=snowluma_settings,
     )

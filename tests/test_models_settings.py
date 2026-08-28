@@ -25,6 +25,7 @@ def base_cfg(**over):
         "models": {"judge": "j", "reply": "r"},
         "generation": {},
         "multimodal": {},
+        "storage": {},
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
@@ -242,9 +243,25 @@ def test_generation_recheck_validation():
         load_settings(DictCfg(base_cfg(generation={"recheck_enabled": "yes"})))
 
 
+# ---------------------------------------------------------------- 存储
+
+
+def test_storage_image_retention_defaults():
+    """storage 段可整体省略，保留期默认 7 天。"""
+    s = load_settings(DictCfg(base_cfg()))
+    assert s.storage.image_retention_days == 7
+    s2 = load_settings(DictCfg(base_cfg(storage={"image_retention_days": 30})))
+    assert s2.storage.image_retention_days == 30
+
+
+def test_storage_image_retention_validation():
+    """保留期必须 ≥ 1，0 与负数一律拒绝。"""
+    for bad in (0, -1, -100):
+        with pytest.raises(ValueError):
+            load_settings(DictCfg(base_cfg(storage={"image_retention_days": bad})))
+
+
 # ---------------------------------------------------------------- 多提供商模型
-
-
 def test_models_string_form_inherits_backend():
     """字符串写法 = 仅模型名，提供商继承 ai_backend（向后兼容）。"""
     s = load_settings(DictCfg(base_cfg(models={"judge": "j", "reply": "r"})))
