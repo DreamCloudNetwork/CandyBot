@@ -307,7 +307,7 @@ async def test_tool_use_disabled_uses_text_contract(monkeypatch):
 
 
 async def test_degrades_to_text_contract_on_tools_rejection(monkeypatch):
-    """端点报 tools 相关错误：该角色降级为纯文本协议，后续调用不带 tools。"""
+    """端点报 tools 相关错误：降级为纯文本协议并立即补发，本次判定不丢。"""
     calls: list[dict] = []
 
     class _RejectingOpenAI:
@@ -325,11 +325,69 @@ async def test_degrades_to_text_contract_on_tools_rejection(monkeypatch):
     monkeypatch.setattr(ai_mod, "AsyncOpenAI", _RejectingOpenAI)
     ai = AIClient(models=_models(), generation=_gen())
     current = _record()
-    with pytest.raises(RuntimeError):
-        await ai.judge_interest("L1", "L2", [current], current, "now")
-    assert ai.judge_tool_use is False
     verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
     assert verdict.score == 8
+    assert ai.judge_tool_use is False
+    assert "tools" in calls[0] and "tools" not in calls[1]
+    # 补发请求换用纯文本输出契约：不再要求调用工具，改为正文输出 JSON
+    assert "submit_judgment" not in calls[1]["messages"][-1]["content"]
+    assert "JSON" in calls[1]["messages"][-1]["content"]
+
+
+async def test_reply_degrades_with_in_place_text_retry(monkeypatch):
+    """reply 工具请求被拒：立即按纯文本契约补发，本轮回复不丢。"""
+    calls: list[dict] = []
+
+    class _RejectingOpenAI:
+        def __init__(self, *, base_url=None, api_key=None):
+            self.chat = SimpleNamespace(completions=self)
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if "tools" in kwargs:
+                raise RuntimeError("This model does not support tools")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=_content_msg("好"))]
+            )
+
+    monkeypatch.setattr(ai_mod, "AsyncOpenAI", _RejectingOpenAI)
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    reply = await ai.generate_reply("L1", "L2", [current], current, "now", forced=True)
+    assert reply is not None and reply.text == "好"
+    assert ai.reply_tool_use is False
+    assert "tools" in calls[0] and "tools" not in calls[1]
+    # 补发请求的 L4 指令换成纯文本契约
+    assert "send_reply" not in calls[1]["messages"][-1]["content"]
+
+
+async def test_assess_degrades_with_in_place_text_retry(monkeypatch):
+    """入库评估工具请求被拒：立即按纯文本契约补发，本次评估不丢。"""
+    calls: list[dict] = []
+
+    class _RejectingOpenAI:
+        def __init__(self, *, base_url=None, api_key=None):
+            self.chat = SimpleNamespace(completions=self)
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if "tools" in kwargs:
+                raise RuntimeError("This model does not support tools")
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=_content_msg('{"summary": "猫", "keep": false}')
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(ai_mod, "AsyncOpenAI", _RejectingOpenAI)
+    vision = ModelConfig("v", "https://vision.example.com/v1", "kv", None, None)
+    ai = AIClient(models=_models(vision=vision), generation=_gen())
+    assessment = await ai.assess_image("data:image/png;base64,QQ==")
+    assert assessment.summary == "猫"
+    assert assessment.keep_raw is False
+    assert ai._tools_on["vision"] is False
     assert "tools" in calls[0] and "tools" not in calls[1]
 
 

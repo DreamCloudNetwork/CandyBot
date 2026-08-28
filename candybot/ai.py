@@ -7,8 +7,9 @@
 结构化结果；models.<role>.tool_use=false 的角色改走纯文本协议——提示词
 要求在正文输出 JSON / 末尾标记，请求不携带 tools 参数。运行中若端点报
 工具相关错误，或接受了 tools 却不返回工具调用，该角色自动降级为纯文本
-协议（本进程内生效），保证提示词永远只约定模型能力范围内的回答方式；
-端点不支持而只回正文时也回退按正文解析。
+协议（本进程内生效），被拒的当次请求也会立即换纯文本契约补发，不让这
+条消息因此丢失；这保证提示词永远只约定模型能力范围内的回答方式，端点
+不支持而只回正文时也回退按正文解析。
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import logging
 import os
 import random
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from openai import AsyncOpenAI
 
@@ -355,16 +358,16 @@ class AIClient:
         if not self._tools_on[role]:
             return
         self._tools_on[role] = False
-        model = {"judge": self._judge, "reply": self._reply, "vision": self._vision}[
-            role
-        ].model
         logger.warning(
             "%s 角色模型 %s 疑似不支持工具调用（%s），已改用纯文本协议；"
             "如需固定行为，请在 config.json5 中为该角色设置 tool_use: false",
             role,
-            model,
+            self._cfg_for(role).model,
             why,
         )
+
+    def _cfg_for(self, role: str) -> ModelConfig:
+        return {"judge": self._judge, "reply": self._reply, "vision": self._vision}[role]
 
     def _client_for(self, cfg: ModelConfig) -> AsyncOpenAI:
         key = (cfg.base_url, cfg.api_key)
@@ -375,6 +378,33 @@ class AIClient:
             client = AsyncOpenAI(base_url=cfg.base_url or None, api_key=api_key)
             self._clients[key] = client
         return client
+
+    async def _create_chat(
+        self,
+        role: str,
+        request: dict,
+        text_messages: Callable[[], list[Message]],
+    ) -> tuple[Any, bool]:
+        """发送请求；端点拒绝 tools 时降级为纯文本协议并立即补发本次请求。
+
+        工具请求报错时若只标记降级再抛出，当次调用会被上层当失败丢弃
+        （judge 失败＝这条消息不发言）。这里换上 text_messages 重建的纯
+        文本消息并去掉 tools/tool_choice 补发一次，让当次调用也走通；
+        重试仍失败则原样抛出。返回（响应, 响应是否来自工具调用请求）。
+        """
+        cfg = self._cfg_for(role)
+        try:
+            response = await self._client_for(cfg).chat.completions.create(**request)
+        except Exception as exc:
+            if "tools" not in request or not _looks_like_tools_rejection(exc):
+                raise
+            self._disable_tools(role, str(exc))
+            retry = {**request, "messages": text_messages()}
+            retry.pop("tools", None)
+            retry.pop("tool_choice", None)
+            response = await self._client_for(cfg).chat.completions.create(**retry)
+            return response, False
+        return response, "tools" in request
 
     def _history_chars(self, cfg: ModelConfig, prompt_chars: int) -> int:
         """结合模型上下文窗口推算历史层的字符预算。
@@ -410,37 +440,42 @@ class AIClient:
         直接复用。输出契约随 judge 角色的工具调用状态选择。
         """
         use_tools = self._tools_on["judge"]
-        # 历史层不含当前消息本身（它单独出现在指令层，保证历史层前缀稳定）
-        # 预算需扣除 L4 文本本身，故先构造指令层再裁历史
         if prev_verdict is not None:
             assert threshold is not None, "复核模式必须提供 threshold 以告知门槛"
             assert min_score is not None, "复核模式必须提供 min_score 以告知触发下限"
-            final_user = final_user_prompt_judge_recheck(
-                now_text,
-                current_message,
-                prev_score=prev_verdict.score,
-                prev_reason=prev_verdict.reason,
-                threshold=threshold,
-                min_score=min_score,
-                via_tool=use_tools,
-            )
             tag = "[judge·复核]"
         else:
-            final_user = final_user_prompt_judge(
-                now_text, current_message, via_tool=use_tools
-            )
             tag = "[judge]"
-        prompt_chars = len(static_system) + len(runtime_system) + len(final_user)
-        turns, _ = history_to_turns(
-            recent_records[:-1], self._history_chars(self._judge, prompt_chars)
-        )
-        history_messages = [{"role": t.role, "content": t.content} for t in turns]
-        chat: list[Message] = [
-            {"role": "system", "content": static_system},
-            {"role": "system", "content": runtime_system},
-            *history_messages,
-            {"role": "user", "content": final_user},
-        ]
+
+        def build_messages(via_tool: bool) -> list[Message]:
+            # 历史层不含当前消息本身（它单独出现在指令层，保证历史层前缀稳定）
+            # 预算需扣除 L4 文本本身，故先构造指令层再裁历史
+            if prev_verdict is not None:
+                final_user = final_user_prompt_judge_recheck(
+                    now_text,
+                    current_message,
+                    prev_score=prev_verdict.score,
+                    prev_reason=prev_verdict.reason,
+                    threshold=threshold,
+                    min_score=min_score,
+                    via_tool=via_tool,
+                )
+            else:
+                final_user = final_user_prompt_judge(
+                    now_text, current_message, via_tool=via_tool
+                )
+            prompt_chars = len(static_system) + len(runtime_system) + len(final_user)
+            turns, _ = history_to_turns(
+                recent_records[:-1], self._history_chars(self._judge, prompt_chars)
+            )
+            return [
+                {"role": "system", "content": static_system},
+                {"role": "system", "content": runtime_system},
+                *[{"role": t.role, "content": t.content} for t in turns],
+                {"role": "user", "content": final_user},
+            ]
+
+        chat = build_messages(use_tools)
         logger.debug(
             "%s model=%s 消息数=%d\n%s",
             tag,
@@ -458,15 +493,10 @@ class AIClient:
         )
         if use_tools:
             request.update(_tool_request_kwargs(_JUDGE_TOOL))
-        try:
-            response = await self._client_for(self._judge).chat.completions.create(
-                **request
-            )
-        except Exception as exc:
-            if use_tools and _looks_like_tools_rejection(exc):
-                self._disable_tools("judge", str(exc))
-            raise
-        if use_tools:
+        response, via_tools = await self._create_chat(
+            "judge", request, lambda: build_messages(False)
+        )
+        if via_tools:
             if not _returned_tool_call(response):
                 # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
                 self._disable_tools("judge", "响应中无工具调用")
@@ -582,15 +612,32 @@ class AIClient:
         )
         if use_tools:
             request.update(_tool_request_kwargs(_REPLY_TOOL))
-        try:
-            response = await self._client_for(self._reply).chat.completions.create(
-                **request
+
+        def text_messages() -> list[Message]:
+            # 降级补发：仅把 L4 指令换成纯文本契约（direct 模式保留图片块）。
+            # L1 守则由调用方按当时的角色状态生成，此处无法重建、仍带工具措辞，
+            # 但 L4 是最后的明确指令（只输出正文），输出契约以它为准。
+            retry_text = final_user_prompt_reply(
+                now_text,
+                current_message,
+                forced=forced,
+                engaged=engaged,
+                score=score,
+                reason=reason,
+                via_tool=False,
             )
-        except Exception as exc:
-            if use_tools and _looks_like_tools_rejection(exc):
-                self._disable_tools("reply", str(exc))
-            raise
-        if use_tools and _returned_tool_call(response):
+            last = chat[-1]["content"]
+            content = (
+                [{"type": "text", "text": retry_text}, *last[1:]]
+                if isinstance(last, list)
+                else retry_text
+            )
+            retried = [*chat]
+            retried[-1] = {"role": "user", "content": content}
+            return retried
+
+        response, via_tools = await self._create_chat("reply", request, text_messages)
+        if via_tools and _returned_tool_call(response):
             args = _tool_arguments(response, _REPLY_TOOL["function"]["name"])
             if args is not None:
                 # 工具正文仍过一遍标记剥除：模型偶尔会沿用旧习惯把标记写进 text
@@ -599,7 +646,7 @@ class AIClient:
             else:
                 text, ops = "", ()
         else:
-            if use_tools:
+            if via_tools:
                 # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
                 self._disable_tools("reply", "响应中无工具调用")
             # 回退/纯文本协议：按旧约定从正文解析（标记写在末尾）
@@ -654,9 +701,9 @@ class AIClient:
             self._vision.model,
             len(data_url),
         )
-        request: dict = dict(
-            model=self._vision.model,
-            messages=[
+
+        def messages(via_tool: bool) -> list[Message]:
+            return [
                 {
                     "role": "user",
                     "content": [
@@ -670,7 +717,7 @@ class AIClient:
                                 + (
                                     "完成后调用 submit_assessment 工具提交：summary 为一句话总结，"
                                     "keep 表示后续对话是否还需要查看原图。"
-                                    if use_tools
+                                    if via_tool
                                     else '只输出一个 JSON 对象：{"summary": "一句话总结",'
                                     ' "keep": true 或 false}'
                                 )
@@ -679,22 +726,21 @@ class AIClient:
                         {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 }
-            ],
+            ]
+
+        request: dict = dict(
+            model=self._vision.model,
+            messages=messages(use_tools),
             temperature=0.2,
             max_tokens=self._vision.max_output_tokens or _ASSESS_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
         if use_tools:
             request.update(_tool_request_kwargs(_ASSESS_TOOL))
-        try:
-            response = await self._client_for(self._vision).chat.completions.create(
-                **request
-            )
-        except Exception as exc:
-            if use_tools and _looks_like_tools_rejection(exc):
-                self._disable_tools("vision", str(exc))
-            raise
-        if use_tools:
+        response, via_tools = await self._create_chat(
+            "vision", request, lambda: messages(False)
+        )
+        if via_tools:
             if not _returned_tool_call(response):
                 # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
                 self._disable_tools("vision", "响应中无工具调用")
