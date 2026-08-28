@@ -50,6 +50,10 @@
     //   base_url / api_key   该模型的 OpenAI 兼容端点与密钥（缺省继承 ai_backend）
     //   context_window       上下文窗口（token），用于约束送入的历史长度
     //   max_output_tokens    该模型单次调用的最大输出 token
+    //   tool_use             模型是否支持工具调用（默认 true）。false 时该角色
+    //                        走纯文本协议（judge 在正文输出 JSON，reply 用末尾
+    //                        <drop_img>/<recall_img> 标记）；运行中若端点报工具
+    //                        相关错误或忽略 tools 参数，也会自动降级并记警告日志
     "models": {
         "judge": "glm-4-flash",           // 兴趣评分模型
         "reply": {
@@ -58,6 +62,7 @@
             // "api_key": "<Another Provider API Key>",
             // "context_window": 64000,
             // "max_output_tokens": 800,
+            // "tool_use": false,          // 模型不支持 function calling 时打开
         },
         // "vision": "glm-4v-flash",      // 视觉模型；注释掉表示禁用图片理解
     },

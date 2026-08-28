@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from types import SimpleNamespace
 
 import candybot.ai as ai_mod
@@ -85,8 +86,25 @@ def test_empty_api_key_falls_back_to_env_then_placeholder(monkeypatch):
 _JUDGE_JSON = '{"score": 8, "to_me": false, "reason": "测试"}'
 
 
-def _install_fake(monkeypatch, content_by_key: dict[str, str]) -> list:
-    """替换 candybot.ai.AsyncOpenAI：记录构造与 create 参数，按 api_key 决定返回文本。"""
+def _content_msg(text: str) -> SimpleNamespace:
+    """不支持工具调用的端点：只有正文。"""
+    return SimpleNamespace(content=text, tool_calls=None)
+
+
+def _tool_msg(name: str, arguments: str) -> SimpleNamespace:
+    """强制工具调用路径：结论在 tool_calls 的参数里，正文为空。"""
+    return SimpleNamespace(
+        content=None,
+        tool_calls=[SimpleNamespace(function=SimpleNamespace(name=name, arguments=arguments))],
+    )
+
+
+def _install_fake(monkeypatch, responses: dict[str, object]) -> list:
+    """替换 candybot.ai.AsyncOpenAI：记录构造与 create 参数，按 api_key 返回预设响应。
+
+    值为字符串时按正文消息返回（回退解析路径）；为 SimpleNamespace 时
+    直接作为 message 返回（工具调用路径）。
+    """
 
     class _FakeAsyncOpenAI:
         instances: list = []
@@ -95,7 +113,8 @@ def _install_fake(monkeypatch, content_by_key: dict[str, str]) -> list:
             self.base_url = base_url
             self.api_key = api_key
             self.create_kwargs: dict | None = None
-            self._content = content_by_key.get(api_key or "", "")
+            value = responses.get(api_key or "", "")
+            self._message = value if not isinstance(value, str) else _content_msg(value)
             outer = self
 
             class _Completions:
@@ -103,7 +122,7 @@ def _install_fake(monkeypatch, content_by_key: dict[str, str]) -> list:
                 async def create(**kwargs):
                     outer.create_kwargs = kwargs
                     return SimpleNamespace(
-                        choices=[SimpleNamespace(message=SimpleNamespace(content=self._content))]
+                        choices=[SimpleNamespace(message=outer._message)]
                     )
 
             self.chat = SimpleNamespace(completions=_Completions())
@@ -128,18 +147,84 @@ async def test_judge_routes_to_own_provider_with_default_max_tokens(monkeypatch)
     assert called.api_key == "kj"
     assert called.create_kwargs["model"] == "j-model"
     assert called.create_kwargs["max_tokens"] == 1000
+    # 结构化结论一律通过强制工具调用提交
+    assert called.create_kwargs["tools"][0]["function"]["name"] == "submit_judgment"
+    assert called.create_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_judgment"},
+    }
+
+
+async def test_judge_prefers_tool_call_arguments(monkeypatch):
+    instances = _install_fake(
+        monkeypatch,
+        {"kj": _tool_msg("submit_judgment", '{"score": 9, "to_me": true, "reason": "在等我"}')},
+    )
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert verdict.score == 9
+    assert verdict.to_me is True
+    assert verdict.reason == "在等我"
+
+
+async def test_judge_tool_args_missing_score_scores_zero(monkeypatch):
+    instances = _install_fake(monkeypatch, {"kj": _tool_msg("submit_judgment", '{"reason": "x"}')})
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert verdict.score == 0
 
 
 async def test_reply_routes_to_own_provider_with_fallback_max_tokens(monkeypatch):
     instances = _install_fake(monkeypatch, {"kr": "好"})
     ai = AIClient(models=_models(), generation=_gen())
     current = _record()
-    assert await ai.generate_reply("L1", "L2", [current], current, "now", forced=True) == "好"
+    reply = await ai.generate_reply("L1", "L2", [current], current, "now", forced=True)
+    assert reply is not None and reply.text == "好"
     (called,) = _called_instances(instances)
     assert called.base_url == "https://reply.example.com/v1"
     assert called.api_key == "kr"
     assert called.create_kwargs["model"] == "r-model"
     assert called.create_kwargs["max_tokens"] == 500  # 未配置 → generation.reply_max_tokens
+    assert called.create_kwargs["tools"][0]["function"]["name"] == "send_reply"
+    assert called.create_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "send_reply"},
+    }
+
+
+async def test_reply_reads_tool_call_text_and_image_ops(monkeypatch):
+    instances = _install_fake(
+        monkeypatch,
+        {
+            "kr": _tool_msg(
+                "send_reply",
+                '{"text": "哈哈", "drop_img": [12, "x"], "recall_img": [7]}',
+            )
+        },
+    )
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    reply = await ai.generate_reply("L1", "L2", [current], current, "now", forced=True)
+    assert reply is not None and reply.text == "哈哈"
+    assert [(o.action, o.message_id) for o in reply.ops] == [
+        ("drop_img", 12),
+        ("recall_img", 7),
+    ]
+
+
+async def test_reply_tool_text_strips_residual_markers(monkeypatch):
+    """模型沿用旧习惯把标记写进 text 参数时也要剥除收编，绝不发进群里。"""
+    _install_fake(
+        monkeypatch,
+        {"kr": _tool_msg("send_reply", '{"text": "好可爱\\n<drop_img 51>"}')},
+    )
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    reply = await ai.generate_reply("L1", "L2", [current], current, "now", forced=True)
+    assert reply is not None and reply.text == "好可爱"
+    assert [(o.action, o.message_id) for o in reply.ops] == [("drop_img", 51)]
 
 
 async def test_per_model_max_output_tokens_override(monkeypatch):
@@ -175,3 +260,116 @@ async def test_vision_uses_own_provider_and_limit_override(monkeypatch):
     assert describe_kwargs["max_tokens"] == 999
     assert assess_kwargs["model"] == "v"
     assert assess_kwargs["max_tokens"] == 999
+    # 转述保持纯文本；入库评估则强制工具调用
+    assert "tools" not in describe_kwargs
+    assert assess_kwargs["tools"][0]["function"]["name"] == "submit_assessment"
+
+
+async def test_assess_reads_tool_call_arguments(monkeypatch):
+    _install_fake(
+        monkeypatch,
+        {"kv": _tool_msg("submit_assessment", '{"summary": "猫", "keep": false}')},
+    )
+    vision = ModelConfig("v", "https://vision.example.com/v1", "kv", None, None)
+    ai = AIClient(models=_models(vision=vision), generation=_gen())
+    assessment = await ai.assess_image("data:image/png;base64,QQ==")
+    assert assessment.summary == "猫"
+    assert assessment.keep_raw is False
+
+
+# ------------------------------------------------- 不支持工具调用的模型
+
+
+async def test_tool_use_disabled_uses_text_contract(monkeypatch):
+    """tool_use=False：不发 tools 参数，按旧约定从正文解析（提示词同套契约）。"""
+    instances = _install_fake(monkeypatch, {"kj": _JUDGE_JSON, "kr": "好"})
+    ai = AIClient(
+        models=_models(
+            judge=ModelConfig(
+                "j", "https://judge.example.com/v1", "kj", None, None, tool_use=False
+            ),
+            reply=ModelConfig(
+                "r", "https://reply.example.com/v1", "kr", None, None, tool_use=False
+            ),
+        ),
+        generation=_gen(),
+    )
+    current = _record()
+    verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert verdict.score == 8
+    reply = await ai.generate_reply("L1", "L2", [current], current, "now", forced=True)
+    assert reply is not None and reply.text == "好"
+    judge_call, reply_call = _called_instances(instances)
+    assert "tools" not in judge_call.create_kwargs
+    assert "tool_choice" not in judge_call.create_kwargs
+    assert "tools" not in reply_call.create_kwargs
+    assert ai.judge_tool_use is False and ai.reply_tool_use is False
+
+
+async def test_degrades_to_text_contract_on_tools_rejection(monkeypatch):
+    """端点报 tools 相关错误：该角色降级为纯文本协议，后续调用不带 tools。"""
+    calls: list[dict] = []
+
+    class _RejectingOpenAI:
+        def __init__(self, *, base_url=None, api_key=None):
+            self.chat = SimpleNamespace(completions=self)
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if "tools" in kwargs:
+                raise RuntimeError("This model does not support tools")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=_content_msg(_JUDGE_JSON))]
+            )
+
+    monkeypatch.setattr(ai_mod, "AsyncOpenAI", _RejectingOpenAI)
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    with pytest.raises(RuntimeError):
+        await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert ai.judge_tool_use is False
+    verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert verdict.score == 8
+    assert "tools" in calls[0] and "tools" not in calls[1]
+
+
+async def test_degrades_when_endpoint_ignores_tools(monkeypatch):
+    """端点接受 tools 却只回正文：本次按回退解析成功，角色随后降级。"""
+    calls: list[dict] = []
+
+    class _IgnoringOpenAI:
+        def __init__(self, *, base_url=None, api_key=None):
+            self.chat = SimpleNamespace(completions=self)
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=_content_msg(_JUDGE_JSON))]
+            )
+
+    monkeypatch.setattr(ai_mod, "AsyncOpenAI", _IgnoringOpenAI)
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert verdict.score == 8
+    assert ai.judge_tool_use is False
+    await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert "tools" in calls[0] and "tools" not in calls[1]
+
+
+async def test_unrelated_error_does_not_degrade(monkeypatch):
+    """与工具无关的调用异常（如网络错误）不应触发降级。"""
+
+    class _FlakyOpenAI:
+        def __init__(self, *, base_url=None, api_key=None):
+            self.chat = SimpleNamespace(completions=self)
+
+        async def create(self, **kwargs):
+            raise RuntimeError("connection reset by peer")
+
+    monkeypatch.setattr(ai_mod, "AsyncOpenAI", _FlakyOpenAI)
+    ai = AIClient(models=_models(), generation=_gen())
+    current = _record()
+    with pytest.raises(RuntimeError):
+        await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert ai.judge_tool_use is True

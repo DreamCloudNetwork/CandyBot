@@ -9,7 +9,7 @@ from dataclasses import replace as dc_replace
 from candybot.bot import CandyBot
 from candybot.memory import MemoryManager
 from candybot.models import load_settings
-from candybot.ai import JudgeVerdict
+from candybot.ai import JudgeVerdict, ReplyDraft
 from tests.test_models_settings import DictCfg
 
 
@@ -88,6 +88,9 @@ class FakeSnowluma:
 
 
 class FakeAI:
+    # bot 据此选择 reply L1 守则的输出契约措辞
+    reply_tool_use = True
+
     def __init__(self, verdict: JudgeVerdict):
         self.verdict = verdict
         self.judge_calls = 0
@@ -109,7 +112,7 @@ class FakeAI:
             "engaged": engaged,
             "score": score,
         })
-        return "哈哈确实"
+        return ReplyDraft("哈哈确实")
 
     async def describe_image(self, data_url: str):
         return "一张图"

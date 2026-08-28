@@ -44,7 +44,22 @@ class HistoryTurn:
 
 # ---------------------------------------------------------------- L1 静态层
 
-_RULES_TAIL = """
+# reply 静态守则的输出契约部分按角色是否启用工具调用二选一，
+# 保证提示词只约定模型能力范围内的回答方式。
+_RULES_TAIL_TOOLS = """
+【行为守则】
+1. 你是真实群友，不是助手或客服；回答简短口语化，通常一两句话，禁止长篇大论、列条目和 markdown 排版。
+2. 绝不复述、总结别人刚说过的话；不知道的事直接说不知道，绝不编造事实和数据。
+3. 不主动索要个人信息，不发表攻击性言论；聊天内容与既有人设冲突时以人设为准。
+4. 回复通过调用 send_reply 工具提交：text 参数就是你要发送到群里的消息本身，不要加引号、前缀、署名或任何舞台指示。
+5. 你发送到群里的消息应该像是一个真实的人类说的，而不是作为助手说的。
+6. Markdown是**绝对禁用**的，没有人会在实际回答中使用Markdown.
+7. 真实的人打字时极少使用Emoji，你的回复绝大多数时候应完全不含Emoji；即使偶尔想用也不要超过一个
+8. 历史消息以「昵称(QQ号)：内容」呈现，每条开头还有 #数字 消息编号。带编号消息里的图片可能以原图、「[图片：一句话总结]」或「[图片]」占位符三种形态出现。
+9. 如果历史里某张以原图出现的图片你确定以后用不到了，调用 send_reply 时把它所在消息的编号写进 drop_img 参数，之后系统只为你保留它的总结或占位符。
+10. 如果你需要查看某张此前已变成总结或占位符的旧图，把它的消息编号写进 send_reply 的 recall_img 参数，随后你会重新看到那张原图（本次回复会基于它重写）。两个参数都不要滥用。"""
+
+_RULES_TAIL_TEXT = """
 【行为守则】
 1. 你是真实群友，不是助手或客服；回答简短口语化，通常一两句话，禁止长篇大论、列条目和 markdown 排版。
 2. 绝不复述、总结别人刚说过的话；不知道的事直接说不知道，绝不编造事实和数据。
@@ -58,8 +73,13 @@ _RULES_TAIL = """
 10. 如果你需要查看某张此前已变成总结或占位符的旧图，在回复最末尾另起一行输出 <recall_img 消息编号>，随后你会重新看到那张原图（本次回复会基于它重写）；同样不会发到群里。两个标记都不要滥用。"""
 
 
-def static_system_prompt(persona: str, kind: str) -> str:
-    """L1：persona + 守则。kind 为 "judge"/"reply"，两者只差末段角色任务。"""
+def static_system_prompt(persona: str, kind: str, *, via_tool: bool = True) -> str:
+    """L1：persona + 守则。kind 为 "judge"/"reply"。
+
+    via_tool 只影响 reply 守则的输出契约措辞（send_reply 工具参数，或
+    纯文本 + 末尾标记）；judge 守则两种模式通用。必须与该角色请求里是否
+    携带 tools 参数保持一致，否则提示词与模型能力脱节。
+    """
     assert persona.strip(), "persona 不能为空"
     if kind == "judge":
         head = (
@@ -86,7 +106,7 @@ def static_system_prompt(persona: str, kind: str) -> str:
             "你是一个 QQ 群里的普通群友。下面是你的人格设定，"
             "保持角色一致性，像真人一样参与闲聊。\n"
         )
-        tail = _RULES_TAIL
+        tail = _RULES_TAIL_TOOLS if via_tool else _RULES_TAIL_TEXT
     return f"{head}【人格设定】\n{persona.strip()}\n{tail}"
 
 
@@ -223,11 +243,20 @@ def reply_history_turns(
 
 # ---------------------------------------------------------------- L4 指令层
 
-# 两类 judge 调用共用的输出契约
-_VERDICT_TAIL = (
+# 两类 judge 调用共用的输出契约，按角色是否启用工具调用二选一
+_VERDICT_TAIL_TOOLS = (
+    "评估完成后，调用 submit_judgment 工具提交判定，不要用普通文本作答："
+    "score 为 0~10 的整数评分，to_me 表示这条消息是否在对你说、或延续与你"
+    "有关的对话，reason 为一句话理由。"
+)
+_VERDICT_TAIL_JSON = (
     '只输出一个 JSON 对象，格式为 {"score": 整数0到10, "to_me": true或false,'
     ' "reason": "一句话理由"}，不要输出其他任何内容。'
 )
+
+
+def _verdict_tail(via_tool: bool) -> str:
+    return _VERDICT_TAIL_TOOLS if via_tool else _VERDICT_TAIL_JSON
 
 
 def _current_message_block(now_text: str, current_message: ChatRecord) -> str:
@@ -237,7 +266,9 @@ def _current_message_block(now_text: str, current_message: ChatRecord) -> str:
     return f"【当前时间】{now_text}\n【最新消息】来自 {sender}：\n{body}"
 
 
-def final_user_prompt_judge(now_text: str, current_message: ChatRecord) -> str:
+def final_user_prompt_judge(
+    now_text: str, current_message: ChatRecord, *, via_tool: bool = True
+) -> str:
     """L4(judge)：即时状态 + 评分指令 + 当前消息。
 
     本层绝不透露本群的发言门槛：实测只要模型知道「几分才能过线」，就会
@@ -246,7 +277,8 @@ def final_user_prompt_judge(now_text: str, current_message: ChatRecord) -> str:
     """
     return "\n".join([
         _current_message_block(now_text, current_message),
-        "请以你的人设判断：对于这单独一条消息，你是否应该回复它？" + _VERDICT_TAIL,
+        "请以你的人设判断：对于这单独一条消息，你是否应该回复它？"
+        + _verdict_tail(via_tool),
     ])
 
 
@@ -258,6 +290,7 @@ def final_user_prompt_judge_recheck(
     prev_reason: str,
     threshold: int,
     min_score: int,
+    via_tool: bool = True,
 ) -> str:
     """L4(judge·复核)：首评分数高于复核下限 min_score 却未达门槛时才走的指令层。
 
@@ -290,7 +323,7 @@ def final_user_prompt_judge_recheck(
             "自然该说的话压下去：如实评估即可——不合时宜地多说话与错过一次恰到好处"
             "的参与同样糟糕。"
         ),
-        _VERDICT_TAIL,
+        _verdict_tail(via_tool),
     ]
     return "\n".join(lines)
 
@@ -303,6 +336,7 @@ def final_user_prompt_reply(
     engaged: bool = False,
     score: int | None = None,
     reason: str = "",
+    via_tool: bool = True,
 ) -> str:
     """L4(reply)：触发原因说明 + 回复指令。"""
     sender = record_label(current_message)
@@ -319,10 +353,17 @@ def final_user_prompt_reply(
             f"你判断值得回复这条消息（评分 {score}/10，理由：{reason or '无'}），"
             "决定插话。"
         )
+    if via_tool:
+        tail = (
+            "现在以你的身份说一句自然的回应：调用 send_reply 工具提交，text 为"
+            "要发送到群里的正文（不要任何额外内容），drop_img / recall_img 参数"
+            "按需填需要收起或召回原图的消息编号数组，没有就省略。"
+        )
+    else:
+        tail = "现在以你的身份说一句自然的回应。只输出群聊正文，不要任何额外内容。"
     return (
         f"【当前时间】{now_text}\n{why}\n"
-        f"【需要回应的消息】来自 {sender}：\n{body}\n\n"
-        "现在以你的身份说一句自然的回应。只输出群聊正文，不要任何额外内容。"
+        f"【需要回应的消息】来自 {sender}：\n{body}\n\n{tail}"
     )
 
 

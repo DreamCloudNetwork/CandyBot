@@ -15,7 +15,7 @@ from datetime import date
 
 import aiohttp
 
-from .ai import AIClient, ImageOp, split_image_ops
+from .ai import AIClient, ImageOp, ReplyDraft, split_image_ops
 from .dedup import MessageDedup
 from .events_server import EventsServer
 from .memory import MemoryManager
@@ -53,11 +53,15 @@ class GroupRuntime:
         self._static_cache_key: tuple[int, str] | None = None
         self._static_cache: str = ""
 
-    def static_system(self, kind: str, persona: str) -> str:
-        """L1 静态层按 (kind, persona) 缓存；persona 改热重载时自动重建。"""
-        key = (hash(kind), persona)
+    def static_system(self, kind: str, persona: str, *, via_tool: bool = True) -> str:
+        """L1 静态层按 (kind, persona, via_tool) 缓存；persona 改热重载时自动重建。
+
+        via_tool 决定 reply 守则里输出契约的措辞，必须与该角色请求是否
+        携带 tools 参数一致（取自 AIClient 的实时角色状态）。
+        """
+        key = (hash(kind), persona, via_tool)
         if key != self._static_cache_key:
-            self._static_cache = static_system_prompt(persona, kind)
+            self._static_cache = static_system_prompt(persona, kind, via_tool=via_tool)
             self._static_cache_key = key
         return self._static_cache
 
@@ -291,17 +295,21 @@ class CandyBot:
         runtime: GroupRuntime,
         decision: Decision,
     ) -> str | None:
-        """生成回复并处理其中的图片生命周期标记。
+        """生成回复并处理其中的图片生命周期操作。
 
-        首稿解析 <drop_img>/<recall_img> 标记：立即把操作落到记忆；
-        若发生过成功的召回（模型想重新查看某张旧图），重建上下文后再
-        生成一次，让召回的原图进入本轮对话。二稿只剥标记、不再重试，
-        保证每条消息至多两次生成调用。
+        首稿通过 send_reply 工具参数携带 drop/recall 操作：立即把操作落到
+        记忆；若发生过成功的召回（模型想重新查看某张旧图），重建上下文后
+        再生成一次，让召回的原图进入本轮对话。二稿不再重试，保证每条消息
+        至多两次生成调用。作为最终防线，正文中任何形似 <drop_img>/<recall_img>
+        的残留标记仍会被剥除收编，绝不发进群里。
         """
         memory = await self._memory.get(group_id)
         for attempt in range(2):
             recent = memory.tail(profile.context_size)
-            static_system = runtime.static_system("reply", profile.persona)
+            # 跟随 reply 角色实时的工具调用状态：降级后 L1 守则换回纯文本措辞
+            static_system = runtime.static_system(
+                "reply", profile.persona, via_tool=self._ai.reply_tool_use
+            )
             nicknames = nickname_list_from_history(
                 [record_to_turn(r) for r in recent[:-1]]
             )
@@ -319,15 +327,16 @@ class CandyBot:
                 score=decision.score,
                 reason=decision.reason,
             )
-            if not draft:
+            if draft is None or not draft.text:
                 return None
-            draft, ops = split_image_ops(draft)
+            text, tag_ops = split_image_ops(draft.text)
+            ops: list[ImageOp] = [*draft.ops, *tag_ops]
             changed = await self._apply_image_ops(group_id, memory, ops)
             recalled = any(op.action == "recall_img" for op in ops)
             if attempt == 0 and changed and recalled:
                 logger.info("群 %d 模型召回历史图片，基于新上下文重写回复", group_id)
                 continue
-            return draft
+            return text
         return None
 
     async def _apply_image_ops(
@@ -494,7 +503,7 @@ class CandyBot:
 
     # ------------------------------------------------------------ 重试包装
 
-    async def _generate_with_retry(self, *args, **kwargs) -> str | None:
+    async def _generate_with_retry(self, *args, **kwargs) -> ReplyDraft | None:
         delay = 2.0
         last_exc: Exception | None = None
         for attempt in range(2):

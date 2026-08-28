@@ -2,6 +2,13 @@
 
 每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
 上下文窗口与输出上限（见 models.ModelConfig）。
+
+判定、回复与图片入库评估默认通过强制工具调用（tool_choice 指定函数）获得
+结构化结果；models.<role>.tool_use=false 的角色改走纯文本协议——提示词
+要求在正文输出 JSON / 末尾标记，请求不携带 tools 参数。运行中若端点报
+工具相关错误，或接受了 tools 却不返回工具调用，该角色自动降级为纯文本
+协议（本进程内生效），保证提示词永远只约定模型能力范围内的回答方式；
+端点不支持而只回正文时也回退按正文解析。
 """
 
 from __future__ import annotations
@@ -80,6 +87,86 @@ class ImageOp:
     message_id: int
 
 
+@dataclass(frozen=True)
+class ReplyDraft:
+    """回复模型的一次产出：群聊正文 + 随附的图片生命周期操作。"""
+
+    text: str
+    ops: tuple[ImageOp, ...] = ()
+
+
+# 判定/回复/入库评估的结构化输出工具。只用于承载模型结论（服务端不执行），
+# tool_choice 强制指定函数名，正文内容一律不作为答案来源。
+_JUDGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_judgment",
+        "description": "提交你对最新消息的回复判定结论。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": "0~10 的回复意愿评分",
+                },
+                "to_me": {
+                    "type": "boolean",
+                    "description": "这条消息是否在对你说、或延续与你有关的对话",
+                },
+                "reason": {"type": "string", "description": "一句话理由"},
+            },
+            "required": ["score", "to_me", "reason"],
+        },
+    },
+}
+
+_REPLY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "send_reply",
+        "description": "提交你要发送到群里的回复及图片生命周期操作。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "要发送的群聊消息正文，像真人打字，不加引号或舞台指示",
+                },
+                "drop_img": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "以后用不到原图的历史消息编号，可省略",
+                },
+                "recall_img": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "想重新查看原图的历史消息编号，可省略",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+}
+
+_ASSESS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_assessment",
+        "description": "提交图片入库评估：一句话总结与是否保留原图。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "不超过40字的内容总结"},
+                "keep": {"type": "boolean", "description": "后续对话是否还需要查看原图"},
+            },
+            "required": ["summary", "keep"],
+        },
+    },
+}
+
+
 _IMAGE_HEAD = 48  # debug 日志中图片 data URL 只保留头部字符数
 
 # judge 需要输出思考段，上限太小会把结论截掉；models.judge.max_output_tokens 可覆盖
@@ -149,6 +236,81 @@ def split_image_ops(text: str) -> tuple[str, list[ImageOp]]:
     return "\n".join(lines).strip(), ops
 
 
+def _forced_tool_choice(tool: dict) -> dict:
+    """强制模型调用指定函数的 tool_choice 参数。"""
+    return {"type": "function", "function": {"name": tool["function"]["name"]}}
+
+
+def _tool_request_kwargs(tool: dict) -> dict:
+    """工具调用模式的 create 附加参数：携带工具定义并强制调用。"""
+    return {"tools": [tool], "tool_choice": _forced_tool_choice(tool)}
+
+
+def _looks_like_tools_rejection(exc: Exception) -> bool:
+    """端点把 tools/tool_choice 参数当错误时，报错文本几乎都带这些字样。
+
+    只认报错关键词，不看状态码：400 也可能是上下文超限等无关错误，
+    误降级会让可用的工具协议被白白放弃。
+    """
+    text = str(exc).lower()
+    return "tool" in text or "function" in text or "工具" in text
+
+
+def _returned_tool_call(response) -> bool:
+    """响应是否携带工具调用；False 说明端点接受了 tools 却没用（多半忽略）。"""
+    try:
+        return bool(response.choices[0].message.tool_calls)
+    except (AttributeError, IndexError):
+        return False
+
+
+def _tool_arguments(response, name: str) -> dict | None:
+    """取响应中首个可用工具调用的参数对象；没有工具调用时返回 None。
+
+    优先取名为 name 的调用，取不到时退而求其次接受第一个能解析出参数
+    字典的调用（部分兼容端点会改写函数名）。参数不是合法 JSON 视为没有。
+    """
+    try:
+        calls = response.choices[0].message.tool_calls or []
+    except (AttributeError, IndexError):
+        return None
+    fallback: dict | None = None
+    for call in calls:
+        fn = getattr(call, "function", None)
+        if fn is None:
+            continue
+        raw = fn.arguments or ""
+        try:
+            args = json.loads(raw)
+        except ValueError:
+            logger.warning("工具调用 %s 的参数不是合法 JSON：%r", name, raw[:200])
+            continue
+        if not isinstance(args, dict):
+            continue
+        if fn.name == name:
+            return args
+        if fallback is None:
+            fallback = args
+    return fallback
+
+
+def _ops_from_reply_args(args: dict) -> list[ImageOp]:
+    """send_reply 工具参数里的图片生命周期操作；无法转换的脏值直接忽略。"""
+    ops: list[ImageOp] = []
+    for action in ("drop_img", "recall_img"):
+        values = args.get(action)
+        if values is None:
+            continue
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            try:
+                ops.append(ImageOp(action=action, message_id=int(value)))
+            except (TypeError, ValueError):
+                continue
+    return ops
+
+
 class AIClient:
     """封装三种 LLM 调用。所有方法都可能抛出 openai 库异常，由上层决定重试。
 
@@ -170,6 +332,39 @@ class AIClient:
         # 只有 direct 模式才允许任何图片（历史层或当前消息）进入请求
         self._multimodal_mode = multimodal_mode
         self._clients: dict[tuple[str, str], AsyncOpenAI] = {}
+        # 每个角色当前是否走工具调用协议：初值来自模型配置，运行中遇端点
+        # 不支持（报错或忽略 tools）时降级为 False，本进程内不再回升。
+        self._tools_on: dict[str, bool] = {
+            "judge": models.judge.tool_use,
+            "reply": models.reply.tool_use,
+            "vision": models.vision.tool_use if models.vision else False,
+        }
+
+    @property
+    def judge_tool_use(self) -> bool:
+        """judge 角色当前是否走工具调用协议。"""
+        return self._tools_on["judge"]
+
+    @property
+    def reply_tool_use(self) -> bool:
+        """reply 角色当前是否走工具调用协议；bot 据此选择 L1 守则措辞。"""
+        return self._tools_on["reply"]
+
+    def _disable_tools(self, role: str, why: str) -> None:
+        """该角色降级为纯文本协议；此后提示词契约与请求都不再涉及 tools。"""
+        if not self._tools_on[role]:
+            return
+        self._tools_on[role] = False
+        model = {"judge": self._judge, "reply": self._reply, "vision": self._vision}[
+            role
+        ].model
+        logger.warning(
+            "%s 角色模型 %s 疑似不支持工具调用（%s），已改用纯文本协议；"
+            "如需固定行为，请在 config.json5 中为该角色设置 tool_use: false",
+            role,
+            model,
+            why,
+        )
 
     def _client_for(self, cfg: ModelConfig) -> AsyncOpenAI:
         key = (cfg.base_url, cfg.api_key)
@@ -212,8 +407,9 @@ class AIClient:
         prev_verdict 传入首评的判定时进入复核模式：本次调用会把本群真实
         门槛与复核下限 min_score 告知模型，请其针对「高于下限却未达门槛」
         的首评结论重新裁定。首评与复核共用相同的 L1-L3 前缀，KVCache 可
-        直接复用。
+        直接复用。输出契约随 judge 角色的工具调用状态选择。
         """
+        use_tools = self._tools_on["judge"]
         # 历史层不含当前消息本身（它单独出现在指令层，保证历史层前缀稳定）
         # 预算需扣除 L4 文本本身，故先构造指令层再裁历史
         if prev_verdict is not None:
@@ -226,10 +422,13 @@ class AIClient:
                 prev_reason=prev_verdict.reason,
                 threshold=threshold,
                 min_score=min_score,
+                via_tool=use_tools,
             )
             tag = "[judge·复核]"
         else:
-            final_user = final_user_prompt_judge(now_text, current_message)
+            final_user = final_user_prompt_judge(
+                now_text, current_message, via_tool=use_tools
+            )
             tag = "[judge]"
         prompt_chars = len(static_system) + len(runtime_system) + len(final_user)
         turns, _ = history_to_turns(
@@ -249,7 +448,7 @@ class AIClient:
             len(chat),
             format_messages_for_log(chat),
         )
-        response = await self._client_for(self._judge).chat.completions.create(
+        request: dict = dict(
             model=self._judge.model,
             messages=chat,
             temperature=0.2,
@@ -257,8 +456,41 @@ class AIClient:
             max_tokens=self._judge.max_output_tokens or _JUDGE_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
+        if use_tools:
+            request.update(_tool_request_kwargs(_JUDGE_TOOL))
+        try:
+            response = await self._client_for(self._judge).chat.completions.create(
+                **request
+            )
+        except Exception as exc:
+            if use_tools and _looks_like_tools_rejection(exc):
+                self._disable_tools("judge", str(exc))
+            raise
+        if use_tools:
+            if not _returned_tool_call(response):
+                # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
+                self._disable_tools("judge", "响应中无工具调用")
+            else:
+                args = _tool_arguments(response, _JUDGE_TOOL["function"]["name"])
+                if args is not None:
+                    return self._verdict_from_args(args)
+        # 回退/纯文本协议：按旧约定从正文解析
         raw = (response.choices[0].message.content or "").strip()
         return self._parse_verdict(raw)
+
+    @staticmethod
+    def _verdict_from_args(args: dict) -> JudgeVerdict:
+        try:
+            score = int(args["score"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("judge 工具调用缺少合法 score：%r", args)
+            return JudgeVerdict(score=0, reason="工具调用参数缺失")
+        return JudgeVerdict(
+            score=max(0, min(10, score)),
+            # to_me 只认布尔 true：脏数据一律视为 False，绝不误判「在和我说话」
+            to_me=args.get("to_me") is True,
+            reason=str(args.get("reason", ""))[:100],
+        )
 
     @staticmethod
     def _parse_verdict(raw: str) -> JudgeVerdict:
@@ -291,10 +523,21 @@ class AIClient:
         engaged: bool = False,
         score: int | None = None,
         reason: str = "",
-    ) -> str | None:
-        """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。"""
+    ) -> ReplyDraft | None:
+        """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。
+
+        工具调用模式下经 send_reply 的强制调用拿到（正文, 图片操作）；纯文本
+        协议下按旧约定解析正文（标记写在末尾）。返回 None 表示无话可说。
+        """
+        use_tools = self._tools_on["reply"]
         text_part = final_user_prompt_reply(
-            now_text, current_message, forced=forced, engaged=engaged, score=score, reason=reason
+            now_text,
+            current_message,
+            forced=forced,
+            engaged=engaged,
+            score=score,
+            reason=reason,
+            via_tool=use_tools,
         )
         # 预算需扣除 L4 文本本身，故先构造指令层再裁历史；原图 token 开销不参与估算
         prompt_chars = len(static_system) + len(runtime_system) + len(text_part)
@@ -330,18 +573,43 @@ class AIClient:
             len(chat),
             format_messages_for_log(chat),
         )
-        response = await self._client_for(self._reply).chat.completions.create(
+        request: dict = dict(
             model=self._reply.model,
             messages=chat,
             temperature=self._generation.temperature,
             max_tokens=self._reply.max_output_tokens or self._generation.reply_max_tokens,
             timeout=self._generation.timeout_seconds,
         )
-        reply = (response.choices[0].message.content or "").strip()
-        reply = _strip_noise(reply)
+        if use_tools:
+            request.update(_tool_request_kwargs(_REPLY_TOOL))
+        try:
+            response = await self._client_for(self._reply).chat.completions.create(
+                **request
+            )
+        except Exception as exc:
+            if use_tools and _looks_like_tools_rejection(exc):
+                self._disable_tools("reply", str(exc))
+            raise
+        if use_tools and _returned_tool_call(response):
+            args = _tool_arguments(response, _REPLY_TOOL["function"]["name"])
+            if args is not None:
+                # 工具正文仍过一遍标记剥除：模型偶尔会沿用旧习惯把标记写进 text
+                text, tag_ops = split_image_ops(str(args.get("text") or ""))
+                ops = (*_ops_from_reply_args(args), *tag_ops)
+            else:
+                text, ops = "", ()
+        else:
+            if use_tools:
+                # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
+                self._disable_tools("reply", "响应中无工具调用")
+            # 回退/纯文本协议：按旧约定从正文解析（标记写在末尾）
+            text, ops = split_image_ops(response.choices[0].message.content or "")
+        text = _strip_noise(text)
         roll_ok = random.random() < self._generation.emoji_chance
-        reply = _cap_emojis(reply, self._generation.emoji_max if roll_ok else 0)
-        return reply or None
+        text = _cap_emojis(text, self._generation.emoji_max if roll_ok else 0)
+        if not text:
+            return None
+        return ReplyDraft(text, tuple(ops))
 
     # --------------------------------------------------------------- vision
 
@@ -380,12 +648,13 @@ class AIClient:
         """
         if not self._vision:
             return ImageAssessment(summary=None, keep_raw=True)
+        use_tools = self._tools_on["vision"]
         logger.debug(
             "[vision·assess] model=%s 图片 %d 字符",
             self._vision.model,
             len(data_url),
         )
-        response = await self._client_for(self._vision).chat.completions.create(
+        request: dict = dict(
             model=self._vision.model,
             messages=[
                 {
@@ -398,8 +667,13 @@ class AIClient:
                                 "再判断后续对话是否还需要继续查看这张原图：只有当图片包含未来"
                                 "可能被反复引用的具体信息（文字截图、代码、表格、关键画面细节等）"
                                 "才值得保留原图；表情包、梗图之类的总结即可。\n"
-                                '只输出一个 JSON 对象：{"summary": "一句话总结",'
-                                ' "keep": true 或 false}'
+                                + (
+                                    "完成后调用 submit_assessment 工具提交：summary 为一句话总结，"
+                                    "keep 表示后续对话是否还需要查看原图。"
+                                    if use_tools
+                                    else '只输出一个 JSON 对象：{"summary": "一句话总结",'
+                                    ' "keep": true 或 false}'
+                                )
                             ),
                         },
                         {"type": "image_url", "image_url": {"url": data_url}},
@@ -410,8 +684,34 @@ class AIClient:
             max_tokens=self._vision.max_output_tokens or _ASSESS_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
+        if use_tools:
+            request.update(_tool_request_kwargs(_ASSESS_TOOL))
+        try:
+            response = await self._client_for(self._vision).chat.completions.create(
+                **request
+            )
+        except Exception as exc:
+            if use_tools and _looks_like_tools_rejection(exc):
+                self._disable_tools("vision", str(exc))
+            raise
+        if use_tools:
+            if not _returned_tool_call(response):
+                # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
+                self._disable_tools("vision", "响应中无工具调用")
+            else:
+                args = _tool_arguments(response, _ASSESS_TOOL["function"]["name"])
+                if args is not None:
+                    return self._assessment_from_args(args)
+        # 回退/纯文本协议：按旧约定从正文解析
         raw = (response.choices[0].message.content or "").strip()
         return self._parse_assessment(raw)
+
+    @staticmethod
+    def _assessment_from_args(args: dict) -> ImageAssessment:
+        summary = args.get("summary")
+        summary = str(summary).strip()[:200] if isinstance(summary, str) else None
+        # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图
+        return ImageAssessment(summary=summary or None, keep_raw=args.get("keep") is not False)
 
     @staticmethod
     def _parse_assessment(raw: str) -> ImageAssessment:

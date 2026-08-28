@@ -306,6 +306,28 @@ def test_models_object_form_per_provider():
     assert s.models.vision.base_url == "https://api.example.com/v1"
 
 
+def test_model_tool_use_flag_parsing():
+    """tool_use 默认 true；显式 false 表示该角色走纯文本协议；非布尔值拒绝。"""
+    s = load_settings(DictCfg(base_cfg(models={"judge": "j", "reply": "r"})))
+    assert s.models.judge.tool_use is True
+    s = load_settings(
+        DictCfg(
+            base_cfg(
+                models={"judge": {"model": "j", "tool_use": False}, "reply": "r"}
+            )
+        )
+    )
+    assert s.models.judge.tool_use is False
+    with pytest.raises(ValueError):
+        load_settings(
+            DictCfg(
+                base_cfg(
+                    models={"judge": {"model": "j", "tool_use": "yes"}, "reply": "r"}
+                )
+            )
+        )
+
+
 def test_models_without_ai_backend_section():
     """三个模型都自带提供商时，ai_backend 段可整个省略。"""
     cfg = base_cfg()

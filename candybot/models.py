@@ -206,6 +206,11 @@ class ModelConfig:
     context_window 为该模型的上下文窗口（token），运行时据此约束送入的
     历史长度；max_output_tokens 为该模型单次调用的输出上限（token），
     未配置时各角色回落到自己的内置/全局默认值。
+    tool_use=False 表示该模型不支持（或不希望使用）工具调用：该角色改走
+    纯文本协议（judge/评估在正文输出 JSON，reply 用 <drop_img>/<recall_img>
+    标记），请求不携带 tools 参数，提示词里的输出契约随之一致——保证
+    提示词永远只约定模型能力范围内的回答方式。运行中若端点报工具相关
+    错误或忽略 tools 参数，该角色也会自动降级为纯文本协议。
     """
 
     model: str
@@ -213,6 +218,7 @@ class ModelConfig:
     api_key: str  # 可为空：本地服务等无密钥端点（运行时回退环境变量/占位符）
     context_window: int | None
     max_output_tokens: int | None
+    tool_use: bool = True
 
 
 @dataclass(frozen=True)
@@ -615,6 +621,7 @@ def _parse_model_config(raw: Any, label: str, defaults: AISettings) -> ModelConf
         api_key=api_key,
         context_window=context_window,
         max_output_tokens=max_output,
+        tool_use=_parse_bool(raw.get("tool_use", True), f"{label}.tool_use"),
     )
 
 

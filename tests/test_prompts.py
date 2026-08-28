@@ -7,6 +7,7 @@ from candybot.prompts import (
     build_messages,
     final_user_prompt_judge,
     final_user_prompt_judge_recheck,
+    final_user_prompt_reply,
     history_to_turns,
     nickname_list_from_history,
     record_to_turn,
@@ -161,3 +162,31 @@ def test_nickname_list_from_history():
     hist.append(record_to_turn(rec(9, 99, "糖糖", "me", is_self=True)))
     names = nickname_list_from_history(hist)
     assert names == ["n0(3)", "n1(3)"]  # assistant 不计入；保序去重；带 QQ 号
+
+
+def test_output_contract_follows_via_tool_flag():
+    """提示词输出契约必须与请求是否携带 tools 严格配套，不容错配。"""
+    msg = rec(1, 5, "小明", "在吗")
+
+    # reply：L1 守则与 L4 指令随 via_tool 同步切换
+    tool_static = static_system_prompt(PERSONA, "reply")
+    text_static = static_system_prompt(PERSONA, "reply", via_tool=False)
+    assert "send_reply" in tool_static and "send_reply" not in text_static
+    assert "<drop_img" not in tool_static and "<drop_img" in text_static
+    assert "send_reply" in final_user_prompt_reply("t", msg, forced=True)
+    assert (
+        "send_reply"
+        not in final_user_prompt_reply("t", msg, forced=True, via_tool=False)
+    )
+
+    # judge：L1 守则通用，L4 的输出契约随 via_tool 切换
+    judge_static = static_system_prompt(PERSONA, "judge")
+    assert "send_reply" not in judge_static  # judge 不说话，两种模式共用
+    assert "submit_judgment" in final_user_prompt_judge("t", msg)
+    assert "submit_judgment" not in final_user_prompt_judge("t", msg, via_tool=False)
+    assert "JSON" in final_user_prompt_judge("t", msg, via_tool=False)
+
+    recheck = final_user_prompt_judge_recheck(
+        "t", msg, prev_score=7, prev_reason="r", threshold=8, min_score=4, via_tool=False
+    )
+    assert "submit_judgment" not in recheck and "JSON" in recheck

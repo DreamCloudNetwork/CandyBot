@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from candybot.ai import ImageAssessment, AIClient, split_image_ops
+from candybot.ai import ImageAssessment, AIClient, ReplyDraft, split_image_ops
 from candybot.memory import MemoryManager
 from candybot.models import ChatRecord, load_settings
 from candybot.normalize import normalize_group_message
@@ -338,6 +338,9 @@ def make_settings(tmp_path, multimodal_mode):
 class MarkerAI:
     """reply 固定返回带标记的草稿；记录每次调用看到的历史快照。"""
 
+    # bot 据此选择 reply L1 守则的输出契约措辞
+    reply_tool_use = True
+
     def __init__(self, drafts):
         self.drafts = list(drafts)
         self.calls: list[list[tuple]] = []
@@ -350,7 +353,7 @@ class MarkerAI:
                 for r in recent
             ]
         )
-        return self.drafts.pop(0) if self.drafts else "兜底回复"
+        return ReplyDraft(self.drafts.pop(0) if self.drafts else "兜底回复")
 
 
 class FakeSnow:
