@@ -211,6 +211,10 @@ class ModelConfig:
     标记），请求不携带 tools 参数，提示词里的输出契约随之一致——保证
     提示词永远只约定模型能力范围内的回答方式。运行中若端点报工具相关
     错误或忽略 tools 参数，该角色也会自动降级为纯文本协议。
+    forced_tool_choice=False 表示该模型不支持强制指定工具（tool_choice 的
+    required/object 形式，思考（thinking）模式的模型普遍如此，如 qwen3
+    系列会直接报 400）：请求仍携带 tools 但改用 tool_choice="auto"，由
+    提示词引导模型主动调用；模型没调用时同样自动降级为纯文本协议。
     """
 
     model: str
@@ -219,6 +223,7 @@ class ModelConfig:
     context_window: int | None
     max_output_tokens: int | None
     tool_use: bool = True
+    forced_tool_choice: bool = True
 
 
 @dataclass(frozen=True)
@@ -622,6 +627,9 @@ def _parse_model_config(raw: Any, label: str, defaults: AISettings) -> ModelConf
         context_window=context_window,
         max_output_tokens=max_output,
         tool_use=_parse_bool(raw.get("tool_use", True), f"{label}.tool_use"),
+        forced_tool_choice=_parse_bool(
+            raw.get("forced_tool_choice", True), f"{label}.forced_tool_choice"
+        ),
     )
 
 

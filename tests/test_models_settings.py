@@ -328,6 +328,34 @@ def test_model_tool_use_flag_parsing():
         )
 
 
+def test_model_forced_tool_choice_flag_parsing():
+    """forced_tool_choice 默认 true；显式 false 表示改用 auto 工具选择；非布尔值拒绝。"""
+    s = load_settings(DictCfg(base_cfg(models={"judge": "j", "reply": "r"})))
+    assert s.models.judge.forced_tool_choice is True
+    s = load_settings(
+        DictCfg(
+            base_cfg(
+                models={
+                    "judge": {"model": "j", "forced_tool_choice": False},
+                    "reply": "r",
+                }
+            )
+        )
+    )
+    assert s.models.judge.forced_tool_choice is False
+    with pytest.raises(ValueError):
+        load_settings(
+            DictCfg(
+                base_cfg(
+                    models={
+                        "judge": {"model": "j", "forced_tool_choice": "no"},
+                        "reply": "r",
+                    }
+                )
+            )
+        )
+
+
 def test_models_without_ai_backend_section():
     """三个模型都自带提供商时，ai_backend 段可整个省略。"""
     cfg = base_cfg()

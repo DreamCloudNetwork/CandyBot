@@ -54,6 +54,10 @@
     //                        走纯文本协议（judge 在正文输出 JSON，reply 用末尾
     //                        <drop_img>/<recall_img> 标记）；运行中若端点报工具
     //                        相关错误或忽略 tools 参数，也会自动降级并记警告日志
+    //   forced_tool_choice   是否强制指定工具（tool_choice=required，默认 true）。
+    //                        思考（thinking）模式的模型普遍不支持强制指定（如
+    //                        qwen3 系列会报 400）：这类模型设为 false，请求改用
+    //                        tool_choice="auto"，由提示词引导模型主动调用
     "models": {
         "judge": "glm-4-flash",           // 兴趣评分模型
         "reply": {
@@ -63,6 +67,7 @@
             // "context_window": 64000,
             // "max_output_tokens": 800,
             // "tool_use": false,          // 模型不支持 function calling 时打开
+            // "forced_tool_choice": false, // 思考模式不支持 required 强制指定时打开
         },
         // "vision": "glm-4v-flash",      // 视觉模型；注释掉表示禁用图片理解
     },

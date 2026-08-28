@@ -4,7 +4,9 @@
 上下文窗口与输出上限（见 models.ModelConfig）。
 
 判定、回复与图片入库评估默认通过强制工具调用（tool_choice 指定函数）获得
-结构化结果；models.<role>.tool_use=false 的角色改走纯文本协议——提示词
+结构化结果；models.<role>.forced_tool_choice=false 的角色改用 tool_choice=
+"auto"（思考模式不支持 required 强制指定的模型，如 qwen3 系列），仍走工具
+协议。models.<role>.tool_use=false 的角色改走纯文本协议——提示词
 要求在正文输出 JSON / 末尾标记，请求不携带 tools 参数。运行中若端点报
 工具相关错误，或接受了 tools 却不返回工具调用，该角色自动降级为纯文本
 协议（本进程内生效），被拒的当次请求也会立即换纯文本契约补发，不让这
@@ -248,9 +250,15 @@ def _forced_tool_choice(tool: dict) -> dict:
     return {"type": "function", "function": {"name": tool["function"]["name"]}}
 
 
-def _tool_request_kwargs(tool: dict) -> dict:
-    """工具调用模式的 create 附加参数：携带工具定义并强制调用。"""
-    return {"tools": [tool], "tool_choice": _forced_tool_choice(tool)}
+def _tool_request_kwargs(tool: dict, *, force: bool = True) -> dict:
+    """工具调用模式的 create 附加参数：携带工具定义并（默认）强制调用。
+
+    force=False 时改用 tool_choice="auto"：思考（thinking）模式的模型普遍
+    不支持 required/object 的强制指定（如 qwen3 系列会报 400），但接受
+    auto，由提示词引导模型主动调用。
+    """
+    choice = _forced_tool_choice(tool) if force else "auto"
+    return {"tools": [tool], "tool_choice": choice}
 
 
 def _looks_like_tools_rejection(exc: Exception) -> bool:
@@ -496,7 +504,9 @@ class AIClient:
             timeout=self._generation.timeout_seconds,
         )
         if use_tools:
-            request.update(_tool_request_kwargs(_JUDGE_TOOL))
+            request.update(
+                _tool_request_kwargs(_JUDGE_TOOL, force=self._judge.forced_tool_choice)
+            )
         response, via_tools = await self._create_chat(
             "judge", request, lambda: build_messages(False)
         )
@@ -615,7 +625,9 @@ class AIClient:
             timeout=self._generation.timeout_seconds,
         )
         if use_tools:
-            request.update(_tool_request_kwargs(_REPLY_TOOL))
+            request.update(
+                _tool_request_kwargs(_REPLY_TOOL, force=self._reply.forced_tool_choice)
+            )
 
         def text_messages() -> list[Message]:
             # 降级补发：仅把 L4 指令换成纯文本契约（direct 模式保留图片块）。
@@ -740,7 +752,9 @@ class AIClient:
             timeout=self._generation.timeout_seconds,
         )
         if use_tools:
-            request.update(_tool_request_kwargs(_ASSESS_TOOL))
+            request.update(
+                _tool_request_kwargs(_ASSESS_TOOL, force=self._vision.forced_tool_choice)
+            )
         response, via_tools = await self._create_chat(
             "vision", request, lambda: messages(False)
         )

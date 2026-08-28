@@ -155,6 +155,34 @@ async def test_judge_routes_to_own_provider_with_default_max_tokens(monkeypatch)
     }
 
 
+async def test_forced_tool_choice_disabled_uses_auto(monkeypatch):
+    """forced_tool_choice=False：仍携带 tools，但 tool_choice 用 auto（思考模式兼容）。"""
+    instances = _install_fake(
+        monkeypatch,
+        {"kj": _tool_msg("submit_judgment", '{"score": 9, "to_me": true, "reason": "在等我"}')},
+    )
+    ai = AIClient(
+        models=_models(
+            judge=ModelConfig(
+                "j",
+                "https://judge.example.com/v1",
+                "kj",
+                None,
+                None,
+                forced_tool_choice=False,
+            )
+        ),
+        generation=_gen(),
+    )
+    current = _record()
+    verdict = await ai.judge_interest("L1", "L2", [current], current, "now")
+    assert verdict.score == 9
+    (called,) = _called_instances(instances)
+    assert called.create_kwargs["tools"][0]["function"]["name"] == "submit_judgment"
+    assert called.create_kwargs["tool_choice"] == "auto"
+    assert ai.judge_tool_use is True  # 仍走工具协议，提示词契约不变
+
+
 async def test_judge_prefers_tool_call_arguments(monkeypatch):
     instances = _install_fake(
         monkeypatch,
