@@ -9,6 +9,7 @@ dependencies = [
     "mcp>=2.1.1",
     "openai>=3.5.0",
     "sqlmodel>=0.0.39",
+    "watchdog>=6.0.0",
 ]
 
 [[tool.uv.index]]

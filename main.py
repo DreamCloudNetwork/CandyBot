@@ -6,16 +6,18 @@ import asyncio
 import logging
 import signal
 import sys
+from watchdog.observers import Observer
 
 from candybot import __version__
 from candybot.bot import build_bot
+from config import ConfigFileEventHandler
 
 logging.basicConfig(
     level=logging.INFO,  # 配置加载前先用默认级别；读取 bot.log_level 后再覆盖
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-noisy_modules = ("openai", "httpx", "httpcore", "httpcore2", "asyncio", "aiosqlite")
+noisy_modules = ("openai", "httpx", "httpcore", "httpcore2", "asyncio", "aiosqlite", "watchdog")
 # 屏蔽依赖库自身的 DEBUG 噪音，只保留 CandyBot 的调试输出
 for noisy in noisy_modules:
     logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -55,11 +57,16 @@ async def run() -> int:
     logger.info("CandyBot v%s 启动中…", __version__)
     await bot.start()
     logger.info("CandyBot 已就绪，等待事件…")
+    observer = Observer()
+    observer.schedule(ConfigFileEventHandler(), "./config.json5", recursive=True)
+    observer.start()
     try:
         await stop_event.wait()
     finally:
         logger.info("正在退出…")
         await bot.stop()
+        observer.stop()
+        observer.join()
     return 0
 
 
