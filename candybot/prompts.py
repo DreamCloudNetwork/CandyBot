@@ -120,6 +120,8 @@ def runtime_system_prompt(
     date_today: str,
     nicknames: Sequence[str],
     impressions: Sequence[tuple[str, str]] = (),
+    *,
+    commands_enabled: bool = False,
 ) -> str:
     """L2：当天内稳定的运行状态。date_today 格式 YYYY-MM-DD。
 
@@ -130,6 +132,11 @@ def runtime_system_prompt(
     (day, summary) 序列、按 day 升序；调用方必须保证同一天内传入内容
     字节级相同（GroupRuntime 的快照缓存），否则 L2 前缀缓存当天会失效。
     缺省为空时输出与引入印象机制之前完全一致。
+
+    commands_enabled=True（plugins.enabled 开）时追加一条「命令功能」须知：
+    历史里会出现 / 开头的命令消息与以你的名义发出的命令输出，不给模型这层
+    认知，模型会把自己的命令输出当成怪异的说话方式、甚至开始模仿。False
+    （缺省）时输出与引入命令功能之前字节级一致。
     """
     lines = [
         "【当前环境】",
@@ -137,6 +144,14 @@ def runtime_system_prompt(
         f"今天：{date_today}",
         "你只看得到这个群里最近的消息流。",
     ]
+    if commands_enabled:
+        lines.append(
+            "【命令功能】群里以 / 开头的消息（如 /help）是群友在使用机器人的命令插件，"
+            "不是在对你说话；以你的名义紧随其后出现的简短输出（比如一行执行结果或"
+            "「可用命令：」清单）是系统自动执行命令的结果，不是你亲口说的话。"
+            "不要模仿 / 命令的写法或这类机械口吻，也不必为它们负责或接着回应；"
+            "有人好奇你为什么会发这些时，如实说那是群里的命令功能，发 /help 能看到列表。"
+        )
     if nicknames:
         shown = "、".join(nicknames[:12])
         lines.append(f"最近参与发言的成员：{shown}")

@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 data/
 .pytest_cache/
+# plugins/ 与 config.json5 同理属部署内容（自写插件可能含私有逻辑/密钥），
+# 整体忽略、只跟踪官方示例（必须用 plugins/*：目录级 pattern 会让 git 不再
+# 进入目录，! 例外随之失效）
+plugins/*
+!plugins/example_echo.py

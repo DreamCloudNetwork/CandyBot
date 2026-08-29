@@ -46,6 +46,15 @@ def test_runtime_layer_stable_within_day_and_order_independent_nicks():
     assert a != c  # 日期变了必须失效其后缓存——语义正确
 
 
+def test_runtime_commands_note_toggle():
+    off = runtime_system_prompt(42, "2026-08-27", ["甲"])
+    assert "【命令功能】" not in off  # 缺省（关闭）与引入命令功能前字节级一致
+    on = runtime_system_prompt(42, "2026-08-27", ["甲"], commands_enabled=True)
+    assert "【命令功能】" in on
+    # 除注入的一段外，L2 其余行逐行不变
+    assert [ln for ln in on.splitlines() if not ln.startswith("【命令功能】")] == off.splitlines()
+
+
 def test_history_only_append_truncates_from_head():
     records = [rec(i, 100 + i, f"u{i}", f"msg{i}") for i in range(10)]
     turns_full, trunc1 = history_to_turns(records, max_chars=10**9)

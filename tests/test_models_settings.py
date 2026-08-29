@@ -726,3 +726,40 @@ def test_extracted_parameters_validation_errors():
     for over, frag in cases:
         with pytest.raises(ValueError, match=frag):
             load_settings(DictCfg(base_cfg(**over)))
+
+
+# ---------------------------------------------------------------- plugins 段（命令插件）
+
+
+def test_plugins_defaults_when_section_absent():
+    s = load_settings(DictCfg(base_cfg()))
+    assert s.plugins.enabled is True
+    assert s.plugins.dir == "plugins"
+    assert s.plugins.timeout_seconds == 30.0
+
+
+def test_plugins_custom_values():
+    cfg = base_cfg(
+        plugins={
+            "enabled": False,
+            "dir": "my_plugins",
+            "timeout_seconds": 5,
+        }
+    )
+    s = load_settings(DictCfg(cfg))
+    assert s.plugins.enabled is False
+    assert s.plugins.dir == "my_plugins"
+    assert s.plugins.timeout_seconds == 5.0
+
+
+def test_plugins_validation_errors():
+    cases = [
+        ({"plugins": {"enabled": "yes"}}, "plugins.enabled"),
+        ({"plugins": {"dir": 42}}, "`dir` 应为字符串"),
+        ({"plugins": {"dir": "   "}}, "plugins.dir"),
+        ({"plugins": {"timeout_seconds": 0.5}}, "plugins.timeout_seconds"),
+        ({"plugins": {"timeout_seconds": "fast"}}, "timeout_seconds"),
+    ]
+    for over, frag in cases:
+        with pytest.raises(ValueError, match=frag):
+            load_settings(DictCfg(base_cfg(**over)))

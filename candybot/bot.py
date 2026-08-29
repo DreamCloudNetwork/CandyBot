@@ -23,17 +23,20 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
 import aiohttp
 
 from .ai import AIClient, ImageOp, ReplyDraft, split_image_ops
+from .commandline import CommandUsageError, detect_command_name, parse_invocation
 from .dedup import MessageDedup
 from .events_server import EventsServer
 from .memory import GroupMemory, MemoryManager
@@ -47,6 +50,12 @@ from .models import (
 )
 from .learning import LearningService, day_bounds
 from .normalize import normalize_group_message
+from .plugin_api import (
+    CommandContext,
+    CommandRegistry,
+    CommandSpec,
+    build_registry,
+)
 from .postprocess import (
     ProcessedReply,
     ensure_indexes,
@@ -161,6 +170,31 @@ def _directed_new_messages(
     ]
 
 
+@dataclass(slots=True)
+class CommandInvocation:
+    """_on_event 命中命令注册表后随队列元素携带的调用意图。
+
+    参数解析与 handler 调用都推迟到 worker 消费时：命令执行与正常回复共用
+    每群串行队列，保证两条链路的发言在群里按到达顺序出现。
+    """
+
+    spec: CommandSpec
+    text: str  # 命令全文（已 lstrip，供 shlex 解析）
+
+
+def _command_memory_text(result: str | list[dict]) -> str:
+    """命令输出写回群记忆用的纯文本：str 原样；段数组拼接文本段，
+    纯媒体段落一个占位（与表情包的「[表情包]」同理，图片不进历史）。"""
+    if isinstance(result, str):
+        return result
+    parts = [
+        str(seg.get("data", {}).get("text", ""))
+        for seg in result
+        if isinstance(seg, dict) and seg.get("type") == "text"
+    ]
+    return " ".join(p for p in parts if p) or "[命令消息]"
+
+
 class GroupRuntime:
     """单个群的运行时状态。"""
 
@@ -214,12 +248,17 @@ class CandyBot:
         self,
         settings: Settings,
         settings_loader: Callable[[], Settings] | None = None,
+        registry: CommandRegistry | None = None,
     ):
         self._settings = settings
         # 热重载时重建 Settings 快照的来源（由 build_bot 传入
         # lambda: load_settings(Config)）；不传则该实例不支持热重载
         # （如测试里手工注入 settings）。
         self._settings_loader = settings_loader
+        # 命令插件注册表：内置命令 + plugins.enabled 时扫描插件目录。
+        # 不传则装到进程共享的 default_registry（生产路径）；测试传入
+        # 独立实例即可与真实 plugins/ 目录隔离。构建期装载，改插件需重启。
+        self._commands = build_registry(settings, registry)
         self._dedup = MessageDedup()
         # 内存热缓存容量取全局最大上下文需求的 2 倍（仍有界）；文本历史
         # 在 candy.db 里全量保留，图片按 storage.image_retention_days 回收
@@ -262,9 +301,13 @@ class CandyBot:
             max_body_bytes=settings.bot.max_event_body_bytes,
         )
         self._runtimes: dict[int, GroupRuntime] = defaultdict(GroupRuntime)
-        # 队列元素为 (消息, 是否观望重评)：观望到点后把原消息重新入队，
-        # 以 observe=True 复用同一串行队列与判定路径，绝不并发生成
-        self._group_queues: dict[int, asyncio.Queue[tuple[NormalizedMessage, bool]]] = {}
+        # 队列元素为 (消息, 是否观望重评, 命令调用)：观望到点后把原消息
+        # 重新入队，以 observe=True 复用同一串行队列与判定路径，绝不并发
+        # 生成；命中命令注册表的消息带 invocation 走 _run_command，同样
+        # 经串行队列与正常回复保持同群时序
+        self._group_queues: dict[
+            int, asyncio.Queue[tuple[NormalizedMessage, bool, CommandInvocation | None]]
+        ] = {}
         self._queue_workers: dict[int, asyncio.Task[None]] = {}
         # 观望的记账：(group_id, message_id) → 未决任务（停机时取消）；
         # 已观望过的消息 id 集合（每条至多观望一次，防循环），按 FIFO 封顶
@@ -288,6 +331,12 @@ class CandyBot:
 
     async def start(self) -> None:
         await self._memory.start()  # 建表 + 每日图片回收循环
+        ps = self._settings.plugins
+        logger.info(
+            "命令插件%s，注册命令：%s",
+            "已启用" if ps.enabled else "已禁用（/ 消息照常走大模型）",
+            "、".join(f"/{n}" for n in self._commands.names()) or "（无）",
+        )
         await self._learning.start()  # 每日群印象循环（启动时先补昨天的）
         pp = self._settings.response_post_process
         if pp.enabled and (pp.typo_error_rate > 0 or pp.typo_word_replace_rate > 0):
@@ -461,7 +510,30 @@ class CandyBot:
                 )
             except Exception:
                 logger.warning("群 %d 表情包收集失败", group_id, exc_info=True)
+        invocation = self._detect_command(normalized)
+        if invocation is not None:
+            # 命中注册表的 / 命令：取消大模型自主回复，直接交给插件执行
+            # （仍走本群串行队列，与正常回复保持到达顺序）
+            await self._enqueue(group_id, normalized, invocation=invocation)
+            return
         await self._enqueue(group_id, normalized)
+
+    def _detect_command(self, msg: NormalizedMessage) -> CommandInvocation | None:
+        """判断这条消息是否命中命令注册表（未命中一律按普通消息走原链路）。
+
+        只看「/ + 第一个空白前的命令名」能否查到 spec；未知命令（含插件
+        总开关关闭时）不作否决，照常交给大模型。enabled 现取现读，热重载
+        即时生效。
+        """
+        if not self._settings.plugins.enabled:
+            return None
+        name = detect_command_name(msg.record.text)
+        if name is None:
+            return None
+        spec = self._commands.get(name)
+        if spec is None:
+            return None
+        return CommandInvocation(spec=spec, text=msg.record.text.lstrip())
 
     async def _find_record(self, event: dict, ref_id: int) -> ChatRecord | None:
         try:
@@ -494,33 +566,119 @@ class CandyBot:
     # ------------------------------------------------------------ 群内串行队列
 
     async def _enqueue(
-        self, group_id: int, msg: NormalizedMessage, *, observe: bool = False
+        self,
+        group_id: int,
+        msg: NormalizedMessage,
+        *,
+        observe: bool = False,
+        invocation: CommandInvocation | None = None,
     ) -> None:
         queue = self._group_queues.get(group_id)
         if queue is None:
-            queue: asyncio.Queue[tuple[NormalizedMessage, bool]] = asyncio.Queue()
+            queue: asyncio.Queue[
+                tuple[NormalizedMessage, bool, CommandInvocation | None]
+            ] = asyncio.Queue()
             self._group_queues[group_id] = queue
             self._queue_workers[group_id] = asyncio.create_task(
                 self._group_worker(group_id, queue)
             )
-        await queue.put((msg, observe))
+        await queue.put((msg, observe, invocation))
 
     async def _group_worker(
         self,
         group_id: int,
-        queue: asyncio.Queue[tuple[NormalizedMessage, bool]],
+        queue: asyncio.Queue[
+            tuple[NormalizedMessage, bool, CommandInvocation | None]
+        ],
     ) -> None:
         while not self._stopping:
             try:
-                msg, observe = await queue.get()
+                msg, observe, invocation = await queue.get()
             except asyncio.CancelledError:
                 return
             try:
-                await self._decide_and_reply(group_id, msg, observe=observe)
+                if invocation is not None:
+                    await self._run_command(group_id, msg, invocation)
+                else:
+                    await self._decide_and_reply(group_id, msg, observe=observe)
             except Exception:
                 logger.exception(
                     "处理群 %d 消息 %d 时出错", group_id, msg.record.message_id
                 )
+
+    # ------------------------------------------------------------ 命令插件
+
+    async def _run_command(
+        self, group_id: int, msg: NormalizedMessage, invocation: CommandInvocation
+    ) -> None:
+        """命令分发：解析参数 → 调用插件 handler → 原样发送返回值 → 写回记忆。
+
+        完全绕开判定/生成/冷却/日配额/后处理链路：命令说的就是插件返回的
+        原文，不拆条、不打字延迟、不注入错别字。失败（用法错误、超时、
+        handler 崩溃）回一句中文提示——机器人对一条 /命令 完全沉默会被
+        当成死机；handler 返回 None 或空串才真正不发。
+        """
+        spec = invocation.spec
+        memory = await self._memory.get(group_id)
+        result: str | list[dict] | None
+        try:
+            args = parse_invocation(spec, invocation.text)
+        except CommandUsageError as exc:
+            result = str(exc)
+            logger.info("群 %d 命令 /%s 用法错误：%s", group_id, spec.name, exc)
+        else:
+            ctx = CommandContext(
+                group_id=group_id,
+                user_id=msg.record.user_id,
+                nickname=msg.record.nickname,
+                text=invocation.text,
+                args=args,
+                registry=self._commands,
+                settings=self._settings,
+                db=self._memory.db,
+            )
+            try:
+                result = await self._invoke_handler(spec, ctx)
+            except TimeoutError:
+                result = f"/{spec.name} 执行超时，稍后再试吧。"
+                logger.warning("群 %d 命令 /%s 执行超时", group_id, spec.name)
+            except Exception:
+                result = f"/{spec.name} 执行失败了（内部错误）。"
+                logger.exception("群 %d 命令 /%s 执行异常", group_id, spec.name)
+        if not result:
+            return
+        try:
+            await self._send_with_retry(group_id, result)
+        except Exception as exc:
+            # 与主链路一致：发送失败只记日志，不写回记忆（群里没说过）
+            logger.error("群 %d 命令回复发送失败：%s", group_id, exc)
+            return
+        await memory.append(
+            self._self_record(group_id, _command_memory_text(result))
+        )
+
+    async def _invoke_handler(
+        self, spec: CommandSpec, ctx: CommandContext
+    ) -> str | list[dict] | None:
+        """调用 handler：同步返回即时生效，协程受 plugins.timeout_seconds 约束。
+
+        返回值类型不合法（插件写了不该写的东西）按「不发消息」处理并记
+        warning——异常永远不许从这里漏到 worker 顶层以外。
+        """
+        outcome = spec.handler(ctx)
+        if inspect.isawaitable(outcome):
+            timeout = max(float(self._settings.plugins.timeout_seconds), 1.0)
+            outcome = await asyncio.wait_for(outcome, timeout)
+        if outcome is None or isinstance(outcome, str):
+            return outcome
+        if isinstance(outcome, list) and all(isinstance(seg, dict) for seg in outcome):
+            return outcome
+        logger.warning(
+            "命令 /%s 返回了非法类型 %s，忽略不发送",
+            spec.name,
+            type(outcome).__name__,
+        )
+        return None
 
     # ------------------------------------------------------------ 决策与回复
 
@@ -682,6 +840,7 @@ class CandyBot:
                 date.today().isoformat(),
                 nicknames,
                 impressions=await self._impressions_for(group_id, runtime),
+                commands_enabled=self._settings.plugins.enabled,
             )
             draft = await self._generate_with_retry(
                 self._ai.reconsider_reply,
@@ -891,6 +1050,7 @@ class CandyBot:
                 date.today().isoformat(),
                 nicknames,
                 impressions=await self._impressions_for(group_id, runtime),
+                commands_enabled=self._settings.plugins.enabled,
             )
             draft = await self._generate_with_retry(
                 self._ai.generate_reply,
@@ -983,6 +1143,7 @@ class CandyBot:
             date.today().isoformat(),
             nicknames,
             impressions=await self._impressions_for(group_id, runtime),
+            commands_enabled=self._settings.plugins.enabled,
         )
         try:
             verdict = await self._ai.judge_interest(

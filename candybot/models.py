@@ -464,6 +464,22 @@ class StickerSettings:
 
 
 @dataclass(frozen=True)
+class PluginSettings:
+    """命令插件系统（见 plugin_api.py / commandline.py）。
+
+    enabled：总开关。关掉后 / 开头的消息不再被拦截，与大模型自主回复
+      引入命令功能之前完全一致（现取现读，热重载即时生效）；
+    dir：插件目录（相对工作目录），启动时逐个导入其中的 .py 文件；
+    timeout_seconds：异步 handler 的执行超时，超时按失败回复。
+    注册表在构建期装载：新增/修改插件文件需重启机器人生效。
+    """
+
+    enabled: bool = True
+    dir: str = "plugins"
+    timeout_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class SnowlumaSettings:
     mcp_command: str
     mcp_args: list[str]
@@ -495,6 +511,8 @@ class Settings:
     learning: LearningSettings = LearningSettings()
     # stickers 段同样可整体省略
     stickers: StickerSettings = StickerSettings()
+    # plugins 段同样可整体省略（缺省即启用命令插件，目录为 plugins/）
+    plugins: PluginSettings = PluginSettings()
 
     def profile_for(self, group_id: int) -> GroupProfile | None:
         """严格白名单语义。
@@ -1066,6 +1084,22 @@ def load_settings(cfg: Any) -> Settings:
         summary_keywords=tuple(str(item).strip() for item in keywords_raw),
     )
 
+    # plugins 段可整体省略（全部走默认值）
+    plugin_cfg = _optional_section(cfg, "plugins")
+    plugin_timeout = _parse_float(plugin_cfg, "timeout_seconds", 30.0)
+    if plugin_timeout < 1:
+        raise ValueError(
+            f"配置项 `plugins.timeout_seconds` 不能小于 1，实际是 {plugin_timeout!r}"
+        )
+    plugin_dir = _parse_str(plugin_cfg, "dir", "plugins")
+    if not plugin_dir.strip():
+        raise ValueError("配置项 `plugins.dir` 不能为空")
+    plugin_settings = PluginSettings(
+        enabled=_parse_bool(plugin_cfg.get("enabled", True), "plugins.enabled"),
+        dir=plugin_dir.strip(),
+        timeout_seconds=plugin_timeout,
+    )
+
     return Settings(
         bot=BotSettings(
             self_qq=self_qq,
@@ -1089,6 +1123,7 @@ def load_settings(cfg: Any) -> Settings:
         response_post_process=post_process_settings,
         learning=learning_settings,
         stickers=sticker_settings,
+        plugins=plugin_settings,
     )
 
 

@@ -5,6 +5,7 @@
 - **收消息**：SnowLuma 通过 OneBot v11 HTTP POST 把事件上报到 CandyBot 内置的 aiohttp 服务；
 - **发消息**：全部经由 SnowLuma 的 MCP server（stdio 启动 `@snowluma/mcp`，write 模式 `invoke_action("send_group_msg")`）；
 - **大脑**：OpenAI 兼容 API。`judge` 模型逐条评估「是否值得回复这条消息」打 0-10 分，超过阈值才插话，并同时识别「这条消息是否在和我说话」（对话中的追问不受冷却限制）；@机器人/回复机器人必答，由 `reply` 模型生成回复；可选 `vision` 模型把图片转成文字描述；`learning` 模型（默认继承 `judge`）在后台总结每日群印象、学习群友的表达与黑话。
+- **命令插件**：以 `/` 开头且命令名命中注册表的消息不走大模型，按 unix 终端命令风格解析参数后调用插件（`plugins/` 目录放一个 .py 即自动加载），插件返回的消息原样发到群里；未知 `/命令` 照常交给大模型。详见下文「命令插件系统」。
 
 ## 快速开始
 
@@ -77,6 +78,9 @@ uv run main.py                   # 启动
 |                       | send_probability                                                   | 成功发送一条文字回复后跟发一张表情包的概率（默认 0.05；0 关闭跟发，收藏仍照常积累）                                                                                                                                                      |
 |                       | max_count                                                          | 全局收藏上限（跨群合计，默认 64）：超限替换最久未使用的条目，记录与图片文件一起删                                                                                                                                                        |
 |                       | max_side_px / summary_keywords                                     | 识别启发式（默认 512px / 表情包·梗图·斗图·动图·meme）：placeholder 模式按「较长边不超过该像素」判表情包；describe 模式总结文本含任一关键词（忽略大小写）即收集；`summary_keywords: []` 表示后者永不命中 |
+| plugins               | enabled                                                            | 命令插件总开关（默认开）：关掉后 `/` 开头的消息完全走大模型，行为与引入命令功能前一致；改完即时生效（整段可省略走默认值，详见下文「命令插件系统」）                                                                                                            |
+|                       | dir                                                                | 插件目录（默认 `plugins`，相对工作目录）：启动时逐个导入其中的 .py，下划线开头的文件跳过；新增/修改插件需重启                                                                                                                                     |
+|                       | timeout_seconds                                                    | 异步 handler 的执行超时（默认 30 秒，最小 1）：超时按失败回一句提示，防止坏插件卡死该群队列；现读，改完即时生效                                                                                                                                       |
 | rate_limit            | global_daily_limit                                                 | 全局每日主动发言上限，null 不限（@必答不受限）。一条正文都没实际发出（重想全部放弃或首条即发送失败）时不计数，会退还配额                                                                                                                                                                                   |
 | response_post_process | enabled                                                            | 输出层拟人化后处理总开关（默认 true）。`false` 时回复整条单发、无任何延迟、不触发连发被打断后的重想，行为与未引入后处理前完全一致；整段配置可省略                                                                                                                                                          |
 |                       | typing_speed                                                       | 打字延迟全局倍率（默认 1.0，0 关闭延迟；须为非负有限数）：第 2 条起按下一条文本的估算打字时长 sleep 后再发送，单条封顶 60 秒                                                                                                                                                                               |
@@ -99,8 +103,8 @@ uv run main.py                   # 启动
 
 程序监听 `config.json5` 所在目录（而非文件本身，编辑器原子保存会替换 inode、单文件 watch 会静默失效），保存后自动重新解析并替换运行时配置，日志出现「配置文件被修改，正在重载」即成功；配置写坏时完整记录解析错误并沿用旧配置继续运行，修好再保存自动恢复（替换动作在事件循环线程上执行，与消息处理串行）。
 
-- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning`；已缓存的 L2 印象快照当天不刷新，次日按新配置重建）、`stickers`（含识别启发式参数）、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
-- **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret` / `bot.max_event_body_bytes`（aiohttp 监听与签名校验、请求体上限在启动时已绑定）、`bot.data_dir`、`snowluma` 的会话类字段（`mcp_command` / `mcp_args` / `endpoint` / `api_key` / `mode` / `timeout_ms` / `allow_private_endpoint`，MCP 子进程会话）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
+- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning`；已缓存的 L2 印象快照当天不刷新，次日按新配置重建）、`stickers`（含识别启发式参数）、`plugins.enabled` / `plugins.timeout_seconds`、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
+- **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret` / `bot.max_event_body_bytes`（aiohttp 监听与签名校验、请求体上限在启动时已绑定）、`bot.data_dir`、`plugins.dir` 与插件文件本身（命令注册表在构建期装载，新增/修改/删除 `plugins/` 下的插件需重启机器人生效）、`snowluma` 的会话类字段（`mcp_command` / `mcp_args` / `endpoint` / `api_key` / `mode` / `timeout_ms` / `allow_private_endpoint`，MCP 子进程会话）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
 
 ## 行为逻辑
 
@@ -161,6 +165,7 @@ flowchart TD
 - 临时随机风格（`generation.multiple_probability` / `multiple_reply_style`）：真实的人有时话多有时只回一个字。每条回复生成前独立掷点，命中时从风格池随机抽一条注入 L4 指令层（「【临时风格】本次回复请遵循这个额外风格：…」），只影响这一次；概率 0（默认）或池为空即关闭、且不消耗随机数。连发重想（reconsider）不走此环节。
 - AI 味拦截（`generation.ai_flavor_rules` / `ai_flavor_retries`）：回复生成并经过现有清洗（`_strip_noise`、emoji 处理）后，再过一轮可配置的正则规则检测（默认含「作为AI/人工智能/语言模型」「很高兴/乐意/荣幸为您/帮您」、「以下是」开头、markdown 加粗/标题/行首列表残留）。命中时把「你上一次的回复『…』因为太像 AI 被拦截（原因：…），请用更口语、更随意的说法重写」附进 L4 重新生成一次（至多 `ai_flavor_retries` 次，默认 1）；重试后仍命中则放行并记 warning——宁可留着稍假的一句话，也绝不死循环卡住决策队列。这是内容级重试，与 reply 失败的网络重试（`_generate_with_retry`）相互独立；连发重想不走此环节。
 - 表情包（`stickers` 段，见下文「表情包（最小版）」）：收到的表情包类图片自动收藏进 `data/stickers/`，每条文字回复成功发出后按小概率随机跟发一张。
+- 命令插件（`plugins` 段，见下文「命令插件系统」）：以 `/` 开头且命令名命中注册表的消息完全绕开大模型——judge、生成、冷却、日配额、后处理都不参与，按 unix 命令风格解析参数后调用插件 handler，返回的消息原样发群。命令消息与插件回复照常进入群记忆。
 - 重启后每群记忆自动从 `data/candy.db` 恢复最近上下文（热缓存容量仍按 context 配置有界）。
 
 ## 图片记忆管理
@@ -202,6 +207,28 @@ flowchart TD
 - **写回**：表情包实际发送成功后，向记忆追加一条 is_self 的 ChatRecord，正文为占位「[表情包]」——模型在历史里知道自己发过图，但文件路径与 base64 都不进入历史；发送失败不写占位。
 
 DEBUG 日志可见：收集（「群 %d 收藏表情包」「已替换最久未使用」）、跟发（「群 %d 跟发表情包」含使用计数、发送前「群 %d 跟发表情包前预计挑图打字 %.1f 秒」延迟预估）；临时风格注入（「[reply] 注入临时风格」）、AI 味拦截与重试（「AI 味拦截」「仍命中…放行」）。
+
+## 命令插件系统
+
+配置 `plugins` 段（整段可省略走默认值，即启用并扫描 `plugins/` 目录；关闭用 `enabled: false`，关掉后 `/` 开头的消息完全走大模型、行为与引入前一致）。
+
+- **拦截规则**（`bot._detect_command`）：白名单群里的消息正文 `lstrip()` 后以 `/` 开头，且第一个空白之前的命令名能在注册表里查到，才作为命令处理；未知命令名（含 `/` 后紧跟空白等形态）不作否决，照常交给 judge/生成链路。命中命令的消息仍先写入群记忆，之后与正常回复共用**每群串行队列**执行——同群的命令输出与大模型发言按到达顺序出现。
+- **unix 风格解析**（`commandline.py`）：命令全文用 `shlex` 切词（引号可包带空格的参数），再按插件声明的参数 schema 校验。支持位置参数（含 `nargs="+"`/`"*"`，带 default 即自动可选）、`--长选项` 与 `-短别名`（`--flag 值`、`--flag=值` 都认）、`store_true` 开关，选项与位置参数可任意混排（GNU 风格置换，`--` 之后全按位置参数）；类型不符/未知选项/缺参数回一行「参数有误 + 用法行 + /help 引导」，绝不让异常外漏。
+- **执行与回发**（`bot._run_command`）：handler 收到 `CommandContext`（群号、发送者、命令全文、解析好的 `args` 字典、注册表、Settings 快照、`db`），返回 `str`（纯文本）或 OneBot v11 段数组（如图片段，见 `stickers.py` 的 `image_segment` 用法）即原样发群——不拆条、不打字延迟、不注入错别字、不消耗日配额也不刷新冷却；返回 `None`/空串则什么都不发。用法错误、异步超时（`plugins.timeout_seconds`，默认 30 秒）与 handler 崩溃各回一句中文提示。发送成功的输出会写回记忆（段数组拼接文本段，纯媒体落 `[命令消息]` 占位）。
+- **内置 `/help`**：`/help` 列出全部命令，`/help <命令>` 展示该命令的用法与参数说明（内容由注册表实时生成）。
+- **AI 自我认知**：`plugins.enabled` 时 judge 与 reply 的 L2 状态层会注入一段「命令功能」须知——告诉模型历史里 `/` 开头的消息是群友在用命令插件、以自己名义出现的命令输出是系统机械执行的结果，不是它亲口说的话，防止它觉得自己的发言怪异或开始模仿命令格式。关闭时 L2 输出与引入前字节级一致（现读配置，热重载后下一条请求生效）；开关变化只失效 L2 之后的缓存，不动 L1 persona 静态前缀。
+- **写插件**：在 `plugins/` 放一个 `.py`（文件名以 `_` 开头的跳过），从 `candybot.plugin_api` 导入装饰器自注册，重启后生效：
+
+```python
+# plugins/example_echo.py（节选，见该文件全文）
+from candybot.plugin_api import command, CommandParam
+
+@command("hello", params=(CommandParam("--name", help="称呼"),), help="打招呼")
+async def hello(ctx):
+    return f"你好，{ctx.args['name'] or ctx.nickname}！"
+```
+
+  同一命令名重复注册时先到者胜（后来的插件记 debug 日志跳过）；单个插件文件导入失败只记 error 并跳过，绝不拖垮机器人。DEBUG 日志可见命令命中与用法错误，异常/超时有对应的 WARNING/ERROR 日志。
 
 ## KV Cache 优化
 
@@ -252,6 +279,8 @@ DEBUG 日志可见：收集（「群 %d 收藏表情包」「已替换最久未�
 
 16. **表情包**：在群里连发几张表情包图片 → INFO 日志出现「群 %d 收藏表情包」，`data/stickers/<群号>/` 下出现文件、`candy.db` 的 `sticker` 表有记录与统计；direct 模式 DEBUG 里 `submit_assessment` 多带 `"sticker": true`。把 `stickers.send_probability` 调到 1 → 之后每次文字回复都跟发一张图，DEBUG prompt 的历史里出现自己发的「[表情包]」占位（无路径/base64）、`use_count` 递增；连发超 `max_count` 张不同的图 → 出现「已替换最久未使用」且最久那张的文件消失。SnowLuma 与 bot 不同机时 image 段会失败——只记错误日志、文字回复不受影响。
 
+17. **命令插件**：启动日志出现「命令插件已启用，注册命令：/echo、/help、/roll…」；群里发 `/echo 你好 "带空格 的词"` → 原样收到 `你好 带空格 的词`（不走大模型：judge 无该条请求日志、DEBUG 无生成请求）；`/echo --upper hello 世界` → `HELLO 世界`；`/roll 3 --sides 20` 收 3 个 1-20 的点数；`/help` 列出命令、`/help roll` 出用法行；`/echo` 裸发 → 回「参数有误…用法…」；`/不存在的命令` → 照常走大模型。把 `plugins.enabled` 改 false 保存 → `/echo hi` 也走大模型（改完即时生效）；往 `plugins/` 丢一个新 .py 注册命令 → 重启后可用。
+
 ## 开发
 
 ```bash
@@ -274,4 +303,4 @@ uv run pytest -k names  # 单测命名过滤
 
 配置错误（非法级别名）会在启动时直接报错，便于及时发现。
 
-模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `events_server.py`(aiohttp 接收) · `snowluma.py`(MCP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类 prompt) · `ai.py`(LLM 四角色：judge/reply/vision/learning) · `learning.py`(后台学习：每日群印象/表达/黑话) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包最小版：识别启发式+收集/上限替换/跟发) · `bot.py`(编排)。
+模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `events_server.py`(aiohttp 接收) · `snowluma.py`(MCP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类 prompt) · `ai.py`(LLM 四角色：judge/reply/vision/learning) · `learning.py`(后台学习：每日群印象/表达/黑话) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包最小版：识别启发式+收集/上限替换/跟发) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。
