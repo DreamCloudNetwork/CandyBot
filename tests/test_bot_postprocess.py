@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 
 from candybot import bot as bot_module
 from candybot.ai import ReplyDraft
 from candybot.postprocess import estimate_typing_time, process_reply
+from tests.deterministic_rng import SeededRng
 from tests.test_integration import (
     FakeAI,
     FakeSnowluma,
@@ -377,7 +377,7 @@ async def test_sent_record_uses_clean_typo_free_text(tmp_path, monkeypatch):
     }
     settings = make_settings(tmp_path, post_process=post_process)
     bot = bot_module.CandyBot(settings)
-    bot._pp_rng = random.Random(2026)  # 固定种子：与下面复算的期望完全同轨迹
+    bot._pp_rng = SeededRng(2026)  # 固定种子：与下面复算的期望完全同轨迹
     bot._snowluma = FakeSnowluma()
     bot._ai = ScriptedAI(REPLY_TEXT)
 
@@ -395,7 +395,7 @@ async def test_sent_record_uses_clean_typo_free_text(tmp_path, monkeypatch):
         )
 
         expected = process_reply(
-            REPLY_TEXT, settings.response_post_process, rng=random.Random(2026)
+            REPLY_TEXT, settings.response_post_process, rng=SeededRng(2026)
         )
         self_records = [r for r in memory.tail(20) if r.is_self]
         # 逐条写回的是无错字原文：条数、顺序、内容都与拆条对齐
@@ -429,7 +429,7 @@ async def test_correction_falls_back_to_plain_text_without_message_id(tmp_path, 
     }
     settings = make_settings(tmp_path, post_process=post_process)
     bot = bot_module.CandyBot(settings)
-    bot._pp_rng = random.Random(2026)
+    bot._pp_rng = SeededRng(2026)
     bot._snowluma = FakeSnowluma()
     bot._ai = ScriptedAI(REPLY_TEXT)
 
@@ -451,7 +451,7 @@ async def test_correction_falls_back_to_plain_text_without_message_id(tmp_path, 
                 and isinstance(bot._snowluma.sent[-1][1], list)
             )
         expected = process_reply(
-            REPLY_TEXT, settings.response_post_process, rng=random.Random(2026)
+            REPLY_TEXT, settings.response_post_process, rng=SeededRng(2026)
         )
         assert expected.correction  # 该种子下确实产生更正
         correction_message = bot._snowluma.sent[-1][1]
@@ -475,7 +475,7 @@ async def test_correction_references_message_id_zero(tmp_path, monkeypatch, capl
         },
     )
     bot = bot_module.CandyBot(settings)
-    bot._pp_rng = random.Random(2026)
+    bot._pp_rng = SeededRng(2026)
     bot._snowluma = FakeSnowluma()
     bot._ai = ScriptedAI(REPLY_TEXT)
 
@@ -667,12 +667,12 @@ async def test_correction_failure_keeps_guard_bookkeeping(
         tmp_path, monkeypatch, snowluma=CorrectionFailingSnowluma(), ai=None,
         post_process=post_process,
     )
-    bot._pp_rng = random.Random(2026)
+    bot._pp_rng = SeededRng(2026)
     bot._ai = ScriptedAI(REPLY_TEXT)
     expected = process_reply(
         REPLY_TEXT,
         make_settings(tmp_path, post_process=post_process).response_post_process,
-        rng=random.Random(2026),
+        rng=SeededRng(2026),
     )
     assert expected.correction  # 该种子下确实会发更正
     try:

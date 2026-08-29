@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import random
 import time
 from dataclasses import replace as dc_replace
 from datetime import date, datetime, timedelta
@@ -31,6 +30,7 @@ from candybot.prompts import (
     learning_chat_text,
     runtime_system_prompt,
 )
+from tests.deterministic_rng import SeededRng
 from tests.test_models_settings import DictCfg
 
 
@@ -397,7 +397,7 @@ async def test_learning_hints_injected_into_reply_call(tmp_path):
 async def test_pick_expressions_weighted_and_touched(tmp_path, mgr):
     settings = make_settings(tmp_path)
     svc = make_service(mgr, settings, StubAI())
-    svc.rng = random.Random(42)  # 固定种子保证可重复
+    svc.rng = SeededRng(42)  # 固定种子保证可重复
     now = time.time()
     for i in range(5):
         await mgr.db.record_expression(42, f"情境{i}", f"风格{i}", now - 100 + i)

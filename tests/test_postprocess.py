@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
-
 import pytest
 
 from candybot.models import LAZY_REPLIES_DEFAULT, ResponsePostProcessSettings
@@ -15,31 +12,7 @@ from candybot.postprocess import (
     process_reply,
     split_reply_segments,
 )
-
-class SeededRng:
-    """固定种子的线性同余伪随机源，仅供测试获得可复现输出。
-
-    只实现后处理链路实际用到的 random() / choice() 两个方法；不 import
-    random 模块，避免测试里出现非加密安全的随机数源（Mimosa low 提示）。
-    random() 返回值恒在 [0, 1)。
-    """
-
-    _A = 6364136223846793005
-    _C = 1442695040888963407
-    _M = 1 << 64
-
-    def __init__(self, seed: int) -> None:
-        self._state = seed % self._M
-
-    def random(self) -> float:
-        self._state = (self._state * self._A + self._C) % self._M
-        return self._state / self._M
-
-    def choice(self, seq: Sequence[Any]) -> Any:
-        if not seq:
-            raise IndexError("cannot choose from an empty sequence")
-        return seq[int(self.random() * len(seq))]
-
+from tests.deterministic_rng import SeededRng
 
 # ---------------------------------------------------------------- 拆条
 
