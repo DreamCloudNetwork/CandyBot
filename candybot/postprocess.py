@@ -4,9 +4,10 @@ LLM 生成的整段回复在这里被加工成更接近真人的发送形态：
 
 - split_reply_segments：剥掉括号旁白后按中英文标点拆条，颜文字与 emoji
   序列绝不拆断；超出 max_split 时把剩余句子并入最后一条。
-- estimate_typing_time：按字符类型估算打字秒数（中文/全角 0.3 秒/字、
-  英文数字 0.15 秒/字、emoji 与颜文字各 1 秒、单字回复 3 倍），再乘全局
-  typing_speed 倍率。
+- estimate_typing_time：按字符类型估算打字秒数（中文/全角、英文数字、
+  emoji/颜文字各自的单字耗时与单字回复加倍、单条封顶，都由
+  response_post_process.typing_* 配置，默认 0.3/0.15/1 秒、3 倍、60 秒），
+  再乘全局 typing_speed 倍率。
 - TypoGenerator：基于 pypinyin 的同音字/整词替换生成错别字，附带供更正
   消息使用的正确词。整词替换用 pypinyin 自带的最大正向匹配分词，不引入
   额外分词依赖。多音字（如「银行」的行）按 typo_polyphone_mode 取词内
@@ -87,7 +88,8 @@ def _strip_narration(text: str) -> str:
 _SENTENCE_DELIMS = "。！？!?，,；;…\n\r"
 _DELIM_RUN_RE = re.compile(f"[{re.escape(_SENTENCE_DELIMS)}]+")
 
-# 打字时长估算的单字耗时（秒）：中文/全角、英文与数字等其他、emoji/颜文字。
+# 打字时长估算的默认单字耗时（秒）：中文/全角、英文与数字等其他、emoji/颜文字。
+# 即提取到配置前的内置字面量，作为 TypingTimePolicy 的默认值保留。
 _CJK_CHAR_TIME = 0.3
 _ENGLISH_CHAR_TIME = 0.15
 _SPECIAL_UNIT_TIME = 1.0
@@ -95,6 +97,35 @@ _SPECIAL_UNIT_TIME = 1.0
 # 配高倍率会把所在群的串行队列堵几分钟，后续消息的判断与回复全部排队），
 # 封顶兜住最坏情况，拟人节奏不受影响（正常配置远达不到上限）。
 _MAX_TYPING_DELAY_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class TypingTimePolicy:
+    """打字延迟估算的单字耗时模型。
+
+    对应 config 的 response_post_process.typing_* / max_typing_delay_seconds
+    各项；默认值即参数提取前代码里写死的字面量，不配置时行为不变。
+    """
+
+    cjk_seconds: float = _CJK_CHAR_TIME          # 中文/全角字符，每字
+    latin_seconds: float = _ENGLISH_CHAR_TIME    # 英文数字等半角字符，每字
+    special_seconds: float = _SPECIAL_UNIT_TIME  # emoji 序列/颜文字，每整块
+    single_char_multiplier: float = 3.0          # 单字回复（无任何特殊块）加倍
+    max_delay_seconds: float = _MAX_TYPING_DELAY_SECONDS
+
+
+_DEFAULT_TYPING_POLICY = TypingTimePolicy()
+
+
+def typing_policy_of(settings: ResponsePostProcessSettings) -> TypingTimePolicy:
+    """从后处理配置提取打字耗时估算策略（bot 发送链路使用）。"""
+    return TypingTimePolicy(
+        cjk_seconds=settings.typing_cjk_seconds,
+        latin_seconds=settings.typing_latin_seconds,
+        special_seconds=settings.typing_special_seconds,
+        single_char_multiplier=settings.typing_single_multiplier,
+        max_delay_seconds=settings.max_typing_delay_seconds,
+    )
 
 # 先 emoji 后颜文字地整体扫描（两类的字符集互不重叠，顺序不影响结果）。
 _SPECIAL_TOKEN_RE = re.compile(f"{EMOJI_RE.pattern}|{KAOMOJI_RE.pattern}")
@@ -195,19 +226,23 @@ def split_reply_segments(
 # ---------------------------------------------------------------- 打字延迟
 
 
-def estimate_typing_time(text: str, speed: float = 1.0) -> float:
+def estimate_typing_time(
+    text: str, speed: float = 1.0, policy: TypingTimePolicy | None = None
+) -> float:
     """估算「打出这段字」所需秒数，供发送间隔制造打字感。
 
-    中文/全角字符 0.3 秒、英文数字等半角字符 0.15 秒；emoji 序列与颜文字
-    各按整块 1 秒；没有任何特殊块的单字符回复按 3 倍计（「嗯」不是秒回的）；
+    各类字符的耗时与单条封顶取自 policy（缺省用内置默认，即参数提取前
+    的写死值）：中文/全角、半角、emoji/颜文字块各按 policy 计，没有任何
+    特殊块的单字符回复按 single_char_multiplier 倍计（「嗯」不是秒回的）；
     总时长乘全局 typing_speed 倍率，speed <= 0 表示关闭延迟，
-    结果封顶在 _MAX_TYPING_DELAY_SECONDS。
+    结果封顶在 policy.max_delay_seconds。
     """
     # `not speed > 0` 而非 `speed <= 0`：连 NaN（异常配置漏网时）也按关闭处理
     if not speed > 0:
         return 0.0
     if not text:
         return 0.0
+    p = policy if policy is not None else _DEFAULT_TYPING_POLICY
 
     special_units = 0
     plain_chars = 0
@@ -223,14 +258,14 @@ def estimate_typing_time(text: str, speed: float = 1.0) -> float:
             continue
         plain_chars += 1
         total += (
-            _CJK_CHAR_TIME
+            p.cjk_seconds
             if unicodedata.east_asian_width(ch) in ("W", "F")
-            else _ENGLISH_CHAR_TIME
+            else p.latin_seconds
         )
     if special_units == 0 and plain_chars == 1:
-        total *= 3
-    total += special_units * _SPECIAL_UNIT_TIME
-    return min(total * speed, _MAX_TYPING_DELAY_SECONDS)
+        total *= p.single_char_multiplier
+    total += special_units * p.special_seconds
+    return min(total * speed, p.max_delay_seconds)
 
 
 # ---------------------------------------------------------------- 错别字

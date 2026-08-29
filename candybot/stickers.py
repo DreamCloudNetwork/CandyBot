@@ -33,19 +33,38 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .database import CandyDatabase, StickerEntry, image_fingerprint
-from .models import ChatRecord, Settings
+from .models import STICKER_SUMMARY_KEYWORDS_DEFAULT, ChatRecord, Settings
 
 logger = logging.getLogger(__name__)
 
 # 写回记忆的占位文本：模型据此知道「这张图是我发的」，不带路径与数据
 STICKER_RECORD_TEXT = "[表情包]"
 
-# describe 模式的文本启发式：视觉模型的总结里出现这类字样即视为表情包类
-_STICKER_SUMMARY_RE = re.compile(r"(表情包|梗图|斗图|动图|meme)", re.IGNORECASE)
+# describe 模式的文本启发式：视觉模型的总结里出现任一配置关键词
+# （stickers.summary_keywords，忽略大小写整词包含）即视为表情包类；
+# 默认词表见 models.STICKER_SUMMARY_KEYWORDS_DEFAULT。显式配置空列表
+# 表示该启发式永不命中。编译结果按词组缓存复用。
+_STICKER_SUMMARY_RES: dict[tuple[str, ...], re.Pattern[str]] = {}
 
-# placeholder 模式「尺寸小」启发式的边长上限（像素）：QQ 表情包普遍远小于
-# 截图与照片，两边都不超过该值才收集；宽高解析不出的格式一律不收集。
-_STICKER_MAX_SIDE = 512
+
+def _sticker_summary_re(keywords: Sequence[str]) -> re.Pattern[str] | None:
+    if not keywords:
+        return None
+    key = tuple(keywords)
+    regex = _STICKER_SUMMARY_RES.get(key)
+    if regex is None:
+        regex = re.compile("|".join(re.escape(k) for k in key), re.IGNORECASE)
+        _STICKER_SUMMARY_RES[key] = regex
+    return regex
+
+
+def is_sticker_by_summary(
+    summary: str | None,
+    keywords: Sequence[str] = STICKER_SUMMARY_KEYWORDS_DEFAULT,
+) -> bool:
+    """按视觉模型给的一句话总结判断是否表情包类（describe 模式来源）。"""
+    regex = _sticker_summary_re(keywords)
+    return bool(summary) and regex is not None and regex.search(summary) is not None
 
 _MIME_SUFFIXES = {
     "image/png": ".png",
@@ -55,11 +74,6 @@ _MIME_SUFFIXES = {
     "image/webp": ".webp",
     "image/bmp": ".bmp",
 }
-
-
-def is_sticker_by_summary(summary: str | None) -> bool:
-    """按视觉模型给的一句话总结判断是否表情包类（describe 模式来源）。"""
-    return bool(summary) and _STICKER_SUMMARY_RE.search(summary) is not None
 
 
 def parse_data_url(data_url: str) -> tuple[str, bytes] | None:
@@ -151,15 +165,21 @@ def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
     return None
 
 
-def is_small_image(data_url: str) -> bool:
-    """placeholder 模式的尺寸启发式：宽高可解析且较长边 ≤ 512px。"""
+# placeholder 模式「尺寸小」启发式的默认边长上限（像素，即参数提取前的写死
+# 值，可用 stickers.max_side_px 覆盖）：QQ 表情包普遍远小于截图与照片，
+# 较长边不超过该值才收集；宽高解析不出的格式一律不收集。
+_STICKER_MAX_SIDE = 512
+
+
+def is_small_image(data_url: str, max_side_px: int = _STICKER_MAX_SIDE) -> bool:
+    """placeholder 模式的尺寸启发式：宽高可解析且较长边 ≤ max_side_px。"""
     parsed = parse_data_url(data_url)
     if parsed is None:
         return False
     dims = image_dimensions(parsed[1])
     if dims is None or dims[0] <= 0 or dims[1] <= 0:
         return False
-    return max(dims) <= _STICKER_MAX_SIDE
+    return max(dims) <= max_side_px
 
 
 class StickerStore:

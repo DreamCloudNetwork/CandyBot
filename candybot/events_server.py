@@ -11,6 +11,8 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
+# 事件上报请求体默认上限（bot.max_event_body_bytes 未配置时的内置值）：
+# direct 模式的大图事件正文可能超过它，超限返回 413。
 MAX_BODY_BYTES = 1 * 1024 * 1024
 
 
@@ -34,15 +36,17 @@ class EventsServer:
         host: str,
         port: int,
         secret: str | None = None,
+        max_body_bytes: int = MAX_BODY_BYTES,
     ):
         self._handler = handler
         self._host = host
         self._port = port
         self._secret = secret
+        self._max_body_bytes = int(max_body_bytes)
         self._runner: web.AppRunner | None = None
 
     def _make_app(self) -> web.Application:
-        app = web.Application(client_max_size=MAX_BODY_BYTES)
+        app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_post("/onebot/event", self._on_event)
         return app
 

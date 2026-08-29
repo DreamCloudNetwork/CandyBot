@@ -143,6 +143,12 @@ class BotSettings:
     event_secret: str | None
     data_dir: str
     log_level: str  # 大写级别名，main.py 据此设置根 logger
+    # 机器人自己的昵称：自发言写回记忆的昵称、@/回复占位文本
+    # （normalize）。此前固定在代码里，默认值保持原样「糖糖」。
+    self_nickname: str = "糖糖"
+    # 事件上报请求体上限（字节）。direct 模式下事件正文可能带较大的图片
+    # 数据，超限时可按需调大。烘进 aiohttp 服务的构造参数，改动需重启。
+    max_event_body_bytes: int = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -304,12 +310,30 @@ class GenerationSettings:
     #   最大重试次数（0 关闭整个环节），重试后仍命中则放行并记 warning。
     ai_flavor_rules: tuple[str, ...] = AI_FLAVOR_RULES_DEFAULT
     ai_flavor_retries: int = 1
+    # ---- 原写死在 ai.py / bot.py 里的调用与重试参数（默认值=原字面量）----
+    # 各角色采样温度：reply 用上面的 temperature；judge/vision/learning
+    # 此前固定在 ai.py 的各调用处。
+    judge_temperature: float = 0.2
+    describe_temperature: float = 0.3    # describe 模式图片转述
+    assess_temperature: float = 0.2      # direct 模式入库评估
+    learning_temperature: float = 0.3    # 后台学习类一次性调用
+    # 生成回复的网络重试（bot._generate_with_retry）：总尝试次数与首次退避
+    # 秒数（其后每次 ×2）。
+    generate_max_attempts: int = 2
+    generate_retry_base_delay: float = 2.0
+    # 连发被打断后每轮最多几次「重想」（bot._decide_and_reply 的 reconsider
+    # 预算），预算用尽后剩余腹稿按原计划发完。
+    max_reconsider_per_burst: int = 2
 
 
 @dataclass(frozen=True)
 class MultimodalSettings:
     mode: str
     download_media: bool
+    # 原写死在 normalize.py 的下载参数（默认值=原字面量）：
+    download_timeout_seconds: float = 15.0   # 单张图片下载超时
+    max_image_bytes: int = 8 * 1024 * 1024   # 超过该字节数放弃下载
+    max_images_per_message: int = 4          # 单条消息至多下载几张图
 
 
 @dataclass(frozen=True)
@@ -356,10 +380,23 @@ class LearningSettings:
     jargon_enabled: bool = True
     jargon_max_entries: int = 50
     jargon_max_inject: int = 5
+    # ---- 原写死在 learning.py 的调度与限流参数（默认值=原字面量）----
+    # 被淘汰消息缓冲的容量倍数（批大小 × 该系数），溢出丢最旧的；
+    pending_buffer_factor: int = 3
+    # 每日印象总结送入的聊天文本字符预算（从当天最新一条向前截取）；
+    impression_text_budget: int = 6000
+    # 每批黑话学习实际做双路推断的候选数上限（一个候选至少 3 次 LLM 调用）；
+    jargon_candidates_per_batch: int = 5
+    # 黑话含义入库长度上限（防模型长篇大论撑爆 L4）。
+    jargon_meaning_max_chars: int = 200
 
 
 # 敷衍池内置默认：回复过长或拆条后为空时随机抽取其一代替发送。
 LAZY_REPLIES_DEFAULT = ("呃呃", "不晓得", "懒得说", "不知道", "emm")
+
+# describe 模式表情包识别的内置默认关键词（stickers.summary_keywords）：
+# 视觉模型总结里出现任一词（忽略大小写）即视为表情包类。
+STICKER_SUMMARY_KEYWORDS_DEFAULT = ("表情包", "梗图", "斗图", "动图", "meme")
 
 # 多音字（如「银行」的行）的错字策略：word_reading 取词典词内读音照常替换；
 # skip 则多音字整体跳过、只替换单一读音的字。两种策略下读音无法确定的
@@ -397,6 +434,13 @@ class ResponsePostProcessSettings:
     typo_correction_probability: float = 0.5
     typo_polyphone_mode: str = TYPO_POLYPHONE_MODE_DEFAULT
     lazy_replies: tuple[str, ...] = LAZY_REPLIES_DEFAULT
+    # ---- 打字延迟的单字耗时模型（原写死在 postprocess.py，默认值=原字面量）----
+    # 估算秒数 =（各类耗时×数量）× typing_speed 倍率，单条另有封顶。
+    typing_cjk_seconds: float = 0.3        # 中文/全角字符，每字
+    typing_latin_seconds: float = 0.15     # 英文数字等半角字符，每字
+    typing_special_seconds: float = 1.0    # emoji 序列/颜文字，每块
+    typing_single_multiplier: float = 3.0  # 无任何特殊块的单字回复加倍
+    max_typing_delay_seconds: float = 60.0  # 单条打字延迟封顶秒数
 
 
 @dataclass(frozen=True)
@@ -412,6 +456,11 @@ class StickerSettings:
     enabled: bool = True
     send_probability: float = 0.05
     max_count: int = 64
+    # 识别启发式参数（原写死在 stickers.py，默认值=原字面量）：
+    # placeholder 模式「尺寸小」启发式的边长上限（像素），较长边不超过才收集；
+    max_side_px: int = 512
+    # describe 模式总结文本的命中关键词（忽略大小写，任一命中即视为表情包类）。
+    summary_keywords: tuple[str, ...] = STICKER_SUMMARY_KEYWORDS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -423,6 +472,10 @@ class SnowlumaSettings:
     mode: str
     timeout_ms: int
     allow_private_endpoint: bool
+    # ---- 发送重试（bot._send_with_retry，原写死；默认值=原字面量）----
+    # 总尝试次数与首次退避秒数（其后每次 ×2）；现取现读，热重载即时生效。
+    send_max_attempts: int = 3
+    send_retry_delay_seconds: float = 1.5
 
 
 @dataclass(frozen=True)
@@ -590,6 +643,15 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError("config.json5 → bot.self_qq 必须配置为机器人的 QQ 号")
     listen_host = _parse_str(bot_cfg, "listen_host", "127.0.0.1")
     listen_port = _parse_int(bot_cfg, "listen_port", 5700)
+    self_nickname = _parse_str(bot_cfg, "self_nickname", "糖糖").strip()
+    if not self_nickname:
+        raise ValueError("config.json5 → bot.self_nickname 不能为空")
+    max_event_body_bytes = _parse_int(bot_cfg, "max_event_body_bytes", 1024 * 1024)
+    if max_event_body_bytes < 1024:
+        raise ValueError(
+            f"配置项 `bot.max_event_body_bytes` 不能小于 1024，"
+            f"实际是 {max_event_body_bytes!r}"
+        )
     log_level = _parse_str(bot_cfg, "log_level", "INFO").upper()
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         raise ValueError(
@@ -705,6 +767,41 @@ def load_settings(cfg: Any) -> Settings:
             "配置项 `generation.observe_delay_seconds` 应为非负有限数字，"
             f"实际是 {observe_delay_seconds!r}"
         )
+
+    def _parse_temperature(key: str, default: float) -> float:
+        value = _parse_float(gen_cfg, key, default)
+        if not 0 <= value <= 2:
+            raise ValueError(
+                f"配置项 `generation.{key}` 应在 0~2 之间，实际是 {value!r}"
+            )
+        return value
+
+    def _parse_backoff(key: str, default: float) -> float:
+        # 退避延时直接喂给 asyncio.sleep：与 observe_delay_seconds 同口径拒收
+        value = _parse_float(gen_cfg, key, default)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"配置项 `generation.{key}` 应为非负有限数字，实际是 {value!r}"
+            )
+        return value
+
+    judge_temperature = _parse_temperature("judge_temperature", 0.2)
+    describe_temperature = _parse_temperature("describe_temperature", 0.3)
+    assess_temperature = _parse_temperature("assess_temperature", 0.2)
+    learning_temperature = _parse_temperature("learning_temperature", 0.3)
+    generate_max_attempts = _parse_int(gen_cfg, "generate_max_attempts", 2)
+    if generate_max_attempts < 1:
+        raise ValueError(
+            f"配置项 `generation.generate_max_attempts` 不能小于 1，"
+            f"实际是 {generate_max_attempts!r}"
+        )
+    generate_retry_base_delay = _parse_backoff("generate_retry_base_delay", 2.0)
+    max_reconsider_per_burst = _parse_int(gen_cfg, "max_reconsider_per_burst", 2)
+    if max_reconsider_per_burst < 0:
+        raise ValueError(
+            f"配置项 `generation.max_reconsider_per_burst` 不能为负数（0 关闭重想），"
+            f"实际是 {max_reconsider_per_burst!r}"
+        )
     generation_settings = GenerationSettings(
         reply_max_tokens=_parse_int(gen_cfg, "reply_max_tokens", 500),
         temperature=float(_get(gen_cfg, "temperature", 0.8)),
@@ -731,6 +828,13 @@ def load_settings(cfg: Any) -> Settings:
         multiple_probability=multiple_probability,
         ai_flavor_rules=ai_flavor_rules,
         ai_flavor_retries=ai_flavor_retries,
+        judge_temperature=judge_temperature,
+        describe_temperature=describe_temperature,
+        assess_temperature=assess_temperature,
+        learning_temperature=learning_temperature,
+        generate_max_attempts=generate_max_attempts,
+        generate_retry_base_delay=generate_retry_base_delay,
+        max_reconsider_per_burst=max_reconsider_per_burst,
     )
 
     mm_cfg = _require_section(cfg, "multimodal")
@@ -742,7 +846,23 @@ def load_settings(cfg: Any) -> Settings:
     multimodal_settings = MultimodalSettings(
         mode=mm_mode,
         download_media=_parse_bool(mm_cfg.get("download_media", True), "download_media"),
+        download_timeout_seconds=_parse_float(mm_cfg, "download_timeout_seconds", 15.0),
+        max_image_bytes=_parse_int(mm_cfg, "max_image_bytes", 8 * 1024 * 1024),
+        max_images_per_message=_parse_int(mm_cfg, "max_images_per_message", 4),
     )
+    if not math.isfinite(multimodal_settings.download_timeout_seconds) or (
+        multimodal_settings.download_timeout_seconds <= 0
+    ):
+        raise ValueError(
+            "配置项 `multimodal.download_timeout_seconds` 应为正有限数字，"
+            f"实际是 {multimodal_settings.download_timeout_seconds!r}"
+        )
+    for key, value in (
+        ("max_image_bytes", multimodal_settings.max_image_bytes),
+        ("max_images_per_message", multimodal_settings.max_images_per_message),
+    ):
+        if value < 1:
+            raise ValueError(f"配置项 `multimodal.{key}` 不能小于 1，实际是 {value!r}")
 
     # storage 段可整体省略（全部走默认值）
     storage_cfg = _optional_section(cfg, "storage")
@@ -765,6 +885,18 @@ def load_settings(cfg: Any) -> Settings:
         snow_cfg.get("allow_private_endpoint", False), "allow_private_endpoint"
     )
     validate_endpoint_url(endpoint, allow_private=allow_private)
+    send_max_attempts = _parse_int(snow_cfg, "send_max_attempts", 3)
+    if send_max_attempts < 1:
+        raise ValueError(
+            f"配置项 `snowluma.send_max_attempts` 不能小于 1，"
+            f"实际是 {send_max_attempts!r}"
+        )
+    send_retry_delay_seconds = _parse_float(snow_cfg, "send_retry_delay_seconds", 1.5)
+    if not math.isfinite(send_retry_delay_seconds) or send_retry_delay_seconds < 0:
+        raise ValueError(
+            "配置项 `snowluma.send_retry_delay_seconds` 应为非负有限数字，"
+            f"实际是 {send_retry_delay_seconds!r}"
+        )
     snowluma_settings = SnowlumaSettings(
         mcp_command=_parse_str(snow_cfg, "mcp_command", "npx"),
         mcp_args=list(_get(snow_cfg, "mcp_args", ["-y", "@snowluma/mcp"])),
@@ -773,6 +905,8 @@ def load_settings(cfg: Any) -> Settings:
         mode=_parse_str(snow_cfg, "mode", "read"),
         timeout_ms=_parse_int(snow_cfg, "timeout_ms", 30000),
         allow_private_endpoint=allow_private,
+        send_max_attempts=send_max_attempts,
+        send_retry_delay_seconds=send_retry_delay_seconds,
     )
     if snowluma_settings.mode != "write":
         raise ValueError(
@@ -824,6 +958,15 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError(
             "配置项 `response_post_process.lazy_replies` 应为非空的字符串列表"
         )
+    def _parse_typing_seconds(key: str, default: float) -> float:
+        value = _parse_float(pp_cfg, key, default)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"配置项 `response_post_process.{key}` 应为非负有限数字，"
+                f"实际是 {value!r}"
+            )
+        return value
+
     post_process_settings = ResponsePostProcessSettings(
         enabled=_parse_bool(pp_cfg.get("enabled", True), "response_post_process.enabled"),
         typing_speed=typing_speed,
@@ -841,6 +984,11 @@ def load_settings(cfg: Any) -> Settings:
         ),
         typo_polyphone_mode=polyphone_mode,
         lazy_replies=tuple(str(item) for item in lazy_raw),
+        typing_cjk_seconds=_parse_typing_seconds("typing_cjk_seconds", 0.3),
+        typing_latin_seconds=_parse_typing_seconds("typing_latin_seconds", 0.15),
+        typing_special_seconds=_parse_typing_seconds("typing_special_seconds", 1.0),
+        typing_single_multiplier=_parse_typing_seconds("typing_single_multiplier", 3.0),
+        max_typing_delay_seconds=_parse_typing_seconds("max_typing_delay_seconds", 60.0),
     )
 
     # learning 段可整体省略（全部走默认值）
@@ -875,6 +1023,12 @@ def load_settings(cfg: Any) -> Settings:
         ),
         jargon_max_entries=_parse_positive_int("jargon_max_entries", 50),
         jargon_max_inject=_parse_positive_int("jargon_max_inject", 5),
+        pending_buffer_factor=_parse_positive_int("pending_buffer_factor", 3),
+        impression_text_budget=_parse_positive_int("impression_text_budget", 6000),
+        jargon_candidates_per_batch=_parse_positive_int(
+            "jargon_candidates_per_batch", 5
+        ),
+        jargon_meaning_max_chars=_parse_positive_int("jargon_meaning_max_chars", 200),
     )
 
     # stickers 段可整体省略（全部走默认值）
@@ -890,10 +1044,26 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError(
             f"配置项 `stickers.max_count` 不能小于 1，实际是 {sticker_max_count!r}"
         )
+    max_side_px = _parse_int(sticker_cfg, "max_side_px", 512)
+    if max_side_px < 1:
+        raise ValueError(
+            f"配置项 `stickers.max_side_px` 不能小于 1，实际是 {max_side_px!r}"
+        )
+    keywords_raw = _get(sticker_cfg, "summary_keywords", list(STICKER_SUMMARY_KEYWORDS_DEFAULT))
+    if (
+        not isinstance(keywords_raw, (list, tuple))
+        or not all(isinstance(item, str) and item.strip() for item in keywords_raw)
+    ):
+        raise ValueError(
+            "配置项 `stickers.summary_keywords` 应为非空字符串的列表"
+            "（显式 [] 表示 describe 模式的关键词识别永不命中）"
+        )
     sticker_settings = StickerSettings(
         enabled=_parse_bool(sticker_cfg.get("enabled", True), "stickers.enabled"),
         send_probability=send_probability,
         max_count=sticker_max_count,
+        max_side_px=max_side_px,
+        summary_keywords=tuple(str(item).strip() for item in keywords_raw),
     )
 
     return Settings(
@@ -904,6 +1074,8 @@ def load_settings(cfg: Any) -> Settings:
             event_secret=_parse_optional_str(bot_cfg, "event_secret"),
             data_dir=_parse_str(bot_cfg, "data_dir", "data"),
             log_level=log_level,
+            self_nickname=self_nickname,
+            max_event_body_bytes=max_event_body_bytes,
         ),
         groups=groups,
         groups_default=default_profile,

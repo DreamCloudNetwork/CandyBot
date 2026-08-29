@@ -24,14 +24,16 @@ from .models import (
     ChatRecord,
     MultimodalSettings,
     NormalizedMessage,
+    StickerSettings,
     validate_request_url,
 )
 from .stickers import is_small_image, is_sticker_by_summary
 
 logger = logging.getLogger(__name__)
 
-_IMAGE_SUFFIXES = ("png", "jpg", "jpeg", "gif", "webp", "bmp")
-_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=15)
+# 图片下载的内置默认（multimodal 段对应项未配置时的兜底，即参数提取前
+# 写死的字面量）：单张超时秒数、字节上限。
+_DOWNLOAD_TIMEOUT_SECONDS = 15.0
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 
@@ -63,7 +65,11 @@ def _extract_image_urls(segment_data: dict) -> list[str]:
 
 
 async def _download_as_data_url(
-    session: aiohttp.ClientSession, url: str
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    timeout_seconds: float = _DOWNLOAD_TIMEOUT_SECONDS,
+    max_bytes: int = _MAX_IMAGE_BYTES,
 ) -> str | None:
     """下载图片并编码为 data URL；任何失败都只记日志返回 None。"""
     try:
@@ -72,13 +78,15 @@ async def _download_as_data_url(
         logger.warning("跳过不安全的图片地址：%s", exc)
         return None
     try:
-        async with session.get(url, timeout=_DOWNLOAD_TIMEOUT) as resp:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)
+        ) as resp:
             resp.raise_for_status()
             data = await resp.read()
     except Exception as exc:  # 网络/HTTP 错误一律降级为占位符
         logger.warning("下载图片失败 %s：%s", url, exc)
         return None
-    if len(data) > _MAX_IMAGE_BYTES:
+    if len(data) > max_bytes:
         logger.warning("图片过大，放弃下载：%s (%d bytes)", url, len(data))
         return None
     mime = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
@@ -97,6 +105,8 @@ async def normalize_group_message(
     http_session: aiohttp.ClientSession | None = None,
     describe_image=None,
     assess_image=None,
+    self_nickname: str = "糖糖",
+    stickers: StickerSettings | None = None,
 ) -> NormalizedMessage | None:
     """把一条 group 消息事件转为 NormalizedMessage。
 
@@ -105,7 +115,10 @@ async def normalize_group_message(
     describe_image: 仅 describe 模式需要，Callable[[str dataurl], Awaitable[str]]；
     assess_image: 仅 direct 模式需要，Callable[[str dataurl], Awaitable[ImageAssessment]]，
     用于入库时判定该图后续继续展示原图还是只保留总结。
+    self_nickname: 机器人昵称（@ 与回复引用的占位文本用，bot.self_nickname）；
+    stickers: 表情包识别启发式参数（stickers 段），缺省全部走内置默认。
     """
+    st = stickers if stickers is not None else StickerSettings()
     if event.get("post_type") != "message" or event.get("message_type") != "group":
         return None
     try:
@@ -145,14 +158,14 @@ async def normalize_group_message(
             if target in (str(self_qq), "all"):
                 if target == str(self_qq):
                     mentioned_me = True
-                    parts.append("@糖糖")
+                    parts.append(f"@{self_nickname}")
                 else:
                     parts.append("@全体成员")
             elif target.isdigit():
                 parts.append(f"@QQ{target}")
         elif seg_type == "reply":
             ref_text, is_self_ref = await _resolve_reply(
-                data, find_by_message_id, self_qq
+                data, find_by_message_id, self_qq, self_nickname
             )
             if ref_text:
                 parts.append(ref_text)
@@ -186,8 +199,13 @@ async def normalize_group_message(
         data_urls: list[str] = []
         descriptions: list[str] = []
         describe_flags: list[bool] = []  # describe 模式：与 data_urls 一一对应
-        for url in image_urls[:4]:  # 至多取 4 张，防刷屏
-            data_url = await _download_as_data_url(http_session, url)
+        for url in image_urls[: multimodal.max_images_per_message]:  # 限制张数，防刷屏
+            data_url = await _download_as_data_url(
+                http_session,
+                url,
+                timeout_seconds=multimodal.download_timeout_seconds,
+                max_bytes=multimodal.max_image_bytes,
+            )
             if data_url is None:
                 continue
             data_urls.append(data_url)
@@ -202,7 +220,7 @@ async def normalize_group_message(
                     desc = None
                 if desc:
                     descriptions.append(desc)
-                describe_flags.append(is_sticker_by_summary(desc))
+                describe_flags.append(is_sticker_by_summary(desc, st.summary_keywords))
 
         if multimodal.mode == "describe":
             images = tuple(data_urls)
@@ -227,10 +245,10 @@ async def normalize_group_message(
                         sticker_is_sticker = assessment.is_sticker
                     except Exception as exc:
                         logger.warning("图片入库评估失败，默认保留原图：%s", exc)
-                        sticker_is_sticker = is_small_image(data_url)
+                        sticker_is_sticker = is_small_image(data_url, st.max_side_px)
                 else:
                     # 未配置 vision：没有入库评估结论可复用，退回尺寸启发式
-                    sticker_is_sticker = is_small_image(data_url)
+                    sticker_is_sticker = is_small_image(data_url, st.max_side_px)
                 state = IMAGE_STATE_SHOW
                 # 判定无需继续展示原图：能总结就转为总结，否则保守保留原图
                 if not keep_raw and summary:
@@ -247,7 +265,9 @@ async def normalize_group_message(
                 text = (text + "\n[图片]").strip()
         else:  # placeholder：一律只展示占位符，图本身仍要写进本地记忆
             images = tuple(data_urls)
-            sticker_flags = tuple(is_small_image(url) for url in data_urls)
+            sticker_flags = tuple(
+                is_small_image(url, st.max_side_px) for url in data_urls
+            )
 
     if not text.strip() and not images:
         return None
@@ -269,7 +289,7 @@ async def normalize_group_message(
 
 
 async def _resolve_reply(
-    reply_data: dict, find_by_message_id, self_qq: int
+    reply_data: dict, find_by_message_id, self_qq: int, self_nickname: str = "糖糖"
 ) -> tuple[str | None, bool]:
     """构造回复引用文本，返回 (文本, 是否引用了机器人自己的消息)。"""
     try:
@@ -282,7 +302,7 @@ async def _resolve_reply(
         referenced = None
     if referenced is not None:
         if referenced.is_self:
-            return "[回复糖糖]", True
+            return f"[回复{self_nickname}]", True
         snippet = referenced.text.replace("\n", " ")[:50]
         ref_label = (
             f"{referenced.nickname}({referenced.user_id})"
@@ -294,6 +314,6 @@ async def _resolve_reply(
     ref_user = str(reply_data.get("user_id", ""))
     if ref_user.isdigit():
         is_self = int(ref_user) == self_qq
-        label = "糖糖" if is_self else f"QQ{ref_user}"
+        label = self_nickname if is_self else f"QQ{ref_user}"
         return f"[回复 {label}]", is_self
     return "[回复消息]", False

@@ -127,9 +127,17 @@ class FailingSnowluma(FakeSnowluma):
         return await super().send_group_msg(group_id, message)
 
 
-async def build_postprocess_bot(tmp_path, monkeypatch, *, post_process: dict, reply_text=REPLY_TEXT, ai=None):
+async def build_postprocess_bot(
+    tmp_path,
+    monkeypatch,
+    *,
+    post_process: dict,
+    reply_text=REPLY_TEXT,
+    ai=None,
+    generation: dict | None = None,
+):
     """构造开启后处理的机器人；asyncio.sleep 记录到 events 并立即返回。"""
-    settings = make_settings(tmp_path, post_process=post_process)
+    settings = make_settings(tmp_path, generation, post_process=post_process)
     bot = bot_module.CandyBot(settings)
     bot._snowluma = FakeSnowluma()
     bot._ai = ai if ai is not None else ScriptedAI(reply_text)
@@ -291,9 +299,14 @@ async def test_reconsider_can_rewrite_remaining(tmp_path, monkeypatch):
 
 async def test_reconsider_budget_exhausted_sends_as_planned(tmp_path, monkeypatch):
     """重想预算用尽：之后的插话不再触发调用，剩余腹稿按原计划发完。"""
-    monkeypatch.setattr(bot_module, "_MAX_RECONSIDER_PER_BURST", 1)
     ai = ScriptedAI(REPLY_TEXT)  # FakeAI 默认重想＝一字不改，bot 沿用原计划
-    bot, _ = await build_postprocess_bot(tmp_path, monkeypatch, post_process=SPLIT_PP, ai=ai)
+    bot, _ = await build_postprocess_bot(
+        tmp_path,
+        monkeypatch,
+        post_process=SPLIT_PP,
+        ai=ai,
+        generation={"max_reconsider_per_burst": 1},  # 预算从 2 收紧到 1
+    )
     memory = await bot._memory.get(42)
     _arm_interrupt(bot, monkeypatch, {1: (2, "不是", 1001), 2: (3, "哈？", 1002)})
     try:

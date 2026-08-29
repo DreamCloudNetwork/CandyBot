@@ -516,7 +516,7 @@ class AIClient:
         request: dict = dict(
             model=self._judge.model,
             messages=chat,
-            temperature=0.2,
+            temperature=self._generation.judge_temperature,
             # 推理型 judge 模型的思考段会占掉不少 token，上限太小会把结论截掉
             max_tokens=self._judge.max_output_tokens or _JUDGE_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
@@ -843,7 +843,7 @@ class AIClient:
                     ],
                 }
             ],
-            temperature=0.3,
+            temperature=self._generation.describe_temperature,
             max_tokens=self._vision.max_output_tokens or _DESCRIBE_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
@@ -896,7 +896,7 @@ class AIClient:
         request: dict = dict(
             model=self._vision.model,
             messages=messages(use_tools),
-            temperature=0.2,
+            temperature=self._generation.assess_temperature,
             max_tokens=self._vision.max_output_tokens or _ASSESS_MAX_TOKENS,
             timeout=self._generation.timeout_seconds,
         )
@@ -962,7 +962,7 @@ class AIClient:
         response = await self._client_for(cfg).chat.completions.create(
             model=cfg.model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=self._generation.learning_temperature,
             max_tokens=cfg.max_output_tokens or default_max_tokens,
             timeout=self._generation.timeout_seconds,
         )

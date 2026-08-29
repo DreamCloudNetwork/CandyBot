@@ -28,16 +28,9 @@ from .prompts import learning_chat_text
 
 logger = logging.getLogger(__name__)
 
-# 被淘汰消息缓冲的容量倍数（批大小 × 该系数）：学习任务运行期间新淘汰的
-# 消息继续攒着等下一批，但不能无界增长，溢出时丢最旧的。
-_PENDING_BUFFER_FACTOR = 3
-# 每批黑话学习实际做双路推断的候选数上限：一个候选至少 3 次 LLM 调用，
-# 必须限流，多余的候选留给下一批。
-_MAX_JARGON_CANDIDATES_PER_BATCH = 5
-# 每日印象总结送入的聊天文本字符预算（从当天最新一条向前截取）。
-_IMPRESSION_TEXT_BUDGET = 6000
-# 黑话含义入库长度上限（提示词未限死，防御模型长篇大论撑爆 L4）。
-_JARGON_MEANING_MAX_CHARS = 200
+# 调度与限流参数（被淘汰缓冲倍数、印象文本预算、每批黑话候选上限、
+# 黑话含义入库长度上限）原先写死在本模块，现统一移到 learning 配置段
+# （models.LearningSettings），默认值与提取前的字面量一致。
 
 
 def day_bounds(day: date) -> tuple[float, float]:
@@ -128,7 +121,7 @@ class LearningService:
         batch_size = max(ls.expression_batch_size, 1)
         pending = self._pending.setdefault(group_id, [])
         pending.append(record)
-        overflow = len(pending) - batch_size * _PENDING_BUFFER_FACTOR
+        overflow = len(pending) - batch_size * ls.pending_buffer_factor
         if overflow > 0:
             del pending[:overflow]
         if len(pending) < batch_size:
@@ -208,7 +201,7 @@ class LearningService:
             return
         logger.debug("群 %d 黑话候选：%r", group_id, terms)
         saved = 0
-        for term in terms[:_MAX_JARGON_CANDIDATES_PER_BATCH]:
+        for term in terms[: ls.jargon_candidates_per_batch]:
             meaning = await self._infer_jargon(term, chat_text)
             if meaning is None:
                 continue
@@ -237,7 +230,9 @@ class LearningService:
         if not await ai.compare_jargon_inference(meaning_with_context, meaning_alone):
             logger.debug("黑话 %r 双路推断不一致，视为未理解，跳过", term)
             return None
-        return meaning_with_context[:_JARGON_MEANING_MAX_CHARS]
+        return meaning_with_context[
+            : self._settings().learning.jargon_meaning_max_chars
+        ]
 
     # ------------------------------------------------------------ 任务 A：每日印象
 
@@ -275,7 +270,7 @@ class LearningService:
                 if not records:
                     continue
                 chat_text = learning_chat_text(
-                    _clip_records_for_impression(records, _IMPRESSION_TEXT_BUDGET)
+                    _clip_records_for_impression(records, ls.impression_text_budget)
                 )
                 summary = await self._ai().summarize_impression(
                     day_str, chat_text, ls.impression_max_chars

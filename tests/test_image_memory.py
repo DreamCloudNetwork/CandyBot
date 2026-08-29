@@ -201,7 +201,7 @@ async def _normalize_with_assess(mode: str, assessor):
 def test_direct_intake_keep_and_drop(monkeypatch):
     import candybot.normalize as norm_mod
 
-    async def fake_download(session, url):
+    async def fake_download(session, url, **_kwargs):
         return IMG_A
 
     monkeypatch.setattr(norm_mod, "_download_as_data_url", fake_download)
@@ -225,7 +225,7 @@ def test_direct_intake_keep_and_drop(monkeypatch):
 def test_direct_intake_assess_failure_keeps_raw(monkeypatch):
     import candybot.normalize as norm_mod
 
-    async def fake_download(session, url):
+    async def fake_download(session, url, **_kwargs):
         return IMG_A
 
     monkeypatch.setattr(norm_mod, "_download_as_data_url", fake_download)
@@ -240,7 +240,7 @@ def test_direct_intake_assess_failure_keeps_raw(monkeypatch):
 def test_placeholder_mode_persists_base64_but_no_states(monkeypatch):
     import candybot.normalize as norm_mod
 
-    async def fake_download(session, url):
+    async def fake_download(session, url, **_kwargs):
         return IMG_A
 
     monkeypatch.setattr(norm_mod, "_download_as_data_url", fake_download)

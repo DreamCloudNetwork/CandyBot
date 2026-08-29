@@ -6,6 +6,7 @@ from candybot.models import (
     AI_FLAVOR_RULES_DEFAULT,
     CONTEXT_SIZE_DEFAULT,
     MULTIPLE_REPLY_STYLE_DEFAULT,
+    STICKER_SUMMARY_KEYWORDS_DEFAULT,
     GroupProfile,
     Settings,
     load_settings,
@@ -603,3 +604,125 @@ def test_style_flavor_sticker_validation_errors():
     ]:
         with pytest.raises(ValueError, match=frag):
             load_settings(DictCfg(base_cfg(stickers=bad_st)))
+
+
+# ------------------------------------------------------ 提取自硬编码值的可配置参数
+
+
+def test_extracted_parameters_defaults():
+    """新参数整段不写时全部落到提取前代码里写死的字面量（行为不变）。"""
+    s = load_settings(DictCfg(base_cfg()))
+    assert s.bot.self_nickname == "糖糖"
+    assert s.bot.max_event_body_bytes == 1024 * 1024
+    gen = s.generation
+    assert (
+        gen.judge_temperature,
+        gen.describe_temperature,
+        gen.assess_temperature,
+        gen.learning_temperature,
+    ) == (0.2, 0.3, 0.2, 0.3)
+    assert gen.generate_max_attempts == 2
+    assert gen.generate_retry_base_delay == 2.0
+    assert gen.max_reconsider_per_burst == 2
+    mm = s.multimodal
+    assert mm.download_timeout_seconds == 15.0
+    assert mm.max_image_bytes == 8 * 1024 * 1024
+    assert mm.max_images_per_message == 4
+    pp = s.response_post_process
+    assert pp.typing_cjk_seconds == 0.3
+    assert pp.typing_latin_seconds == 0.15
+    assert pp.typing_special_seconds == 1.0
+    assert pp.typing_single_multiplier == 3.0
+    assert pp.max_typing_delay_seconds == 60.0
+    assert s.stickers.max_side_px == 512
+    assert s.stickers.summary_keywords == STICKER_SUMMARY_KEYWORDS_DEFAULT
+    ls = s.learning
+    assert ls.pending_buffer_factor == 3
+    assert ls.impression_text_budget == 6000
+    assert ls.jargon_candidates_per_batch == 5
+    assert ls.jargon_meaning_max_chars == 200
+    assert s.snowluma.send_max_attempts == 3
+    assert s.snowluma.send_retry_delay_seconds == 1.5
+
+
+def test_extracted_parameters_custom_values():
+    s = load_settings(
+        DictCfg(
+            base_cfg(
+                bot={"self_nickname": " 小糖 ", "max_event_body_bytes": 2 * 1024 * 1024},
+                generation={
+                    "judge_temperature": 0.5,
+                    "describe_temperature": 0.0,
+                    "generate_max_attempts": 4,
+                    "generate_retry_base_delay": 0.5,
+                    "max_reconsider_per_burst": 0,
+                },
+                multimodal={
+                    "download_timeout_seconds": 5,
+                    "max_image_bytes": 4096,
+                    "max_images_per_message": 1,
+                },
+                response_post_process={
+                    "typing_cjk_seconds": 0.5,
+                    "typing_latin_seconds": 0.2,
+                    "typing_special_seconds": 2.0,
+                    "typing_single_multiplier": 4.0,
+                    "max_typing_delay_seconds": 30,
+                },
+                stickers={"max_side_px": 300, "summary_keywords": ["梗图", " meme "]},
+                learning={
+                    "pending_buffer_factor": 5,
+                    "impression_text_budget": 12000,
+                    "jargon_candidates_per_batch": 2,
+                    "jargon_meaning_max_chars": 100,
+                },
+                snowluma={"send_max_attempts": 5, "send_retry_delay_seconds": 0.2},
+            )
+        )
+    )
+    assert s.bot.self_nickname == "小糖"  # 自动 strip
+    assert s.bot.max_event_body_bytes == 2 * 1024 * 1024
+    assert s.generation.judge_temperature == 0.5
+    assert s.generation.describe_temperature == 0.0
+    assert s.generation.generate_max_attempts == 4
+    assert s.generation.max_reconsider_per_burst == 0  # 0 = 关闭重想，合法
+    assert s.multimodal.max_images_per_message == 1
+    assert s.response_post_process.typing_cjk_seconds == 0.5
+    assert s.response_post_process.max_typing_delay_seconds == 30.0
+    assert s.stickers.max_side_px == 300
+    assert s.stickers.summary_keywords == ("梗图", "meme")  # 词组内自动 strip
+    assert s.learning.impression_text_budget == 12000
+    assert s.snowluma.send_max_attempts == 5
+
+    # 关键词显式空列表：合法，表示 describe 模式启发式永不命中
+    cfg2 = base_cfg(stickers={"summary_keywords": []})
+    assert load_settings(DictCfg(cfg2)).stickers.summary_keywords == ()
+
+
+def test_extracted_parameters_validation_errors():
+    cases = [
+        ({"bot": {"self_nickname": "   "}}, "self_nickname"),
+        ({"bot": {"max_event_body_bytes": 100}}, "max_event_body_bytes"),
+        ({"generation": {"judge_temperature": 3.0}}, "judge_temperature"),
+        ({"generation": {"judge_temperature": -0.1}}, "judge_temperature"),
+        ({"generation": {"learning_temperature": "hot"}}, "learning_temperature"),
+        ({"generation": {"generate_max_attempts": 0}}, "generate_max_attempts"),
+        ({"generation": {"generate_retry_base_delay": float("inf")}}, "generate_retry_base_delay"),
+        ({"generation": {"max_reconsider_per_burst": -1}}, "max_reconsider_per_burst"),
+        ({"multimodal": {"download_timeout_seconds": 0}}, "download_timeout_seconds"),
+        ({"multimodal": {"max_image_bytes": 0}}, "max_image_bytes"),
+        ({"multimodal": {"max_images_per_message": -1}}, "max_images_per_message"),
+        ({"response_post_process": {"typing_cjk_seconds": -0.1}}, "typing_cjk_seconds"),
+        ({"response_post_process": {"typing_single_multiplier": float("nan")}}, "typing_single_multiplier"),
+        ({"response_post_process": {"max_typing_delay_seconds": -5}}, "max_typing_delay_seconds"),
+        ({"stickers": {"max_side_px": 0}}, "max_side_px"),
+        ({"stickers": {"summary_keywords": ["  "]}}, "summary_keywords"),
+        ({"stickers": {"summary_keywords": "表情包"}}, "summary_keywords"),
+        ({"learning": {"pending_buffer_factor": 0}}, "pending_buffer_factor"),
+        ({"learning": {"impression_text_budget": -1}}, "impression_text_budget"),
+        ({"snowluma": {"send_max_attempts": 0}}, "send_max_attempts"),
+        ({"snowluma": {"send_retry_delay_seconds": -1}}, "send_retry_delay_seconds"),
+    ]
+    for over, frag in cases:
+        with pytest.raises(ValueError, match=frag):
+            load_settings(DictCfg(base_cfg(**over)))

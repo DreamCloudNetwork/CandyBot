@@ -52,6 +52,7 @@ from .postprocess import (
     ensure_indexes,
     estimate_typing_time,
     process_reply,
+    typing_policy_of,
 )
 from .prompts import (
     nickname_list_from_history,
@@ -65,12 +66,9 @@ from .stickers import STICKER_RECORD_TEXT, StickerStore
 
 logger = logging.getLogger(__name__)
 
-# 一轮连发最多几次「被打断后重想」：每次重想是一回额外的 reply 模型调用，
-# 预算用尽后剩下的腹稿按原计划发完，防止病态刷屏把发送环节变成无限往返。
-_MAX_RECONSIDER_PER_BURST = 2
-
 # 「已观望过」记账的进程内历史上限：只为防同一条消息被反复观望，
 # 长期运行的活跃群里旧条目没有保留价值，超出按 FIFO 遗忘。
+# （纯内存记账容量，不进配置；重想预算等可调参数已移到 generation 段。）
 _OBSERVED_HISTORY_MAX = 4096
 
 
@@ -261,6 +259,7 @@ class CandyBot:
             host=settings.bot.listen_host,
             port=settings.bot.listen_port,
             secret=settings.bot.event_secret,
+            max_body_bytes=settings.bot.max_event_body_bytes,
         )
         self._runtimes: dict[int, GroupRuntime] = defaultdict(GroupRuntime)
         # 队列元素为 (消息, 是否观望重评)：观望到点后把原消息重新入队，
@@ -342,10 +341,14 @@ class CandyBot:
         由 main.py 经 loop.call_soon_threadsafe 调度到事件循环线程调用，与
         消息处理天然串行，无需额外加锁。启动时已烘进监听/子进程会话的字段
         无法就地更换、改动仍需重启：bot.listen_host / listen_port /
-        event_secret（aiohttp 监听与签名校验已绑定）、bot.data_dir、
-        snowluma.*（MCP 子进程会话）；热缓存容量也在启动时按全局最大
-        context_size 定死（新配置超出时记警告）。其余（白名单、人设、护栏
-        阈值、模型与生成参数、多模态、输出后处理、限速、图片保留天数）
+        event_secret / max_event_body_bytes（aiohttp 监听与签名校验、请求体
+        上限已绑定）、bot.data_dir、snowluma 的会话类字段（mcp_command /
+        mcp_args / endpoint / api_key / mode / timeout_ms /
+        allow_private_endpoint，MCP 子进程会话；但 send_max_attempts /
+        send_retry_delay_seconds 是发送时现读，即时生效）；热缓存容量也在
+        启动时按全局最大 context_size 定死（新配置超出时记警告）。其余
+        （白名单、人设与 bot.self_nickname、护栏阈值、模型与生成参数、
+        多模态、输出后处理、限速、图片保留天数、表情包识别启发式）
         即时生效。
 
         解析失败（典型场景：配置写坏）完整记日志但不拖垮服务：沿用旧配置，
@@ -415,7 +418,11 @@ class CandyBot:
             normalized = await normalize_group_message(
                 event,
                 self_qq=self._settings.bot.self_qq,
+                self_nickname=self._settings.bot.self_nickname,
                 multimodal=self._settings.multimodal,
+                # 表情包识别启发式参数（尺寸上限与总结关键词）现取现用，
+                # 热重载即时生效
+                stickers=self._settings.stickers,
                 # 传协程回调，normalize 解析 reply 段时会 await 它
                 find_by_message_id=lambda ref_id: self._find_record(event, ref_id),
                 http_session=self._http,
@@ -647,7 +654,12 @@ class CandyBot:
         expression_hints, jargon_hints = await self._learning_hints(
             group_id, memory.tail(profile.context_size)
         )
-        reconsider_left = _MAX_RECONSIDER_PER_BURST
+        # 一轮连发最多几次「被打断后重想」（generation.max_reconsider_per_burst）：
+        # 每次重想是一回额外的 reply 模型调用，预算用尽后剩下的腹稿按原计划
+        # 发完，防止病态刷屏把发送环节变成无限往返。
+        reconsider_left = max(
+            int(self._settings.generation.max_reconsider_per_burst), 0
+        )
 
         async def reconsider(sent: list[str], pending: list[str]) -> ProcessedReply | None:
             """被打断后的重想调用。
@@ -808,7 +820,11 @@ class CandyBot:
                 logger.debug("群 %d 掷点命中但收藏为空，不跟发表情包", group_id)
                 return
             speed = self._settings.response_post_process.typing_speed
-            delay = estimate_typing_time(STICKER_RECORD_TEXT, speed)
+            delay = estimate_typing_time(
+                STICKER_RECORD_TEXT,
+                speed,
+                typing_policy_of(self._settings.response_post_process),
+            )
             logger.debug("群 %d 跟发表情包前预计挑图打字 %.1f 秒", group_id, delay)
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -1180,12 +1196,16 @@ class CandyBot:
     async def _generate_with_retry(self, fn, *args, **kwargs) -> ReplyDraft | None:
         """带指数退避地调用一个 reply 模型的生成函数（generate/reconsider）。
 
-        两次都失败返回 None——调用方须把它与「模型主动输出空正文」区分开：
-        前者按原计划继续，后者才是模型的明确决定。
+        尝试次数与首次退避来自 generation.generate_max_attempts /
+        generate_retry_base_delay（每次 ×2 倍增）。全部失败返回 None——
+        调用方须把它与「模型主动输出空正文」区分开：前者按原计划继续，
+        后者才是模型的明确决定。
         """
-        delay = 2.0
+        gen = self._settings.generation
+        attempts = max(int(gen.generate_max_attempts), 1)
+        delay = gen.generate_retry_base_delay
         last_exc: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(attempts):
             try:
                 return await fn(*args, **kwargs)
             except Exception as exc:
@@ -1312,7 +1332,9 @@ class CandyBot:
         speed: float,
     ) -> None:
         """按下一条消息的估算打字时长等待；speed 为 0 时直接跳过。"""
-        delay = estimate_typing_time(message, speed)
+        delay = estimate_typing_time(
+            message, speed, typing_policy_of(self._settings.response_post_process)
+        )
         logger.debug(
             "群 %d 第 %d/%d 条预计打字 %.1f 秒", group_id, index, total, delay
         )
@@ -1322,13 +1344,19 @@ class CandyBot:
     async def _send_with_retry(
         self, group_id: int, message: str | list[dict]
     ) -> int | None:
-        """发送一条消息（文本或 OneBot 段数组），返回其 message_id。"""
-        delay = 1.5
-        for attempt in range(3):
+        """发送一条消息（文本或 OneBot 段数组），返回其 message_id。
+
+        尝试次数与首次退避来自 snowluma.send_max_attempts /
+        send_retry_delay_seconds（每次 ×2 倍增）；最后一次失败原样上抛。
+        """
+        snow = self._settings.snowluma
+        attempts = max(int(snow.send_max_attempts), 1)
+        delay = snow.send_retry_delay_seconds
+        for attempt in range(attempts):
             try:
                 return await self._snowluma.send_group_msg(group_id, message)
             except Exception as exc:
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise
                 logger.warning("发送第 %d 次失败：%s", attempt + 1, exc)
                 await asyncio.sleep(delay)
@@ -1341,7 +1369,7 @@ class CandyBot:
             message_id=self._next_self_message_id(),
             group_id=group_id,
             user_id=self._settings.bot.self_qq,
-            nickname="糖糖",
+            nickname=self._settings.bot.self_nickname,
             text=text,
             ts=time.time(),
             is_self=True,

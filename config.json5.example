@@ -10,6 +10,9 @@
         "listen_port": 5700,              // 事件服务监听端口
         // "event_secret": "xxx",         // 事件推送签名密钥；注释掉表示不校验签名
         "data_dir": "data",               // 数据目录（记忆等持久化文件）
+        "self_nickname": "糖糖",          // 机器人昵称：自发言写回记忆、@/回复占位文本
+        "max_event_body_bytes": 1048576,  // 事件上报请求体上限（字节，默认 1MB）；
+                                          // 带大图的事件正文超限时调大；改动需重启
         // "log_level": "INFO",           // 默认 INFO；排查问题可改为 DEBUG
     },
 
@@ -88,6 +91,15 @@
         "emoji_chance": 0.25,             // 随机附加 emoji 的概率（0~1）
         "emoji_max": 2,                   // 单条回复最多 emoji 数
         "max_history_images": 8,      // 历史中最多携带的图片数（默认 8）
+        // ---- 各角色采样温度（reply 用上面的 temperature；其余角色此前写死在代码里）----
+        "judge_temperature": 0.2,         // 兴趣评分/门槛复核
+        "describe_temperature": 0.3,      // describe 模式图片转述
+        "assess_temperature": 0.2,        // direct 模式图片入库评估
+        "learning_temperature": 0.3,      // 后台学习类调用（印象/表达/黑话）
+        // ---- 重试与预算（退避延时逐次 ×2）----
+        "generate_max_attempts": 2,       // 生成回复的网络重试总尝试次数（默认 2）
+        "generate_retry_base_delay": 2.0, // 生成重试首次退避秒数（默认 2）
+        "max_reconsider_per_burst": 2,    // 一轮连发被打断后最多几次「重想」（默认 2；0 关闭）
         // 临时随机回复风格：每条回复独立按 multiple_probability 掷点，命中时从
         // 列表随机抽一条注入指令层（如「用 1-2 个字进行回复」）。默认 0 关闭；
         // 不写列表时使用代码内置的 5 条群聊风格示例。
@@ -103,6 +115,9 @@
     "multimodal": {
         "mode": "placeholder",            // direct = 发原图给视觉模型；placeholder = 仅占位
         "download_media": true,
+        "download_timeout_seconds": 15,   // 单张图片下载超时秒数
+        "max_image_bytes": 8388608,       // 图片超过该字节数放弃下载（默认 8MB）
+        "max_images_per_message": 4,      // 单条消息至多下载几张图（防刷屏）
     },
 
     "rate_limit": {
@@ -128,6 +143,10 @@
         "jargon_enabled": true,           // 黑话学习单项开关
         "jargon_max_entries": 50,         // 每群黑话条目上限，超限淘汰最久未命中
         "jargon_max_inject": 5,           // 单次回复最多注入的命中黑话条数
+        "pending_buffer_factor": 3,       // 被淘汰消息缓冲容量 = 批大小 × 该系数，溢出丢最旧
+        "impression_text_budget": 6000,   // 每日印象总结送入的聊天文本字符预算
+        "jargon_candidates_per_batch": 5, // 每批黑话学习实际做双路推断的候选数上限（每候选至少 3 次调用）
+        "jargon_meaning_max_chars": 200,  // 黑话含义入库长度上限（防撑爆 L4）
     },
 
     // 输出层拟人化后处理：拆条发送、打字延迟、错别字与敷衍兜底、连发被打断后的重想（整段可省略，全部走默认值）
@@ -142,6 +161,13 @@
         "typo_word_replace_rate": 0.2,    // 整词替换为同音词的概率
         "typo_correction_probability": 0.5, // 出现错字后追加「＊正确词」更正消息（引用最后一条正文）的概率
         "typo_polyphone_mode": "word_reading", // 多音字错字策略：word_reading=取词内读音照常替换 / skip=跳过多音字；读音无法确定时两种模式都不替换
+        // 打字延迟的单字耗时模型：估算秒数 =（各类耗时×数量）× typing_speed，
+        // 单条封顶 max_typing_delay_seconds（默认值即提取前代码写死值）
+        "typing_cjk_seconds": 0.3,        // 中文/全角字符每字
+        "typing_latin_seconds": 0.15,     // 英文数字等半角字符每字
+        "typing_special_seconds": 1.0,    // emoji 序列/颜文字每整块
+        "typing_single_multiplier": 3.0,  // 无任何特殊块的单字回复加倍
+        "max_typing_delay_seconds": 60,   // 单条打字延迟封顶秒数
         // 敷衍池：随机抽一条代替过长回复
         "lazy_replies": ["呃呃", "不晓得", "懒得说", "不知道", "emm"],
     },
@@ -154,6 +180,10 @@
         "enabled": true,                  // 总开关（关掉既不收集也不跟发）
         "send_probability": 0.05,         // 每条文字回复后跟发一张的概率（0 关闭跟发）
         "max_count": 64,                  // 全局收藏上限，超限替换最久未使用的
+        "max_side_px": 512,               // placeholder 模式「尺寸小」启发式的边长上限（像素）
+        "summary_keywords": ["表情包", "梗图", "斗图", "动图", "meme"],
+                                          // describe 模式总结文本的命中关键词（忽略大小写）；
+                                          // 显式 [] 表示该启发式永不命中
     },
 
     "snowluma": {
@@ -164,5 +194,7 @@
         "mode": "write",                  // read / write / all
         "timeout_ms": 30000,
         "allow_private_endpoint": true,   // 允许内网地址（本地部署需为 true）
+        "send_max_attempts": 3,           // 发送重试总尝试次数（默认 3）
+        "send_retry_delay_seconds": 1.5,  // 发送重试首次退避秒数（逐次 ×2）
     },
 }

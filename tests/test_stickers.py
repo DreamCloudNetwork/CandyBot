@@ -95,6 +95,9 @@ def test_is_small_image():
     assert is_small_image("https://example.com/x.png") is False  # 非 data URL
     assert is_small_image("data:image/png;base64,!!!坏数据") is False
     assert is_small_image("data:image/png,非base64") is False
+    # 边长上限可配置（stickers.max_side_px）
+    assert is_small_image(png_url(600, 200), 1000) is True
+    assert is_small_image(png_url(64, 64), 32) is False
 
 
 def test_parse_data_url():
@@ -112,6 +115,15 @@ def test_is_sticker_by_summary():
     assert is_sticker_by_summary("代码截图，报错栈") is False
     assert is_sticker_by_summary(None) is False
     assert is_sticker_by_summary("") is False
+    # 关键词可配置（stickers.summary_keywords，忽略大小写）；
+    # 显式空列表＝该启发式永不命中
+    assert is_sticker_by_summary("一张柴犬表情包", ["表情包"]) is True
+    assert is_sticker_by_summary("一张柴犬表情包", ["截图"]) is False
+    assert is_sticker_by_summary("MEME 风格的猫", ["meme"]) is True
+    assert is_sticker_by_summary("表情包", ()) is False
+    # 关键词按字面匹配，含正则特殊字符不炸
+    assert is_sticker_by_summary("这是 a+b 图", ["a+b"]) is True
+    assert is_sticker_by_summary("这是 axb 图", ["a+b"]) is False
 
 
 # ---------------------------------------------------------------- normalize 判定
@@ -135,7 +147,7 @@ async def _no_ref(_id):
 
 
 async def _normalize(monkeypatch, mode, data_url, *, describe_image=None, assess_image=None):
-    async def fake_download(session, url):
+    async def fake_download(session, url, **_kwargs):
         return data_url
 
     monkeypatch.setattr(norm_mod, "_download_as_data_url", fake_download)
