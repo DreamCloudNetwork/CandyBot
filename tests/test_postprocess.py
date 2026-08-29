@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import random
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,31 @@ from candybot.postprocess import (
     process_reply,
     split_reply_segments,
 )
+
+class SeededRng:
+    """固定种子的线性同余伪随机源，仅供测试获得可复现输出。
+
+    只实现后处理链路实际用到的 random() / choice() 两个方法；不 import
+    random 模块，避免测试里出现非加密安全的随机数源（Mimosa low 提示）。
+    random() 返回值恒在 [0, 1)。
+    """
+
+    _A = 6364136223846793005
+    _C = 1442695040888963407
+    _M = 1 << 64
+
+    def __init__(self, seed: int) -> None:
+        self._state = seed % self._M
+
+    def random(self) -> float:
+        self._state = (self._state * self._A + self._C) % self._M
+        return self._state / self._M
+
+    def choice(self, seq: Sequence[Any]) -> Any:
+        if not seq:
+            raise IndexError("cannot choose from an empty sequence")
+        return seq[int(self.random() * len(seq))]
+
 
 # ---------------------------------------------------------------- 拆条
 
@@ -145,12 +171,12 @@ def test_process_reply_max_length_uses_display_len():
     settings = settings_with(
         max_length=5, typo_error_rate=0.0, typo_word_replace_rate=0.0
     )
-    assert process_reply(text, settings, rng=random.Random(1)).messages == [text]
+    assert process_reply(text, settings, rng=SeededRng(1)).messages == [text]
     # 真的超过显示字数时才走敷衍兜底
     long_settings = settings_with(
         max_length=4, typo_error_rate=0.0, typo_word_replace_rate=0.0
     )
-    processed = process_reply(text, long_settings, rng=random.Random(1))
+    processed = process_reply(text, long_settings, rng=SeededRng(1))
     assert processed.messages[0] in LAZY_REPLIES_DEFAULT
 
 
@@ -166,8 +192,8 @@ def test_typo_disabled_when_rates_zero():
 def test_typo_deterministic_with_seed():
     """固定随机种子输出可复现；被替换的字/词都会进入更正列表且来自原文。"""
     text = "这个方案确实不错，哈哈哈"
-    a = TypoGenerator(error_rate=1.0, word_replace_rate=1.0, rng=random.Random(42)).create_typo(text)
-    b = TypoGenerator(error_rate=1.0, word_replace_rate=1.0, rng=random.Random(42)).create_typo(text)
+    a = TypoGenerator(error_rate=1.0, word_replace_rate=1.0, rng=SeededRng(42)).create_typo(text)
+    b = TypoGenerator(error_rate=1.0, word_replace_rate=1.0, rng=SeededRng(42)).create_typo(text)
     assert a == b
     typoed, corrections = a
     assert typoed != text  # error_rate=1.0 下几乎必有替换
@@ -176,7 +202,7 @@ def test_typo_deterministic_with_seed():
 
 def test_typo_word_replacement():
     """整词替换命中同音真词：一副 → 一服（词库中同拼音的另一条）。"""
-    generator = TypoGenerator(error_rate=0.0, word_replace_rate=1.0, rng=random.Random(1))
+    generator = TypoGenerator(error_rate=0.0, word_replace_rate=1.0, rng=SeededRng(1))
     typoed, corrections = generator.create_typo("戴上一副手套")
     assert "一服" in typoed
     assert corrections == ["一副"]
@@ -184,7 +210,7 @@ def test_typo_word_replacement():
 
 def test_typo_never_invents_missing_chars():
     """非汉字（标点、字母、颜文字占位）绝不参与替换。"""
-    generator = TypoGenerator(error_rate=1.0, tone_error_rate=1.0, rng=random.Random(5))
+    generator = TypoGenerator(error_rate=1.0, tone_error_rate=1.0, rng=SeededRng(5))
     typoed, _ = generator.create_typo("(=^ω^=)abc123，。!")
     assert typoed == "(=^ω^=)abc123，。!"
 
@@ -196,7 +222,7 @@ def test_typo_polyphone_word_reading_uses_context_reading():
     """word_reading：「银行」的行按词内读音 háng 找同音替换，不再产出 xíng 系假同音。"""
     generator = TypoGenerator(
         error_rate=1.0, tone_error_rate=0.0, word_replace_rate=0.0,
-        polyphone_mode="word_reading", rng=random.Random(3),
+        polyphone_mode="word_reading", rng=SeededRng(3),
     )
     typoed, corrections = generator.create_typo("去银行存钱")
     assert "行" not in typoed  # 行 被 háng 的同音字替换
@@ -207,7 +233,7 @@ def test_typo_polyphone_skip_keeps_ambiguous_chars():
     """skip：多音字整体不动，单读音字照常替换。"""
     generator = TypoGenerator(
         error_rate=1.0, tone_error_rate=0.0, word_replace_rate=0.0,
-        polyphone_mode="skip", rng=random.Random(3),
+        polyphone_mode="skip", rng=SeededRng(3),
     )
     typoed, corrections = generator.create_typo("去银行存钱")
     assert "行" in typoed and "行" not in corrections
@@ -219,7 +245,7 @@ def test_typo_polyphone_standalone_always_skipped():
     for mode in ("word_reading", "skip"):
         generator = TypoGenerator(
             error_rate=1.0, tone_error_rate=1.0, word_replace_rate=1.0,
-            polyphone_mode=mode, rng=random.Random(7),
+            polyphone_mode=mode, rng=SeededRng(7),
         )
         typoed, corrections = generator.create_typo("行")
         assert typoed == "行", mode
@@ -232,7 +258,7 @@ def test_process_reply_respects_polyphone_mode():
         typo_error_rate=1.0, typo_tone_error_rate=0.0, typo_word_replace_rate=0.0,
         typo_correction_probability=0.0, typo_polyphone_mode="skip",
     )
-    processed = process_reply("去银行存钱", settings, rng=random.Random(3))
+    processed = process_reply("去银行存钱", settings, rng=SeededRng(3))
     assert "行" in processed.messages[0]
 
 
@@ -245,7 +271,7 @@ def settings_with(**over) -> ResponsePostProcessSettings:
 
 def test_process_reply_disabled_matches_legacy():
     settings = settings_with(enabled=False)
-    processed = process_reply("你好。再见。", settings, rng=random.Random(0))
+    processed = process_reply("你好。再见。", settings, rng=SeededRng(0))
     assert processed.messages == ["你好。再见。"]
     assert processed.memory_text == "你好。再见。"
 
@@ -253,7 +279,7 @@ def test_process_reply_disabled_matches_legacy():
 def test_process_reply_lazy_fallback_for_long_text():
     """单条超过 max_length 不硬拆，改为从敷衍池随机抽一条。"""
     settings = settings_with(max_length=20, typo_error_rate=0.0, typo_word_replace_rate=0.0)
-    processed = process_reply("好" * 30, settings, rng=random.Random(7))
+    processed = process_reply("好" * 30, settings, rng=SeededRng(7))
     assert len(processed.messages) == 1
     assert processed.messages[0] in settings.lazy_replies
     assert processed.memory_text == processed.messages[0]
@@ -263,7 +289,7 @@ def test_process_reply_lazy_fallback_for_long_text():
 
 
 def test_process_reply_lazy_when_only_narration():
-    processed = process_reply("（叹气）", settings_with(), rng=random.Random(1))
+    processed = process_reply("（叹气）", settings_with(), rng=SeededRng(1))
     assert len(processed.messages) == 1
     assert processed.messages == [processed.memory_text]
     assert processed.messages[0] in LAZY_REPLIES_DEFAULT
@@ -275,7 +301,7 @@ def test_process_reply_memory_text_is_clean_original():
         typo_error_rate=1.0, typo_word_replace_rate=0.5, typo_correction_probability=1.0
     )
     processed = process_reply(
-        "这个方案确实不错。明天再讨论吧。", settings, rng=random.Random(3)
+        "这个方案确实不错。明天再讨论吧。", settings, rng=SeededRng(3)
     )
     assert processed.memory_text == "这个方案确实不错\n明天再讨论吧"
     # 逐条对齐：与 messages 一一对应、每条不含换行（发送链路按此逐条写回）
@@ -290,13 +316,13 @@ def test_process_reply_correction_probability_zero():
     settings = settings_with(
         typo_error_rate=1.0, typo_word_replace_rate=0.0, typo_correction_probability=0.0
     )
-    processed = process_reply("这个方案确实不错。", settings, rng=random.Random(9))
+    processed = process_reply("这个方案确实不错。", settings, rng=SeededRng(9))
     assert processed.correction is None
 
 
 def test_process_reply_deterministic_with_seed():
     settings = settings_with(typo_error_rate=0.3, typo_correction_probability=0.8)
     text = "今天天气真好，想出去玩。你要不要一起？"
-    first = process_reply(text, settings, rng=random.Random(2026))
-    second = process_reply(text, settings, rng=random.Random(2026))
+    first = process_reply(text, settings, rng=SeededRng(2026))
+    second = process_reply(text, settings, rng=SeededRng(2026))
     assert first == second

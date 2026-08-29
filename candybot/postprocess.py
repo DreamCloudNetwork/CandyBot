@@ -335,8 +335,8 @@ class TypoGenerator:
         self._tone_error_rate = tone_error_rate
         self._word_replace_rate = word_replace_rate
         self._polyphone_mode = polyphone_mode
-        # 默认加密安全随机源（与 ai.py 的掷点约定一致）；测试可传入
-        # random.Random(seed) 获得可复现输出。
+        # 默认加密安全随机源（与 ai.py 的掷点约定一致）；测试可传入任何
+        # 提供 random()/choice() 的确定性 rng 获得可复现输出。
         self._rng = rng if rng is not None else random.SystemRandom()
 
     @property
