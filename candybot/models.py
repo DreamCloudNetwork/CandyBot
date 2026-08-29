@@ -251,6 +251,20 @@ class GenerationSettings:
     recheck_min_score: int = 5
     # direct 模式下整个历史层最多同时传入的原图张数，超出从最旧的开始摘除
     max_history_images: int = 8
+    # ---- 决策层三项增强（各自关闭时行为与引入前完全一致）----
+    # freshness_check_enabled：发送前新鲜度检查——回复生成期间有明确指向
+    #   bot 的新消息（@我/回复我）时，并入最新上下文重生成一次（至多一次）。
+    freshness_check_enabled: bool = True
+    # observe_band / observe_delay_seconds：观望——终评分落在
+    #   [门槛 - observe_band, 门槛) 且未被护栏直接终止的消息，延迟
+    #   observe_delay_seconds 秒后取届时最新上下文重判一次（每条消息至多
+    #   一次，护栏与配额路径不变）；observe_band=0 关闭。
+    observe_band: int = 2
+    observe_delay_seconds: float = 45.0
+    # repetition_guard_enabled：重复抑制——目标消息之后已有自己的发言且
+    #   对方没再开口时（判定规则见 bot._already_replied_to），在 L4 注入
+    #   「不要和之前的发言重复」的提醒。
+    repetition_guard_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -588,6 +602,20 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError(
             f"配置项 `generation.max_history_images` 不能为负数，实际是 {max_history_images!r}"
         )
+    observe_band = _parse_int(gen_cfg, "observe_band", 2)
+    if not 0 <= observe_band <= 10:
+        raise ValueError(
+            f"配置项 `generation.observe_band` 应在 0~10 之间（0 关闭观望），"
+            f"实际是 {observe_band!r}"
+        )
+    observe_delay_seconds = _parse_float(gen_cfg, "observe_delay_seconds", 45.0)
+    # 观望延时直接喂给 asyncio.sleep：inf/nan 会让任务永久挂起或行为未定，
+    # 与 typing_speed 同口径拒收
+    if not math.isfinite(observe_delay_seconds) or observe_delay_seconds < 0:
+        raise ValueError(
+            "配置项 `generation.observe_delay_seconds` 应为非负有限数字，"
+            f"实际是 {observe_delay_seconds!r}"
+        )
     generation_settings = GenerationSettings(
         reply_max_tokens=_parse_int(gen_cfg, "reply_max_tokens", 500),
         temperature=float(_get(gen_cfg, "temperature", 0.8)),
@@ -600,6 +628,16 @@ def load_settings(cfg: Any) -> Settings:
         ),
         recheck_min_score=recheck_min_score,
         max_history_images=max_history_images,
+        freshness_check_enabled=_parse_bool(
+            gen_cfg.get("freshness_check_enabled", True),
+            "generation.freshness_check_enabled",
+        ),
+        observe_band=observe_band,
+        observe_delay_seconds=observe_delay_seconds,
+        repetition_guard_enabled=_parse_bool(
+            gen_cfg.get("repetition_guard_enabled", True),
+            "generation.repetition_guard_enabled",
+        ),
     )
 
     mm_cfg = _require_section(cfg, "multimodal")

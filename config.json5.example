@@ -81,6 +81,10 @@
         "timeout_seconds": 60,
         "recheck_enabled": true,       // 是否对回复做二次评分（默认 true）
         "recheck_min_score": 5,        // 二次评分低于该值则放弃回复（默认 5）
+        "freshness_check_enabled": true, // 发送前新鲜度检查：生成期间被 @/被回复时并入新上下文重生成一次（默认开）
+        "observe_band": 2,             // 观望带（分）：终评分落在 [门槛-该值, 门槛) 且未被护栏终止时，延迟后重判一次；0 关闭（默认 2）
+        "observe_delay_seconds": 45,   // 观望延迟秒数（默认 45）
+        "repetition_guard_enabled": true, // 重复抑制：同一条消息疑似已被自己回复过时，在指令层注入「不要重复刚才发言」的提醒（默认开）
         "emoji_chance": 0.25,             // 随机附加 emoji 的概率（0~1）
         "emoji_max": 2,                   // 单条回复最多 emoji 数
         "max_history_images": 8,      // 历史中最多携带的图片数（默认 8）

@@ -7,6 +7,17 @@
 连发期间（生成中或打字延迟中）一旦有他人新消息进入记忆，下一条发出前
 会先让 reply 模型对剩余腹稿重想一次：可以放弃、改写或照原样继续，防止
 别人已经插话、AI 却把打好的字一条条硬发完。
+
+决策层另有三项增强（配置都在 generation 段，关闭时行为与引入前一致）：
+
+- 发送前新鲜度检查（freshness_check_enabled）：回复生成期间群里若进了
+  明确指向 bot 的新消息（@我/回复我），把新消息并入上下文重生成一次
+  （每条回复至多一次）；普通新话题不触发——宁可稍旧也不无限拖延。
+- 观望（observe_band / observe_delay_seconds）：终评分差一点点没过门槛
+  且未被护栏直接终止的消息，不再直接放弃，延迟一段时间后连同届时的
+  最新上下文重新走一遍判定（每条消息至多一次，护栏与配额路径不变）。
+- 重复抑制（repetition_guard_enabled）：生成前若发现目标消息之后已有
+  自己的发言且对方没再开口，在 L4 注入「不要和之前的发言重复」的提醒。
 """
 
 from __future__ import annotations
@@ -24,7 +35,7 @@ import aiohttp
 from .ai import AIClient, ImageOp, ReplyDraft, split_image_ops
 from .dedup import MessageDedup
 from .events_server import EventsServer
-from .memory import MemoryManager
+from .memory import GroupMemory, MemoryManager
 from .models import (
     ChatRecord,
     Decision,
@@ -56,6 +67,10 @@ logger = logging.getLogger(__name__)
 # 预算用尽后剩下的腹稿按原计划发完，防止病态刷屏把发送环节变成无限往返。
 _MAX_RECONSIDER_PER_BURST = 2
 
+# 「已观望过」记账的进程内历史上限：只为防同一条消息被反复观望，
+# 长期运行的活跃群里旧条目没有保留价值，超出按 FIFO 遗忘。
+_OBSERVED_HISTORY_MAX = 4096
+
 
 def _verbatim_match(text: str, pending: list[str]) -> bool:
     """重想输出是否与腹稿一字不差（忽略行间空白差异）。
@@ -71,6 +86,80 @@ def _verbatim_match(text: str, pending: list[str]) -> bool:
     return norm(text) == norm("\n".join(pending))
 
 
+def _index_of(records: list[ChatRecord], message_id: int) -> int:
+    """在时间正序的快照里按 message_id 定位记录；找不到返回 -1。"""
+    for i, record in enumerate(records):
+        if record.message_id == message_id:
+            return i
+    return -1
+
+
+def _self_reply_after(
+    records: list[ChatRecord], target_id: int
+) -> tuple[bool, bool]:
+    """目标消息是否还在上下文里、其后是否已有自己的发言。
+
+    返回 (目标存在, 其后有 is_self 记录)。观望到点时据此决定要不要取消
+    重评：连发写回紧跟发送，目标之后出现的 is_self 记录即「已经通过其他
+    路径（@必答/接话等）回复过这一带」的信号——保守取消，避免同一话题被
+    连说两遍。目标不存在（被撤回或被淘汰出热缓存）时同样按取消处理。
+    """
+    index = _index_of(records, target_id)
+    if index < 0:
+        return False, False
+    return True, any(record.is_self for record in records[index + 1 :])
+
+
+def _already_replied_to(records: list[ChatRecord], target: ChatRecord) -> bool:
+    """重复回复判定（重复抑制 / 任务 C）：本次生成是否很可能在重复自己
+    针对同一条消息刚发过的话。
+
+    判定规则（records 为热缓存快照、时间正序，逐条扫描）：
+    1. 目标消息不在快照里（已撤回或被淘汰出热缓存）→ False；
+    2. 目标消息之后没有任何 is_self 记录 → False（还没回过它）；
+    3. 取目标之后最后一条 is_self 记录：若它之后还出现目标发送者
+       （user_id 相同且非 self）的新消息，说明对话已经往前走了 → False；
+    4. 其余情况 → True：自己在这条消息之后发过言、对方也没再开口，
+       此时若再生成，极可能把同一句话说第二遍。
+    """
+    index = _index_of(records, target.message_id)
+    if index < 0:
+        return False
+    after = records[index + 1 :]
+    last_self = -1
+    for i, record in enumerate(after):
+        if record.is_self:
+            last_self = i
+    if last_self < 0:
+        return False
+    return not any(
+        record.user_id == target.user_id and not record.is_self
+        for record in after[last_self + 1 :]
+    )
+
+
+def _directed_new_messages(
+    memory: GroupMemory, runtime: GroupRuntime, seen_ids: set[int]
+) -> list[ChatRecord]:
+    """找出决策基线之后新入记忆、且明确指向 bot（@我/回复我）的他人消息。
+
+    「生成期间新增」以 seen_ids（决策时刻的记忆快照 id 集）为基线，而不是
+    与目标消息比时间戳：决策前已在上下文里的消息模型本来就看得见，不该
+    触发重生成。「指向 bot」取自 GroupRuntime 登记的近期 mentioned_me 消息
+    id（ChatRecord 不携带该信息，_on_event 在 memory.append 的同时登记）。
+    """
+    mentions = set(runtime.recent_mentions)
+    if not mentions:
+        return []
+    return [
+        record
+        for record in memory.tail(len(memory))
+        if not record.is_self
+        and record.message_id not in seen_ids
+        and record.message_id in mentions
+    ]
+
+
 class GroupRuntime:
     """单个群的运行时状态。"""
 
@@ -81,6 +170,11 @@ class GroupRuntime:
         # 近一分钟的群消息时间戳（含 @ 必答的消息，反映真实热闹程度）。
         self.msgs_since_reply: int = 10**9
         self.recent_msg_times: deque[float] = deque()
+        # 近期「明确指向自己」（@我/回复我的消息，即 normalize 的
+        # mentioned_me）的消息 id：ChatRecord 不带这个信息，发送前新鲜度
+        # 检查据此判断生成期间新进的消息是不是在等自己回话。有界即可，
+        # 只需与本轮决策基线之后的新消息做交集。
+        self.recent_mentions: deque[int] = deque(maxlen=256)
         self._static_cache_key: tuple[int, str] | None = None
         self._static_cache: str = ""
         # L2 群印象快照：按 (group_id, 日期) 缓存，天内字节级不变
@@ -157,8 +251,15 @@ class CandyBot:
             secret=settings.bot.event_secret,
         )
         self._runtimes: dict[int, GroupRuntime] = defaultdict(GroupRuntime)
-        self._group_queues: dict[int, asyncio.Queue[NormalizedMessage]] = {}
+        # 队列元素为 (消息, 是否观望重评)：观望到点后把原消息重新入队，
+        # 以 observe=True 复用同一串行队列与判定路径，绝不并发生成
+        self._group_queues: dict[int, asyncio.Queue[tuple[NormalizedMessage, bool]]] = {}
         self._queue_workers: dict[int, asyncio.Task[None]] = {}
+        # 观望的记账：(group_id, message_id) → 未决任务（停机时取消）；
+        # 已观望过的消息 id 集合（每条至多观望一次，防循环），按 FIFO 封顶
+        self._observe_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self._observed_once: set[tuple[int, int]] = set()
+        self._observed_order: deque[tuple[int, int]] = deque()
         self._daily_date: date = date.today()
         self._daily_replies: int = 0
         self._last_self_message_id: int = 0
@@ -199,6 +300,13 @@ class CandyBot:
 
     async def stop(self) -> None:
         self._stopping = True
+        # 未决的观望任务先取消：_observe_task 的取消语义是静默退出，
+        # 取消后不会再向队列投递二次判定
+        observe_tasks = list(self._observe_tasks.values())
+        for task in observe_tasks:
+            task.cancel()
+        if observe_tasks:
+            await asyncio.gather(*observe_tasks, return_exceptions=True)
         workers = list(self._queue_workers.values())
         for task in workers:
             task.cancel()
@@ -321,6 +429,10 @@ class CandyBot:
 
         memory = await self._memory.get(group_id)
         await memory.append(normalized.record)
+        if normalized.mentioned_me:
+            # 新鲜度检查的记账：ChatRecord 不带 mentioned_me，这里登记
+            # 「明确指向自己」的消息 id，供发送前比对生成期间的新消息
+            self._runtimes[group_id].recent_mentions.append(normalized.record.message_id)
         logger.debug("收到消息 %s : %s",group_id,normalized)
         await self._enqueue(group_id, normalized)
 
@@ -354,26 +466,30 @@ class CandyBot:
 
     # ------------------------------------------------------------ 群内串行队列
 
-    async def _enqueue(self, group_id: int, msg: NormalizedMessage) -> None:
+    async def _enqueue(
+        self, group_id: int, msg: NormalizedMessage, *, observe: bool = False
+    ) -> None:
         queue = self._group_queues.get(group_id)
         if queue is None:
-            queue: asyncio.Queue[NormalizedMessage] = asyncio.Queue()
+            queue: asyncio.Queue[tuple[NormalizedMessage, bool]] = asyncio.Queue()
             self._group_queues[group_id] = queue
             self._queue_workers[group_id] = asyncio.create_task(
                 self._group_worker(group_id, queue)
             )
-        await queue.put(msg)
+        await queue.put((msg, observe))
 
     async def _group_worker(
-        self, group_id: int, queue: asyncio.Queue[NormalizedMessage]
+        self,
+        group_id: int,
+        queue: asyncio.Queue[tuple[NormalizedMessage, bool]],
     ) -> None:
         while not self._stopping:
             try:
-                msg = await queue.get()
+                msg, observe = await queue.get()
             except asyncio.CancelledError:
                 return
             try:
-                await self._decide_and_reply(group_id, msg)
+                await self._decide_and_reply(group_id, msg, observe=observe)
             except Exception:
                 logger.exception(
                     "处理群 %d 消息 %d 时出错", group_id, msg.record.message_id
@@ -473,12 +589,21 @@ class CandyBot:
             )
         return expression_hints, jargon_hints
 
-    async def _decide_and_reply(self, group_id: int, msg: NormalizedMessage) -> None:
+    async def _decide_and_reply(
+        self, group_id: int, msg: NormalizedMessage, *, observe: bool = False
+    ) -> None:
+        """对一条消息走完「判定 → 生成 → 发送 → 记账」的完整链路。
+
+        observe=True 表示这是观望到点后的二次处理：护栏与配额路径与首评
+        完全相同（见 _make_decision），但不再安排新的观望。
+        """
         profile = self._settings.profile_for(group_id)
         assert profile is not None
         runtime = self._runtimes[group_id]
 
-        decision = await self._make_decision(group_id, msg, profile, runtime)
+        decision = await self._make_decision(
+            group_id, msg, profile, runtime, observe=observe
+        )
         if not decision.should_reply:
             return
 
@@ -540,6 +665,30 @@ class CandyBot:
         if not reply_text:
             logger.info("群 %d 回复生成为空，放弃发送", group_id)
             return
+        # 发送前新鲜度检查（打断的低成本等价物）：_compose_reply 生成期间
+        # 群里可能又进了明确指向 bot 的新消息（@我/回复我），原稿基于旧
+        # 上下文、可能说的正是那些消息已经回答过的话。此时把新消息并入
+        # 上下文重生成一次（走现有生成与重试路径，每条回复至多一次，
+        # 防止循环）；普通新话题不触发——宁可稍旧也不要无限拖延。
+        if self._settings.generation.freshness_check_enabled:
+            directed = _directed_new_messages(memory, runtime, seen_ids)
+            if directed:
+                logger.info(
+                    "群 %d 生成期间来了 %d 条明确指向自己的新消息（%s），并入最新上下文重生成一次",
+                    group_id,
+                    len(directed),
+                    "、".join(f"{r.nickname}({r.message_id})" for r in directed),
+                )
+                regenerated = await self._compose_reply(
+                    group_id, msg, profile, runtime, decision
+                )
+                if regenerated:
+                    reply_text = regenerated
+                    # 基线刷新到重生成时刻：新消息已进上下文，发送环节不必
+                    # 再把它们当「插话」触发连发重想
+                    seen_ids = {r.message_id for r in memory.tail(len(memory))}
+                else:
+                    logger.warning("群 %d 新鲜度重生成未产出内容，按原稿发送", group_id)
         if not decision.forced and not self._consume_daily_quota():
             logger.info("达到 global_daily_limit，本次主动回复被拦截")
             return
@@ -596,8 +745,22 @@ class CandyBot:
         再生成一次，让召回的原图进入本轮对话。二稿不再重试，保证每条消息
         至多两次生成调用。作为最终防线，正文中任何形似 <drop_img>/<recall_img>
         的残留标记仍会被剥除收编，绝不发进群里。
+
+        生成前先做重复抑制检查（任务 C，repetition_guard_enabled=False 时
+        跳过）：目标消息之后是否已有自己的发言、且对方没再开口（判定规则
+        见 _already_replied_to）。命中时不拦截发送，只在 L4 注入重复提醒，
+        把取舍交给模型。
         """
         memory = await self._memory.get(group_id)
+        repetition = self._settings.generation.repetition_guard_enabled and (
+            _already_replied_to(memory.tail(len(memory)), msg.record)
+        )
+        if repetition:
+            logger.info(
+                "群 %d 消息 %d 之后已有自己的发言，本次生成注入 L4 重复提醒",
+                group_id,
+                msg.record.message_id,
+            )
         for attempt in range(2):
             recent = memory.tail(profile.context_size)
             # 跟随 reply 角色实时的工具调用状态：降级后 L1 守则换回纯文本措辞
@@ -627,6 +790,7 @@ class CandyBot:
                 reason=decision.reason,
                 expression_hints=expression_hints,
                 jargon_hints=jargon_hints,
+                repetition_warning=repetition,
             )
             if draft is None or not draft.text:
                 return None
@@ -665,14 +829,28 @@ class CandyBot:
         return changed
 
     async def _make_decision(
-        self, group_id: int, msg: NormalizedMessage, profile: GroupProfile, runtime: GroupRuntime
+        self,
+        group_id: int,
+        msg: NormalizedMessage,
+        profile: GroupProfile,
+        runtime: GroupRuntime,
+        *,
+        observe: bool = False,
     ) -> Decision:
+        """判定一条消息要不要回。judge 打分 + to_me 识别 + 三道护栏 + 门槛复核。
+
+        observe=True 是观望到点后的二次判定：复用完全相同的护栏与配额路径，
+        只去掉两处差异——消息到达时的记账不做第二遍（同一条消息不重复计入
+        发言间隔与热闹统计），以及不再为它安排新的观望（每条消息至多一次）。
+        """
         # 结构性护栏的记账先于一切判断：即使消息最终不触发回复，
-        # 也要计入间隔与热闹统计
-        runtime.msgs_since_reply += 1
+        # 也要计入间隔与热闹统计。观望的二次判定是 45 秒前的旧消息：
+        # 不重复记账，但过期时间戳照常清理（热闹程度按当下流量判定）。
         now = time.time()
         window = runtime.recent_msg_times
-        window.append(now)
+        if not observe:
+            runtime.msgs_since_reply += 1
+            window.append(now)
         while window and window[0] < now - 60.0:
             window.popleft()
 
@@ -777,6 +955,10 @@ class CandyBot:
                 )
             except Exception as exc:
                 logger.warning("群 %d judge 复核失败，按首评不达标处理：%s", group_id, exc)
+                # 复核失败时手里的终评仍是首评：按首评分数决定是否观望
+                self._schedule_observe(
+                    group_id, msg, profile, runtime, verdict.score, observe
+                )
             else:
                 logger.info(
                     "群 %d 回复复核 首评 %d → 复评 %d/阈值 %d%s：%s",
@@ -793,6 +975,9 @@ class CandyBot:
                         score=rechecked.score,
                         reason=rechecked.reason,
                     )
+                self._schedule_observe(
+                    group_id, msg, profile, runtime, rechecked.score, observe
+                )
                 return Decision(
                     should_reply=False,
                     score=rechecked.score,
@@ -803,7 +988,93 @@ class CandyBot:
             return Decision(
                 should_reply=True, score=verdict.score, reason=verdict.reason
             )
+        self._schedule_observe(group_id, msg, profile, runtime, verdict.score, observe)
         return Decision(should_reply=False, score=verdict.score, reason=verdict.reason)
+
+    def _schedule_observe(
+        self,
+        group_id: int,
+        msg: NormalizedMessage,
+        profile: GroupProfile,
+        runtime: GroupRuntime,
+        score: int | None,
+        observe: bool,
+    ) -> None:
+        """观望（wait 的低成本等价物）：差一点点没过门槛的消息先看一会儿再说。
+
+        触发条件（缺一不可）：
+
+        - 终评分（含复评后的最终分数）落在 [门槛 - observe_band, 门槛) 的
+          观望带内；observe_band=0 整体关闭；
+        - 未被护栏（冷却/发言间隔/热闹静默）直接终止——本方法只在护栏
+          检查全部通过、纯因分数不达标而静默的路径上被调用；
+        - 该消息（(group_id, message_id) 记账）从未被观望过——二次判定
+          仍差一点也不会再安排第三次，杜绝观望循环；
+        - 不是观望的二次处理（observe=True 时永不再安排）。
+
+        到点后经 _observe_task 把原消息重新投进该群的串行队列，取届时
+        最新的上下文再走一遍完全相同的判定与护栏路径。
+        """
+        gen = self._settings.generation
+        if observe or gen.observe_band <= 0 or score is None:
+            return
+        threshold = profile.proactivity_threshold
+        if not threshold - gen.observe_band <= score < threshold:
+            return
+        key = (group_id, msg.record.message_id)
+        if key in self._observed_once:
+            return
+        self._observed_once.add(key)
+        self._observed_order.append(key)
+        while len(self._observed_order) > _OBSERVED_HISTORY_MAX:
+            self._observed_once.discard(self._observed_order.popleft())
+        logger.info(
+            "群 %d 消息 %d 终评 %d 差一点点没过门槛 %d，安排 %.0f 秒后观望重评",
+            group_id,
+            msg.record.message_id,
+            score,
+            threshold,
+            gen.observe_delay_seconds,
+        )
+        task = asyncio.create_task(
+            self._observe_task(group_id, msg),
+            name=f"observe-{group_id}-{msg.record.message_id}",
+        )
+        self._observe_tasks[key] = task
+        task.add_done_callback(lambda _t, k=key: self._observe_tasks.pop(k, None))
+
+    async def _observe_task(self, group_id: int, msg: NormalizedMessage) -> None:
+        """观望任务的延时体：到点检查取消条件，满足则重新入队二次判定。"""
+        message_id = msg.record.message_id
+        try:
+            await asyncio.sleep(self._settings.generation.observe_delay_seconds)
+            if self._stopping:
+                return
+            memory = await self._memory.get(group_id)
+            exists, answered = _self_reply_after(
+                memory.tail(len(memory)), message_id
+            )
+            if not exists:
+                logger.info(
+                    "群 %d 消息 %d 观望期间已不在上下文（撤回或被淘汰），取消重评",
+                    group_id,
+                    message_id,
+                )
+                return
+            if answered:
+                logger.info(
+                    "群 %d 消息 %d 观望期间已通过其他路径回复，取消重评",
+                    group_id,
+                    message_id,
+                )
+                return
+            logger.info(
+                "群 %d 消息 %d 观望到点，取最新上下文重新判定", group_id, message_id
+            )
+            await self._enqueue(group_id, msg, observe=True)
+        except asyncio.CancelledError:
+            # 停机或消息已被处理：观望静默作废，不报错也不二次判定
+            logger.debug("群 %d 消息 %d 的观望任务已取消", group_id, message_id)
 
     # ------------------------------------------------------------ 重试包装
 

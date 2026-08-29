@@ -9,7 +9,7 @@ L2 system·状态层   群号、上下文昵称表、今天的日期、最近 N 
 L3 历史层          只追加、从头整块淘汰的群聊记录，映射为连续 user/assistant
                    （direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
 L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分、学习注入的
-                   表达/黑话参考）与本次指令。
+                   表达/黑话参考、重复回复提醒）与本次指令。
 
 任何时刻都不得把易变字段（秒级时间、计数、分数）塞进 L1/L2，也不得重排或
 重新格式化历史消息——否则其后的缓存全部失效。
@@ -358,6 +358,11 @@ def jargon_hint_block(hints: Sequence[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def repetition_warning_block() -> str:
+    """L4 重复提醒块：判定本次很可能是在重复自己刚发过的话时注入。"""
+    return "【重复提醒】你刚刚已经回复过这条消息，不要和之前的发言重复。"
+
+
 def final_user_prompt_reply(
     now_text: str,
     current_message: ChatRecord,
@@ -369,11 +374,16 @@ def final_user_prompt_reply(
     via_tool: bool = True,
     expression_hints: Sequence[tuple[str, str]] = (),
     jargon_hints: Sequence[tuple[str, str]] = (),
+    repetition_warning: bool = False,
 ) -> str:
-    """L4(reply)：触发原因说明 + 表达/黑话参考（可选） + 回复指令。
+    """L4(reply)：触发原因说明 + 表达/黑话参考（可选） + 重复提醒（可选） + 回复指令。
 
     expression_hints / jargon_hints 是每次回复都可能变化的易变信息，
     只进 L4；两者都为空时输出与引入学习机制之前字节级一致。
+
+    repetition_warning=True 时（bot 层判定目标消息之后已有自己的发言、
+    对方也没再开口，见 bot._already_replied_to）在【需要回应的消息】之后
+    注入一段重复提醒；False 时输出与引入前字节级一致。
     """
     sender = record_label(current_message)
     body = current_message.text or "[图片]"
@@ -398,6 +408,8 @@ def final_user_prompt_reply(
     else:
         tail = "现在以你的身份说一句自然的回应。只输出群聊正文，不要任何额外内容。"
     parts = [f"【当前时间】{now_text}\n{why}\n【需要回应的消息】来自 {sender}：\n{body}"]
+    if repetition_warning:
+        parts.append(repetition_warning_block())
     if expression_hints:
         parts.append(expression_hint_block(expression_hints))
     if jargon_hints:

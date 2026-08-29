@@ -111,7 +111,8 @@ class FakeAI:
     async def generate_reply(self, static_system, runtime_system, recent,
                              current_message, now_text, *, forced=False,
                              engaged=False, score=None, reason="",
-                             expression_hints=(), jargon_hints=()):
+                             expression_hints=(), jargon_hints=(),
+                             repetition_warning=False):
         self.reply_calls.append({
             "static_system": static_system,
             "runtime_system": runtime_system,
@@ -122,6 +123,7 @@ class FakeAI:
             "score": score,
             "expression_hints": list(expression_hints),
             "jargon_hints": list(jargon_hints),
+            "repetition_warning": repetition_warning,
         })
         return ReplyDraft("哈哈确实")
 

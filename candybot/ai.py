@@ -579,6 +579,7 @@ class AIClient:
         reason: str = "",
         expression_hints: Sequence[tuple[str, str]] = (),
         jargon_hints: Sequence[tuple[str, str]] = (),
+        repetition_warning: bool = False,
     ) -> ReplyDraft | None:
         """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。
 
@@ -587,7 +588,8 @@ class AIClient:
 
         expression_hints / jargon_hints 为学习机制产出的注入条目（见
         prompts.final_user_prompt_reply），属于每次回复都可变的易变信息，
-        只进 L4 指令层。
+        只进 L4 指令层。repetition_warning 同理：bot 层判定很可能在重复
+        刚才的发言时为 True，L4 注入重复提醒。
         """
         return await self._reply_call(
             static_system,
@@ -604,6 +606,7 @@ class AIClient:
                 via_tool=via_tool,
                 expression_hints=expression_hints,
                 jargon_hints=jargon_hints,
+                repetition_warning=repetition_warning,
             ),
         )
 

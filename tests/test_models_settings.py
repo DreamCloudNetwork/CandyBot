@@ -243,6 +243,50 @@ def test_generation_recheck_validation():
         load_settings(DictCfg(base_cfg(generation={"recheck_enabled": "yes"})))
 
 
+def test_generation_decision_layers_defaults():
+    """新鲜度检查 / 观望 / 重复抑制：键缺失时全部走默认值且默认开启。"""
+    s = load_settings(DictCfg(base_cfg()))
+    g = s.generation
+    assert g.freshness_check_enabled is True
+    assert g.observe_band == 2
+    assert g.observe_delay_seconds == 45.0
+    assert g.repetition_guard_enabled is True
+
+
+def test_generation_decision_layers_custom_values():
+    cfg = base_cfg(
+        generation={
+            "freshness_check_enabled": False,
+            "observe_band": 0,               # 0 = 关闭观望
+            "observe_delay_seconds": 5.5,
+            "repetition_guard_enabled": False,
+        }
+    )
+    s = load_settings(DictCfg(cfg))
+    g = s.generation
+    assert g.freshness_check_enabled is False
+    assert g.observe_band == 0
+    assert g.observe_delay_seconds == 5.5
+    assert g.repetition_guard_enabled is False
+
+
+def test_generation_decision_layers_validation():
+    for bad in (
+        {"observe_band": -1},
+        {"observe_band": 11},
+        {"observe_band": "wide"},
+        # 观望延时喂给 asyncio.sleep：inf/nan 会挂死或行为未定，负数非法
+        {"observe_delay_seconds": float("inf")},
+        {"observe_delay_seconds": float("nan")},
+        {"observe_delay_seconds": -0.1},
+        {"observe_delay_seconds": "45s"},
+        {"freshness_check_enabled": "yes"},
+        {"repetition_guard_enabled": 1},
+    ):
+        with pytest.raises(ValueError):
+            load_settings(DictCfg(base_cfg(generation=bad)))
+
+
 # ---------------------------------------------------------------- 存储
 
 
