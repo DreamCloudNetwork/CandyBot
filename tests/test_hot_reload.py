@@ -167,7 +167,6 @@ def _cfg_dict(tmp_path, persona: str) -> dict:
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
         "response_post_process": {"enabled": False},

@@ -355,7 +355,7 @@ class CandyBot:
                     self._settings.bot.self_qq,
                 )
         else:
-            logger.info("未能查询登录账号（read 权限或 action 缺失），跳过自检")
+            logger.info("未能查询登录账号（action 缺失或鉴权失败），跳过自检")
         await self._server.start()
 
     async def stop(self) -> None:
@@ -388,13 +388,13 @@ class CandyBot:
         """重新解析 config.json5 并原子替换运行时配置（热重载入口）。
 
         由 main.py 经 loop.call_soon_threadsafe 调度到事件循环线程调用，与
-        消息处理天然串行，无需额外加锁。启动时已烘进监听/子进程会话的字段
+        消息处理天然串行，无需额外加锁。启动时已烘进监听/客户端会话的字段
         无法就地更换、改动仍需重启：bot.listen_host / listen_port /
         event_secret / max_event_body_bytes（aiohttp 监听与签名校验、请求体
-        上限已绑定）、bot.data_dir、snowluma 的会话类字段（mcp_command /
-        mcp_args / endpoint / api_key / mode / timeout_ms /
-        allow_private_endpoint，MCP 子进程会话；但 send_max_attempts /
-        send_retry_delay_seconds 是发送时现读，即时生效）；热缓存容量也在
+        上限已绑定）、bot.data_dir、snowluma 的连接类字段（endpoint /
+        api_key / timeout_ms / allow_private_endpoint，HTTP 客户端会话建好；
+        但 send_max_attempts / send_retry_delay_seconds 是发送时现读，
+        即时生效）；热缓存容量也在
         启动时按全局最大 context_size 定死（新配置超出时记警告）。其余
         （白名单、人设与 bot.self_nickname、护栏阈值、模型与生成参数、
         多模态、输出后处理、限速、图片保留天数、表情包识别启发式）

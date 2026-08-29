@@ -3,7 +3,7 @@
 一个通过 SnowLuma 参与 QQ 群聊讨论的 AI 机器人。
 
 - **收消息**：SnowLuma 通过 OneBot v11 HTTP POST 把事件上报到 CandyBot 内置的 aiohttp 服务；
-- **发消息**：全部经由 SnowLuma 的 MCP server（stdio 启动 `@snowluma/mcp`，write 模式 `invoke_action("send_group_msg")`）；
+- **发消息**：直接调用 SnowLuma 的 OneBot v11 兼容 HTTP API（`POST {endpoint}/send_group_msg` 等，请求体为 JSON 参数、响应为标准 OneBot 信封；accessToken 以 `Authorization: Bearer` 头携带）；
 - **大脑**：OpenAI 兼容 API。`judge` 模型逐条评估「是否值得回复这条消息」打 0-10 分，超过阈值才插话，并同时识别「这条消息是否在和我说话」（对话中的追问不受冷却限制）；@机器人/回复机器人必答，由 `reply` 模型生成回复；可选 `vision` 模型把图片转成文字描述；`learning` 模型（默认继承 `judge`）在后台总结每日群印象、学习群友的表达与黑话。
 - **命令插件**：以 `/` 开头且命令名命中注册表的消息不走大模型，按 unix 终端命令风格解析参数后调用插件（`plugins/` 目录放一个 .py 即自动加载），插件返回的消息原样发到群里；未知 `/命令` 照常交给大模型。详见下文「命令插件系统」。
 
@@ -21,8 +21,7 @@ uv run main.py                   # 启动
 2. 在 SnowLuma WebUI 的「网络适配器」里：
    - **HTTP 服务端**已启用（默认 http://127.0.0.1:3000/ ），记下 accessToken；
    - **HTTP 上报（client）** 新增一条，URL 填 http://127.0.0.1:5700/onebot/event ，勾选消息事件。
-3. Node.js ≥ 22（MCP 子进程需要）。
-4. 编辑 `config.json5`（JSON5 格式，支持 `//` 注释；见下文逐项说明），至少改掉 `bot.self_qq`、`ai_backend.api_key`、`snowluma.api_key`，并把要服务的群号写进 `groups` 且 `enabled: true`。
+3. 编辑 `config.json5`（JSON5 格式，支持 `//` 注释；见下文逐项说明），至少改掉 `bot.self_qq`、`ai_backend.api_key`、`snowluma.api_key`，并把要服务的群号写进 `groups` 且 `enabled: true`。
 
 ## 配置项说明（config.json5）
 
@@ -91,10 +90,8 @@ uv run main.py                   # 启动
 |                       | typo_correction_probability                                        | 出现错字后追加一条「＊正确词」更正消息的概率（默认 0.5）。更正经 OneBot v11 reply 消息段引用最后一条正文发送（响应无 message_id 时退回无引用纯文本并记警告）。更正只面向群友：写回记忆的是无错字原文，错别字不进入 L3 历史                                                                                 |
 |                       | lazy_replies                                                       | 敷衍池（默认 呃呃/不晓得/懒得说/不知道/emm）：回复过长或清洗后无内容时随机抽一条代替发送                                                                                                                                                                                                                   |
 |                       | typing_cjk_seconds / typing_latin_seconds / typing_special_seconds / typing_single_multiplier / max_typing_delay_seconds | 打字延迟的单字耗时模型（默认 0.3 / 0.15 / 1.0 秒、单字回复 3 倍、单条封顶 60 秒）：中文全角每字、半角每字、emoji/颜文字每块的估算耗时，总时长再乘 typing_speed |
-| snowluma              | mcp_command / mcp_args                                             | MCP server 启动命令（默认 npx -y @snowluma/mcp）                                                                                                                                                                                                                                                           |
-|                       | endpoint                                                           | SnowLuma OneBot HTTP 端点；**允许私网需显式设置 allow_private_endpoint=true**                                                                                                                                                                                                                              |
-|                       | api_key                                                            | accessToken，作为 Bearer token 传给 MCP                                                                                                                                                                                                                                                                    |
-|                       | mode                                                               | 必须 `"write"`，否则无法发言                                                                                                                                                                                                                                                                               |
+| snowluma              | endpoint                                                           | SnowLuma OneBot v11 兼容 HTTP API 基址（每个 action 走 `POST {endpoint}/{action}`）；**允许私网需显式设置 allow_private_endpoint=true**                                                                                                                                                                                                                              |
+|                       | api_key                                                            | accessToken，作为 `Authorization: Bearer` 头随每个 HTTP 请求发送；留空则不带鉴权头                                                                                                                                                                                                                                                                    |
 |                       | send_max_attempts / send_retry_delay_seconds                       | 发送重试（默认 3 次尝试 / 首次退避 1.5 秒，逐次 ×2）：发送时现读，改完即时生效（不同于本段其余字段需重启）                                                                                                                                                                                                |
 
 机器人昵称由 `bot.self_nickname` 配置（默认「糖糖」）：自发言写回记忆的昵称与 @/回复占位文本都用它，若 persona 里另取了名字，把这里改成一致即可（改完即时生效）。
@@ -104,7 +101,7 @@ uv run main.py                   # 启动
 程序监听 `config.json5` 所在目录（而非文件本身，编辑器原子保存会替换 inode、单文件 watch 会静默失效），保存后自动重新解析并替换运行时配置，日志出现「配置文件被修改，正在重载」即成功；配置写坏时完整记录解析错误并沿用旧配置继续运行，修好再保存自动恢复（替换动作在事件循环线程上执行，与消息处理串行）。
 
 - **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning`；已缓存的 L2 印象快照当天不刷新，次日按新配置重建）、`stickers`（含识别启发式参数）、`plugins.enabled` / `plugins.timeout_seconds`、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
-- **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret` / `bot.max_event_body_bytes`（aiohttp 监听与签名校验、请求体上限在启动时已绑定）、`bot.data_dir`、`plugins.dir` 与插件文件本身（命令注册表在构建期装载，新增/修改/删除 `plugins/` 下的插件需重启机器人生效）、`snowluma` 的会话类字段（`mcp_command` / `mcp_args` / `endpoint` / `api_key` / `mode` / `timeout_ms` / `allow_private_endpoint`，MCP 子进程会话）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
+- **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret` / `bot.max_event_body_bytes`（aiohttp 监听与签名校验、请求体上限在启动时已绑定）、`bot.data_dir`、`plugins.dir` 与插件文件本身（命令注册表在构建期装载，新增/修改/删除 `plugins/` 下的插件需重启机器人生效）、`snowluma` 的连接类字段（`endpoint` / `api_key` / `timeout_ms` / `allow_private_endpoint`，HTTP 客户端会话在启动时建好）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
 
 ## 行为逻辑
 
@@ -247,7 +244,7 @@ async def hello(ctx):
    ```bash
    uv run main.py
    ```
-   日志应依次出现：「SnowLuma MCP 会话已建立」→ 工具列表含 `invoke_action` → 「事件服务已启动」→ 「CandyBot 已就绪」。若报配置错误按提示改 config.json5。
+   日志应依次出现：「SnowLuma HTTP 客户端已启动」→「SnowLuma HTTP 连接正常」→ 「事件服务已启动」→ 「CandyBot 已就绪」。若报配置错误按提示改 config.json5。
 
 2. **@必答**：在白名单群里 @机器人 说一句话 → 几秒内收到回复，日志无「兴趣评分」行（judge 未被调用）。
 
@@ -303,4 +300,4 @@ uv run pytest -k names  # 单测命名过滤
 
 配置错误（非法级别名）会在启动时直接报错，便于及时发现。
 
-模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `events_server.py`(aiohttp 接收) · `snowluma.py`(MCP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类 prompt) · `ai.py`(LLM 四角色：judge/reply/vision/learning) · `learning.py`(后台学习：每日群印象/表达/黑话) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包最小版：识别启发式+收集/上限替换/跟发) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。
+模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `events_server.py`(aiohttp 接收) · `snowluma.py`(HTTP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类 prompt) · `ai.py`(LLM 四角色：judge/reply/vision/learning) · `learning.py`(后台学习：每日群印象/表达/黑话) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包最小版：识别启发式+收集/上限替换/跟发) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。

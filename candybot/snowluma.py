@@ -1,26 +1,23 @@
-"""SnowLuma MCP 客户端封装。
+"""SnowLuma HTTP 客户端封装。
 
-通过 stdio 启动 ``@snowluma/mcp`` 子进程并保持长会话；发消息走 write 模式
-的 ``invoke_action`` 工具（封装 OneBot v11 的 send_group_msg）。
+直接调用 SnowLuma 的 OneBot v11 兼容 HTTP API（文档：
+https://snowluma.github.io/api/index.html ）：每个 action 通过
+``POST {endpoint}/{action}`` 调用，请求体为 JSON 参数，响应为标准
+OneBot 信封；api_key 非空时以 ``Authorization: Bearer`` 头携带。
 send_group_msg 支持纯文本与 OneBot v11 消息段数组（如 reply 引用段），
 并从响应中解出 message_id 供引用更正使用。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import re
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import aiohttp
 
 from .models import SnowlumaSettings
 
 logger = logging.getLogger(__name__)
-
-_SEND_GROUP_MSG_RE = re.compile(r"send[_-]?group[_-]?msg|group.*send.*message", re.I)
 
 
 def _text_segments(message: str | list[dict]) -> list[dict]:
@@ -30,26 +27,20 @@ def _text_segments(message: str | list[dict]) -> list[dict]:
     return message
 
 
-def _send_params(action: str, group_id: int, segments: list[dict]) -> dict:
-    return {
-        "action": action,
-        "params": {"group_id": group_id, "message": segments},
-    }
-
-
-def _raise_for_failed_response(payload: object) -> None:
-    """按 OneBot 信封判定逻辑失败：SnowLuma MCP 对 retcode≠0 不报 MCP 错误，
-    而是把完整响应当数据返回。不检查 retcode 会把发送失败当成功，
-    后续拿不到 message_id 的引用更正也会静默丢失。"""
-    if isinstance(payload, dict):
-        envelope = payload.get("data") if "retcode" not in payload else payload
-        if isinstance(envelope, dict) and envelope.get("retcode", 0) != 0:
-            raise SnowlumaError(
-                "发送群消息失败："
-                f"retcode={envelope.get('retcode')!r} "
-                f"wording={envelope.get('wording')!r} "
-                f"status={envelope.get('status')!r}"
-            )
+def _raise_for_failed_response(envelope: object) -> None:
+    """按 OneBot 信封判定逻辑失败：retcode≠0 时 SnowLuma 仍返回 HTTP 200，
+    不检查会把发送失败当成功，后续拿不到 message_id 的引用更正也会静默丢失。"""
+    if (
+        isinstance(envelope, dict)
+        and "retcode" in envelope
+        and envelope.get("retcode", 0) != 0
+    ):
+        raise SnowlumaError(
+            "发送群消息失败："
+            f"retcode={envelope.get('retcode')!r} "
+            f"wording={envelope.get('wording')!r} "
+            f"status={envelope.get('status')!r}"
+        )
 
 
 def _extract_message_id(payload: object) -> int | None:
@@ -65,101 +56,80 @@ def _extract_message_id(payload: object) -> int | None:
 
 
 class SnowlumaError(RuntimeError):
-    """SnowLuma 调用层错误（业务失败或工具缺失）。"""
+    """SnowLuma 调用层错误（HTTP 失败或业务 retcode≠0）。"""
 
 
 class SnowlumaClient:
-    """管理一个 stdio MCP 会话的完整生命周期。"""
+    """管理到 SnowLuma HTTP API 的 aiohttp 会话的完整生命周期。"""
 
     def __init__(self, settings: SnowlumaSettings):
         self._settings = settings
-        self._transport = None
-        self._session: ClientSession | None = None
-        self._send_tool_lock = asyncio.Lock()
-        self._resolved_send_action: str | None = None
+        # endpoint 补尾部 '/'，让 action 以相对路径拼在其后（含路径前缀的部署也能对上）
+        endpoint = settings.endpoint
+        self._base_url = endpoint if endpoint.endswith("/") else endpoint + "/"
+        self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------ 生命周期
 
     async def start(self) -> None:
         s = self._settings
-        env: dict[str, str] = {
-            "SNOWLUMA_MCP_ENDPOINT": s.endpoint,
-            "SNOWLUMA_MCP_MODE": s.mode,
-            "SNOWLUMA_MCP_TIMEOUT_MS": str(s.timeout_ms),
-        }
+        timeout = aiohttp.ClientTimeout(total=max(s.timeout_ms / 1000.0, 5.0))
+        headers: dict[str, str] = {"Content-Type": "application/json"}
         if s.api_key:
-            env["SNOWLUMA_MCP_TOKEN"] = s.api_key
-        params = StdioServerParameters(
-            command=s.mcp_command, args=list(s.mcp_args), env=env
-        )
-        logger.info("正在启动 SnowLuma MCP：%s %s → %s", s.mcp_command, " ".join(s.mcp_args), s.endpoint)
-        self._transport = stdio_client(params)
-        try:
-            read_stream, write_stream = await self._transport.__aenter__()
-        except Exception:
-            self._transport = None
-            raise
-        try:
-            self._session = ClientSession(read_stream, write_stream)
-            await self._session.__aenter__()
-            await self._session.initialize()
-        except Exception:
-            await self.stop()
-            raise
-        logger.info("SnowLuma MCP 会话已建立")
+            headers["Authorization"] = f"Bearer {s.api_key}"
+        self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
+        logger.info("SnowLuma HTTP 客户端已启动 → %s", s.endpoint)
 
     async def stop(self) -> None:
         session, self._session = self._session, None
         if session is not None:
             try:
-                await session.__aexit__(None, None, None)
+                await session.close()
             except Exception as exc:
-                logger.warning("关闭 MCP 会话出错（忽略）：%s", exc)
-        transport, self._transport = self._transport, None
-        if transport is not None:
-            try:
-                await transport.__aexit__(None, None, None)
-            except Exception as exc:
-                logger.warning("关闭 MCP 传输出错（忽略）：%s", exc)
+                logger.warning("关闭 HTTP 会话出错（忽略）：%s", exc)
 
-    # ------------------------------------------------------------ 工具调用
+    # ------------------------------------------------------------ action 调用
 
-    async def _list_tool_names(self) -> list[str]:
-        assert self._session is not None
-        result = await self._session.list_tools()
-        return [tool.name for tool in result.tools]
+    async def call_action(self, action: str, **params) -> dict:
+        """POST {endpoint}/{action}，请求体为 params，返回解析后的 OneBot 信封。
 
-    async def _call_tool_json(self, name: str, arguments: dict) -> tuple[bool, object]:
-        """调用工具，返回 (is_error, 解析后的 JSON 或原始文本)。"""
-        assert self._session is not None
-        timeout = max(self._settings.timeout_ms / 1000.0, 5.0)
-        result = await self._session.call_tool(name, arguments, read_timeout_seconds=timeout)
-        texts: list[str] = []
-        for block in result.content:
-            text = getattr(block, "text", None)
-            if isinstance(text, str):
-                texts.append(text)
-        payload: object
-        if result.structured_content is not None:
-            payload = result.structured_content
-        elif len(texts) == 1:
-            try:
-                payload = json.loads(texts[0])
-            except ValueError:
-                payload = texts[0]
-        else:
-            payload = "\n".join(texts)
-        return bool(result.is_error), payload
+        HTTP 层失败（连接错误、非 2xx）与响应不是 JSON 对象都抛
+        SnowlumaError；retcode 判定留给调用方（见 _raise_for_failed_response）。
+        """
+        if self._session is None:
+            raise SnowlumaError("SnowLuma HTTP 客户端尚未启动")
+        url = self._base_url + action
+        try:
+            async with self._session.post(url, json=params) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise SnowlumaError(
+                        f"{action} 返回 HTTP {resp.status}：{text[:200]!r}"
+                    )
+        except SnowlumaError:
+            raise
+        except aiohttp.ClientError as exc:
+            raise SnowlumaError(f"{action} 请求失败：{exc}") from exc
+        try:
+            envelope = json.loads(text)
+        except ValueError:
+            raise SnowlumaError(f"{action} 响应不是 JSON：{text[:200]!r}") from None
+        if not isinstance(envelope, dict):
+            raise SnowlumaError(f"{action} 响应不是 JSON 对象：{envelope!r}")
+        return envelope
 
     async def probe(self) -> None:
-        """探活：确认工具目录可读、invoke_action 可用且处于 write 模式。"""
-        names = await self._list_tool_names()
-        logger.info("SnowLuma MCP 提供工具：%s", ", ".join(names))
-        if "invoke_action" not in names:
+        """探活：确认 HTTP 端点可达、鉴权通过（get_version_info 返回 retcode=0）。"""
+        envelope = await self.call_action("get_version_info")
+        retcode = envelope.get("retcode", 0)
+        if retcode != 0:
             raise SnowlumaError(
-                f"MCP 工具列表中缺少 invoke_action（当前：{names}）；"
-                '请把 snowluma.mode 设为 "write"'
+                f"SnowLuma 探活失败：retcode={retcode!r} "
+                f"wording={envelope.get('wording')!r}"
             )
+        data = envelope.get("data")
+        version = data.get("version") if isinstance(data, dict) else None
+        logger.info("SnowLuma HTTP 连接正常（version=%r）", version)
 
     async def send_group_msg(
         self, group_id: int, message: str | list[dict]
@@ -168,55 +138,24 @@ class SnowlumaClient:
 
         message 可以是纯文本（包成单个 text 段，内容按字面发送、不解析 CQ
         码），也可以是 OneBot v11 消息段数组（如 [{"type": "reply", ...}]
-        引用段）；unknown action 时自动从目录模糊匹配一次。
+        引用段）。
         """
         segments = _text_segments(message)
-        action = self._resolved_send_action or "send_group_msg"
-        params = _send_params(action, group_id, segments)
-        try:
-            is_error, payload = await self._call_tool_json("invoke_action", params)
-        except Exception as exc:
-            detail = str(exc).lower()
-            if not ("unknown" in detail and "action" in detail):
-                raise
-            is_error, payload = await self._retry_with_fuzzy_action(group_id, segments)
-        _raise_for_failed_response(payload)
-        if is_error:
-            raise SnowlumaError(f"发送群消息被拒绝：{payload!r}")
-        logger.info("已发送群消息到 %d，响应：%r", group_id, payload)
-        return _extract_message_id(payload)
-
-    async def _retry_with_fuzzy_action(
-        self, group_id: int, segments: list[dict]
-    ) -> tuple[bool, object]:
-        async with self._send_tool_lock:
-            if self._resolved_send_action:
-                params = _send_params(
-                    self._resolved_send_action, group_id, segments
-                )
-                return await self._call_tool_json("invoke_action", params)
-            names = await self._list_tool_names()
-            matches = [n for n in names if _SEND_GROUP_MSG_RE.search(n)]
-            if not matches:
-                raise SnowlumaError(f"目录中找不到任何发消息 action（工具：{names}）")
-            chosen = sorted(matches)[0]
-            logger.warning("send_group_msg 不存在，改用目录匹配到的 %r", chosen)
-            self._resolved_send_action = chosen
-            params = _send_params(chosen, group_id, segments)
-            return await self._call_tool_json("invoke_action", params)
+        envelope = await self.call_action(
+            "send_group_msg", group_id=group_id, message=segments
+        )
+        _raise_for_failed_response(envelope)
+        logger.info("已发送群消息到 %d，响应：%r", group_id, envelope)
+        return _extract_message_id(envelope)
 
     async def query_login_info(self) -> dict | None:
-        """只读查询登录账号（read 模式也可用）；失败返回 None 不影响启动。"""
-        for action in ("get_login_info",):
-            try:
-                is_error, payload = await self._call_tool_json(
-                    "query_action", {"action": action}
-                )
-            except Exception as exc:
-                logger.debug("query_action(%s) 失败：%s", action, exc)
-                continue
-            if not is_error and isinstance(payload, dict):
-                data = payload.get("data", payload)
-                if isinstance(data, dict):
-                    return data
-        return None
+        """只读查询登录账号；失败返回 None 不影响启动。"""
+        try:
+            envelope = await self.call_action("get_login_info")
+        except Exception as exc:
+            logger.debug("get_login_info 失败：%s", exc)
+            return None
+        if envelope.get("retcode", 0) != 0:
+            return None
+        data = envelope.get("data")
+        return data if isinstance(data, dict) else None

@@ -33,7 +33,6 @@ def base_cfg(**over):
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
             "api_key": "t",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
     }
@@ -62,7 +61,6 @@ def test_load_settings_full():
     assert s.bot.self_qq == 99
     assert s.groups_default.persona == "测试人设"
     assert s.snowluma.allow_private_endpoint is True
-    assert s.snowluma.mode == "write"
     assert s.multimodal.mode == "placeholder"
     assert s.rate_limit.global_daily_limit is None
 
@@ -146,12 +144,6 @@ def test_whitelist_empty_and_default_disabled_blocks_everything():
 def test_missing_section_raises():
     cfg = base_cfg()
     del cfg["models"]
-    with pytest.raises(ValueError):
-        load_settings(DictCfg(cfg))
-
-
-def test_mode_read_rejected():
-    cfg = base_cfg(snowluma={"mode": "read", "endpoint": "http://example.com/"})
     with pytest.raises(ValueError):
         load_settings(DictCfg(cfg))
 

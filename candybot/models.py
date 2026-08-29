@@ -481,11 +481,10 @@ class PluginSettings:
 
 @dataclass(frozen=True)
 class SnowlumaSettings:
-    mcp_command: str
-    mcp_args: list[str]
+    """SnowLuma OneBot HTTP API 连接参数（见 snowluma.py）。"""
+
     endpoint: str
     api_key: str
-    mode: str
     timeout_ms: int
     allow_private_endpoint: bool
     # ---- 发送重试（bot._send_with_retry，原写死；默认值=原字面量）----
@@ -916,20 +915,13 @@ def load_settings(cfg: Any) -> Settings:
             f"实际是 {send_retry_delay_seconds!r}"
         )
     snowluma_settings = SnowlumaSettings(
-        mcp_command=_parse_str(snow_cfg, "mcp_command", "npx"),
-        mcp_args=list(_get(snow_cfg, "mcp_args", ["-y", "@snowluma/mcp"])),
         endpoint=endpoint,
         api_key=_parse_str(snow_cfg, "api_key", ""),
-        mode=_parse_str(snow_cfg, "mode", "read"),
         timeout_ms=_parse_int(snow_cfg, "timeout_ms", 30000),
         allow_private_endpoint=allow_private,
         send_max_attempts=send_max_attempts,
         send_retry_delay_seconds=send_retry_delay_seconds,
     )
-    if snowluma_settings.mode != "write":
-        raise ValueError(
-            'snowluma.mode 必须是 "write"，否则机器人无法调用 send_group_msg 发言'
-        )
 
     # response_post_process 段可整体省略（全部走默认值）
     pp_cfg = _optional_section(cfg, "response_post_process")

@@ -1,4 +1,4 @@
-"""全链路集成：真实 CandyBot 编排 + 假 MCP/AI，验证事件→决策→发送。"""
+"""全链路集成：真实 CandyBot 编排 + 假 SnowLuma/AI，验证事件→决策→发送。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ def make_settings(tmp_path, generation_overrides: dict | None = None, *, post_pr
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
         # 本文件各用例断言的是未引入后处理时的整条单发行为，默认关闭拆条/

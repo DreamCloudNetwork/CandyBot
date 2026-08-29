@@ -320,7 +320,6 @@ def make_settings(tmp_path, multimodal_mode):
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
         # 本文件断言的是发送原文（标记剥除等），关闭拟人化后处理的

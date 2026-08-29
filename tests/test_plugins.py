@@ -1,4 +1,4 @@
-"""命令插件全链路：真实 CandyBot 编排 + 假 MCP/AI + 独立注册表。
+"""命令插件全链路：真实 CandyBot 编排 + 假 SnowLuma/AI + 独立注册表。
 
 验证「/ 命中注册表 → 取消大模型自主回复 → 解析参数 → 调用插件 → 原样
 发群 → 写回记忆」，以及未知命令回落、总开关关闭、各类失败提示。
@@ -40,7 +40,6 @@ def make_settings(tmp_path, plugins_over: dict | None = None):
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
         "response_post_process": {"enabled": False},

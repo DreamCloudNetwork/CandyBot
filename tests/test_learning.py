@@ -62,7 +62,6 @@ def make_settings(tmp_path, **learning_over) -> Settings:
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
     }
@@ -576,7 +575,6 @@ def test_models_learning_optional_override():
         "rate_limit": {},
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
-            "mode": "write",
             "allow_private_endpoint": True,
         },
     }

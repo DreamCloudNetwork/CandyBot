@@ -1,6 +1,6 @@
 """决策层三项增强的单测：发送前新鲜度检查、观望重评、重复抑制。
 
-全链路集成风格（真实 CandyBot 编排 + 假 MCP/AI），LLM 调用全部 mock。
+全链路集成风格（真实 CandyBot 编排 + 假 SnowLuma/AI），LLM 调用全部 mock。
 复用 test_integration 的配置与假件基建。
 """
 

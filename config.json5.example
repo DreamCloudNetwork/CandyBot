@@ -199,11 +199,8 @@
     },
 
     "snowluma": {
-        "mcp_command": "npx",
-        "mcp_args": ["-y", "@snowluma/mcp"],
-        "endpoint": "http://127.0.0.1:3000/",
-        "api_key": "<Your API Key>",
-        "mode": "write",                  // read / write / all
+        "endpoint": "http://127.0.0.1:3000/",   // OneBot v11 兼容 HTTP API 基址
+        "api_key": "<Your API Key>",            // accessToken，作 Bearer token 鉴权
         "timeout_ms": 30000,
         "allow_private_endpoint": true,   // 允许内网地址（本地部署需为 true）
         "send_max_attempts": 3,           // 发送重试总尝试次数（默认 3）
