@@ -1,7 +1,10 @@
-"""OpenAI 兼容 API 的三个调用角色：judge（打分）、reply（回复）、vision（转述）。
+"""OpenAI 兼容 API 的调用角色：judge（打分）、reply（回复）、vision（转述）、
+learning（群印象/表达/黑话等后台学习任务，未配置时继承 judge 的模型）。
 
 每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
-上下文窗口与输出上限（见 models.ModelConfig）。
+上下文窗口与输出上限（见 models.ModelConfig）。learning 角色一律走一次性
+纯文本调用（按提示词契约输出 JSON、从正文解析），不携带 tools、也不参与
+judge/reply 的分层前缀缓存。
 
 判定、回复与图片入库评估默认通过强制工具调用（tool_choice 指定函数）获得
 结构化结果；models.<role>.forced_tool_choice=false 的角色改用 tool_choice=
@@ -31,11 +34,18 @@ from .models import ChatRecord, GenerationSettings, ModelConfig, ModelSettings
 from .postprocess import EMOJI_RE as _EMOJI_RE
 from .prompts import (
     Message,
+    expression_evaluation_prompt,
+    expression_learning_prompt,
     final_user_prompt_judge,
     final_user_prompt_judge_recheck,
     final_user_prompt_reconsider,
     final_user_prompt_reply,
     history_to_turns,
+    impression_summary_prompt,
+    jargon_compare_inference_prompt,
+    jargon_extraction_prompt,
+    jargon_inference_alone_prompt,
+    jargon_inference_with_context_prompt,
     reply_history_turns,
 )
 
@@ -172,6 +182,10 @@ _JUDGE_MAX_TOKENS = 1000
 # 视觉两个调用各自的输出上限；models.vision.max_output_tokens 可统一覆盖
 _DESCRIBE_MAX_TOKENS = 80
 _ASSESS_MAX_TOKENS = 400
+# 学习类调用的内置输出上限；models.learning.max_output_tokens 可统一覆盖
+_IMPRESSION_MAX_TOKENS = 800
+_LEARN_MAX_TOKENS = 2000
+_REVIEW_MAX_TOKENS = 300  # 表达自审 / 黑话双路比对这类一句话判定
 # 上下文窗口预算中为消息 role 标记等固定格式开销预留的 token 数
 _CONTEXT_OVERHEAD_TOKENS = 128
 
@@ -332,6 +346,8 @@ class AIClient:
         self._judge = models.judge
         self._reply = models.reply
         self._vision = models.vision
+        # learning 角色未配置时继承 judge（便宜快速）：学习任务与判定共用模型
+        self._learning = models.learning or models.judge
         self._generation = generation
         # 只有 direct 模式才允许任何图片（历史层或当前消息）进入请求
         self._multimodal_mode = multimodal_mode
@@ -368,7 +384,12 @@ class AIClient:
         )
 
     def _cfg_for(self, role: str) -> ModelConfig:
-        return {"judge": self._judge, "reply": self._reply, "vision": self._vision}[role]
+        return {
+            "judge": self._judge,
+            "reply": self._reply,
+            "vision": self._vision,
+            "learning": self._learning,
+        }[role]
 
     def _client_for(self, cfg: ModelConfig) -> AsyncOpenAI:
         key = (cfg.base_url, cfg.api_key)
@@ -556,11 +577,17 @@ class AIClient:
         engaged: bool = False,
         score: int | None = None,
         reason: str = "",
+        expression_hints: Sequence[tuple[str, str]] = (),
+        jargon_hints: Sequence[tuple[str, str]] = (),
     ) -> ReplyDraft | None:
         """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。
 
         工具调用模式下经 send_reply 的强制调用拿到（正文, 图片操作）；纯文本
         协议下按旧约定解析正文（标记写在末尾）。返回 None 表示无话可说。
+
+        expression_hints / jargon_hints 为学习机制产出的注入条目（见
+        prompts.final_user_prompt_reply），属于每次回复都可变的易变信息，
+        只进 L4 指令层。
         """
         return await self._reply_call(
             static_system,
@@ -575,6 +602,8 @@ class AIClient:
                 score=score,
                 reason=reason,
                 via_tool=via_tool,
+                expression_hints=expression_hints,
+                jargon_hints=jargon_hints,
             ),
         )
 
@@ -831,6 +860,155 @@ class AIClient:
                 )
         logger.warning("图片入库评估输出无法解析：%r", raw[:200])
         return ImageAssessment(summary=None, keep_raw=True)
+
+    # -------------------------------------------------------------- learning
+
+    async def _learning_call(self, prompt: str, *, default_max_tokens: int) -> str:
+        """一次性纯文本学习调用（不带 tools）。网络/端点异常原样上抛，
+        由上层学习任务记 warning 并跳过本次——后台任务容忍失败。"""
+        cfg = self._learning
+        response = await self._client_for(cfg).chat.completions.create(
+            model=cfg.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=cfg.max_output_tokens or default_max_tokens,
+            timeout=self._generation.timeout_seconds,
+        )
+        return _strip_think((response.choices[0].message.content or "").strip())
+
+    async def summarize_impression(
+        self, day: str, chat_text: str, max_chars: int
+    ) -> str | None:
+        """任务 A：把某群某天的聊天记录总结成一段「今日群聊印象」。"""
+        text = await self._learning_call(
+            impression_summary_prompt(day, chat_text, max_chars),
+            default_max_tokens=_IMPRESSION_MAX_TOKENS,
+        )
+        return text or None
+
+    async def learn_expressions(self, chat_text: str) -> list[tuple[str, str]]:
+        """任务 B：从被淘汰的聊天记录中提取「(情境, 风格)」表达规律。
+
+        情境与风格各裁剪到 20 字（提示词已要求，此处兜底），最多取 10 条。
+        """
+        text = await self._learning_call(
+            expression_learning_prompt(chat_text), default_max_tokens=_LEARN_MAX_TOKENS
+        )
+        parsed = _extract_json(text)
+        if not isinstance(parsed, list):
+            if text:
+                logger.warning("表达学习输出无法解析：%r", text[:200])
+            return []
+        out: list[tuple[str, str]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            situation = str(item.get("situation") or "").strip()
+            style = str(item.get("style") or "").strip()
+            if not situation or not style:
+                continue
+            out.append((situation[:20], style[:20]))
+        return out[:10]
+
+    async def review_expression(self, situation: str, style: str) -> bool:
+        """任务 B 可选自审：只有明确 suitable=true 才通过（歧义一律拒收）。"""
+        text = await self._learning_call(
+            expression_evaluation_prompt(situation, style),
+            default_max_tokens=_REVIEW_MAX_TOKENS,
+        )
+        parsed = _extract_json(text)
+        if isinstance(parsed, dict):
+            return parsed.get("suitable") is True
+        logger.warning("表达自审输出无法解析：%r", text[:200])
+        return False
+
+    async def extract_jargon_terms(self, chat_text: str) -> list[str]:
+        """任务 C 第一步：从聊天流中提取黑话候选词条（去重、限长、最多 10 个）。"""
+        text = await self._learning_call(
+            jargon_extraction_prompt(chat_text), default_max_tokens=_LEARN_MAX_TOKENS
+        )
+        parsed = _extract_json(text)
+        if not isinstance(parsed, list):
+            if text:
+                logger.warning("黑话提取输出无法解析：%r", text[:200])
+            return []
+        terms: list[str] = []
+        seen: set[str] = set()
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            term = str(item.get("content") or "").strip()
+            if not term or len(term) > 16 or term in seen:
+                continue
+            terms.append(term)
+            seen.add(term)
+        return terms[:10]
+
+    async def infer_jargon_with_context(
+        self, term: str, context_text: str
+    ) -> tuple[str | None, bool]:
+        """黑话双路推断·第一路（带上下文）。返回（含义, 信息不足标记）。"""
+        text = await self._learning_call(
+            jargon_inference_with_context_prompt(term, context_text),
+            default_max_tokens=_LEARN_MAX_TOKENS,
+        )
+        parsed = _extract_json(text)
+        if not isinstance(parsed, dict):
+            logger.warning("黑话 %r 带上下文推断输出无法解析：%r", term, text[:200])
+            return None, True
+        meaning = str(parsed.get("meaning") or "").strip()
+        return (meaning or None), parsed.get("no_info") is True
+
+    async def infer_jargon_alone(self, term: str) -> str | None:
+        """黑话双路推断·第二路（仅词条本身）。"""
+        text = await self._learning_call(
+            jargon_inference_alone_prompt(term), default_max_tokens=_LEARN_MAX_TOKENS
+        )
+        parsed = _extract_json(text)
+        if not isinstance(parsed, dict):
+            logger.warning("黑话 %r 仅词条推断输出无法解析：%r", term, text[:200])
+            return None
+        meaning = str(parsed.get("meaning") or "").strip()
+        return meaning or None
+
+    async def compare_jargon_inference(
+        self, meaning_with_context: str, meaning_alone: str
+    ) -> bool:
+        """黑话双路一致性判定：两次推断一致才认为「真的理解」（歧义按不一致）。"""
+        text = await self._learning_call(
+            jargon_compare_inference_prompt(meaning_with_context, meaning_alone),
+            default_max_tokens=_REVIEW_MAX_TOKENS,
+        )
+        parsed = _extract_json(text)
+        if isinstance(parsed, dict):
+            return parsed.get("is_similar") is True
+        logger.warning("黑话双路比对输出无法解析：%r", text[:200])
+        return False
+
+
+def _extract_json(text: str) -> Any | None:
+    """从学习类调用的正文里解析 JSON 对象/数组。
+
+    容忍模型在 JSON 前后附带解释文字或 markdown 代码块围栏；解析不出
+    返回 None（调用方按「本次学习无产出」处理，绝不抛业务异常）。
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```[a-zA-Z]*[ \t]*\n?", "", stripped)
+        stripped = re.sub(r"\n?```\s*$", "", stripped)
+    try:
+        return json.loads(stripped)
+    except ValueError:
+        pass
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = stripped.find(open_ch)
+        end = stripped.rfind(close_ch)
+        if start != -1 and end > start:
+            try:
+                return json.loads(stripped[start : end + 1])
+            except ValueError:
+                continue
+    return None
 
 
 def _strip_think(text: str) -> str:

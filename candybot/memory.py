@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,19 +31,41 @@ logger = logging.getLogger(__name__)
 class GroupMemory:
     """单个群的记忆（有界内存队列 + candy.db 持久化）。"""
 
-    def __init__(self, group_id: int, db: CandyDatabase, capacity: int):
+    def __init__(
+        self,
+        group_id: int,
+        db: CandyDatabase,
+        capacity: int,
+        on_evict: Callable[[int, ChatRecord], None] | None = None,
+    ):
         self.group_id = group_id
         self.capacity = max(capacity, 8)
         self._db = db
         self._records: deque[ChatRecord] = deque(maxlen=self.capacity)
+        # 热缓存溢出回调：被 deque 静默丢弃的最旧消息交给监听者
+        # （学习任务据此积累「被淘汰消息」）。必须同步且 O(1) 廉价，
+        # 在 append 锁内调用，绝不能在这里 await 或做重活。
+        self._on_evict = on_evict
         # 串行化同群的「入库 + 进缓存」，保证 deque 顺序与库内 row_id
         # 顺序一致（insert 的 flush 与 commit 之间存在 await，无锁时
         # 两条并发消息可能顺序互换，重启回放后翻转）
         self._append_lock = asyncio.Lock()
 
     def _prime(self, records: list[ChatRecord]) -> None:
-        """启动回放：把库里最近的历史装进热缓存（仅由 MemoryManager 调用）。"""
+        """启动回放：把库里最近的历史装进热缓存（仅由 MemoryManager 调用）。
+
+        回放导致的挤出属于装载而非实时淘汰，不触发 on_evict。
+        """
         self._records.extend(records)
+
+    def _push(self, record: ChatRecord) -> None:
+        """进热缓存；溢出前捕获即将被挤出的最旧消息并交给监听者。"""
+        evicted: ChatRecord | None = None
+        if self._on_evict is not None and len(self._records) == self._records.maxlen:
+            evicted = self._records[0]
+        self._records.append(record)
+        if evicted is not None:
+            self._on_evict(self.group_id, evicted)
 
     async def append(self, record: ChatRecord) -> None:
         """入库并进热缓存。库写入失败时退化为仅热缓存（与旧版落盘失败
@@ -57,14 +80,14 @@ class GroupMemory:
                     record.message_id,
                     exc_info=True,
                 )
-                self._records.append(record)
+                self._push(record)
                 return
             if not inserted:
                 logger.debug(
                     "群 %d 消息 %d 重复入库，跳过", self.group_id, record.message_id
                 )
                 return
-            self._records.append(record)
+            self._push(record)
 
     async def remove(self, message_id: int) -> bool:
         """按 message_id 删除记录（内存与库同步），返回是否真的删了。
@@ -149,7 +172,7 @@ class GroupMemory:
         return len(self._records)
 
 
-def _seconds_until_next_midnight() -> float:
+def seconds_until_next_midnight() -> float:
     now = datetime.now()
     next_midnight = (now + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -177,6 +200,9 @@ class MemoryManager:
         self._lock = asyncio.Lock()
         self._ready = False
         self._prune_task: asyncio.Task[None] | None = None
+        # 热缓存淘汰监听（签名 (group_id, 被淘汰记录)）：由 bot 接线到学习
+        # 服务；设置后对新创建的群记忆生效。必须同步且 O(1) 廉价。
+        self.evict_listener: Callable[[int, ChatRecord], None] | None = None
 
     async def get(self, group_id: int) -> GroupMemory:
         """取某群记忆；首次访问时从库回放最近历史（并发安全）。"""
@@ -188,7 +214,9 @@ class MemoryManager:
         async with self._lock:
             memory = self._groups.get(gid)
             if memory is None:
-                memory = GroupMemory(gid, self.db, self.default_capacity)
+                memory = GroupMemory(
+                    gid, self.db, self.default_capacity, on_evict=self.evict_listener
+                )
                 memory._prime(await self.db.load_recent(gid, memory.capacity))
                 self._groups[gid] = memory
             return memory
@@ -212,7 +240,7 @@ class MemoryManager:
     async def _prune_loop(self) -> None:
         await self.prune_expired_images()  # 启动即回收一次
         while True:
-            await asyncio.sleep(_seconds_until_next_midnight())
+            await asyncio.sleep(seconds_until_next_midnight())
             await self.prune_expired_images()
 
     async def close(self) -> None:

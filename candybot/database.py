@@ -1,11 +1,17 @@
 """SQLite 持久层：SQLModel 表定义与异步数据操作（data 目录下的 candy.db）。
 
-三个表：
-- chat_history  每条群聊消息（含机器人自己发出的）；文本历史全量保留。
-- chat_image    消息内每个图片槽位（展示状态、总结、指向原图的指纹）；
-                随消息永久保留，回收图片时只摘除数据引用、降级展示状态。
-- image_blob    以内容指纹（SHA-256）为主键的原图 base64；同一张图全库只存
-                一份，按保留期回收——没有任何槽位引用时即删除。
+六个表：
+- chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留。
+- chat_image       消息内每个图片槽位（展示状态、总结、指向原图的指纹）；
+                   随消息永久保留，回收图片时只摘除数据引用、降级展示状态。
+- image_blob       以内容指纹（SHA-256）为主键的原图 base64；同一张图全库
+                   只存一份，按保留期回收——没有任何槽位引用时即删除。
+- group_impression 每日群聊印象（中期记忆）：每群每天一条 ≤300 字总结，
+                   最近 N 天注入提示词 L2，更旧的按保留期清理。
+- expressions      表达学习成果：「当 situation 时，可以用 style」规律，
+                   同群按内容去重，count 作加权随机抽取的权重。
+- jargons          黑话词条：term + meaning，同群去重，超出条目上限时
+                   淘汰最久未命中的条目。
 
 展示状态与总结属于历史语义内容，回收后仍然保留（占位/总结随历史照常
 送入模型），只有 base64 数据消失；恢复后的记录里对应槽位 images 为空串。
@@ -18,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -89,6 +96,92 @@ class ImageBlobRow(SQLModel, table=True):
     sha256: str = Field(primary_key=True)
     data_url: str = Field(nullable=False)
     created_ts: float = Field(default=0.0, nullable=False)
+
+
+class GroupImpressionRow(SQLModel, table=True):
+    """group_impression：每日「今日群聊印象」（中期记忆）。
+
+    day 为 YYYY-MM-DD 字符串（字典序即时间序），每群每天一条；
+    注入提示词 L2 时取最近 N 天，天内字节级不变。
+    """
+
+    __tablename__ = "group_impression"
+    __table_args__ = (UniqueConstraint("group_id", "day"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    group_id: int = Field(nullable=False)
+    day: str = Field(nullable=False)
+    summary: str = Field(default="", nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+
+
+class ExpressionRow(SQLModel, table=True):
+    """expressions：表达学习成果「当 situation 时，可以用 style」。
+
+    同群按 (group_id, situation, style) 内容去重，重复学到时只累计
+    count（即加权随机抽取的权重）；last_active_time 记录最近一次被
+    选中注入回复的时刻。
+    """
+
+    __tablename__ = "expressions"
+    __table_args__ = (UniqueConstraint("group_id", "situation", "style"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    group_id: int = Field(nullable=False)
+    situation: str = Field(nullable=False)
+    style: str = Field(nullable=False)
+    count: int = Field(default=1, nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+    last_active_time: float = Field(default=0.0, nullable=False)
+
+
+class JargonRow(SQLModel, table=True):
+    """jargons：群内黑话词条（双路含义推断一致才入库）。
+
+    同群按 (group_id, term) 去重；last_hit_time 是条目超上限时
+    「淘汰最久未命中」的排序键。
+    """
+
+    __tablename__ = "jargons"
+    __table_args__ = (UniqueConstraint("group_id", "term"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    group_id: int = Field(nullable=False)
+    term: str = Field(nullable=False)
+    meaning: str = Field(default="", nullable=False)
+    count: int = Field(default=1, nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+    last_hit_time: float = Field(default=0.0, nullable=False)
+
+
+@dataclass(frozen=True)
+class ImpressionEntry:
+    """一条群印象（day 为 YYYY-MM-DD）。"""
+
+    day: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class ExpressionEntry:
+    """一条候选表达。weight 即学习到的次数 count。"""
+
+    id: int
+    situation: str
+    style: str
+    weight: int
+    last_active_time: float
+
+
+@dataclass(frozen=True)
+class JargonEntry:
+    """一条黑话词条。"""
+
+    id: int
+    term: str
+    meaning: str
+    count: int
+    last_hit_time: float
 
 
 def _set_sqlite_pragmas(dbapi_conn, _record) -> None:
@@ -315,6 +408,266 @@ class CandyDatabase:
         if freed:
             await session.commit()
         return freed
+
+    # ------------------------------------------------------------ 中期记忆与学习
+
+    async def list_group_ids(self) -> list[int]:
+        """库里出现过的全部群号（每日印象任务据此枚举白名单内的群）。"""
+        async with self._sessions() as session:
+            return list(
+                (await session.exec(select(col(ChatHistoryRow.group_id)).distinct())).all()
+            )
+
+    async def load_day_records(
+        self, group_id: int, start_ts: float, end_ts: float
+    ) -> list[ChatRecord]:
+        """某群 [start_ts, end_ts) 内的全部消息（时间正序，不含图片数据）。"""
+        async with self._sessions() as session:
+            rows = (
+                await session.exec(
+                    select(ChatHistoryRow)
+                    .where(
+                        ChatHistoryRow.group_id == group_id,
+                        ChatHistoryRow.ts >= start_ts,
+                        ChatHistoryRow.ts < end_ts,
+                    )
+                    .order_by(col(ChatHistoryRow.row_id))
+                )
+            ).all()
+            return [self._record_from_row(row, [], {}) for row in rows]
+
+    async def has_day_records(
+        self, group_id: int, start_ts: float, end_ts: float
+    ) -> bool:
+        """某群在 [start_ts, end_ts) 内是否有任何消息记录（廉价存在性查询）。
+
+        供 L2 印象快照的零点竞态防护使用：昨日有聊天却还没有印象，说明
+        每日印象任务还没轮到/还没跑完该群，快照暂不完整、不宜固化。
+        """
+        async with self._sessions() as session:
+            row = (
+                await session.exec(
+                    select(ChatHistoryRow.row_id)
+                    .where(
+                        ChatHistoryRow.group_id == group_id,
+                        ChatHistoryRow.ts >= start_ts,
+                        ChatHistoryRow.ts < end_ts,
+                    )
+                    .limit(1)
+                )
+            ).first()
+            return row is not None
+
+    async def save_impression(
+        self, group_id: int, day: str, summary: str, ts: float | None = None
+    ) -> None:
+        """写入/覆盖某群某天的印象（定时任务重跑幂等）。"""
+        async with self._sessions() as session:
+            row = (
+                await session.exec(
+                    select(GroupImpressionRow).where(
+                        GroupImpressionRow.group_id == group_id,
+                        GroupImpressionRow.day == day,
+                    )
+                )
+            ).first()
+            if row is None:
+                row = GroupImpressionRow(group_id=group_id, day=day)
+            row.summary = summary
+            row.created_ts = ts if ts is not None else time.time()
+            session.add(row)
+            await session.commit()
+
+    async def load_impressions(self, group_id: int, limit: int) -> list[ImpressionEntry]:
+        """某群最近 limit 天的印象，按 day 升序（旧→新）返回。"""
+        if limit <= 0:
+            return []
+        async with self._sessions() as session:
+            rows = list(
+                (
+                    await session.exec(
+                        select(GroupImpressionRow)
+                        .where(GroupImpressionRow.group_id == group_id)
+                        .order_by(col(GroupImpressionRow.day).desc())
+                        .limit(limit)
+                    )
+                ).all()
+            )[::-1]
+            return [ImpressionEntry(day=r.day, summary=r.summary) for r in rows]
+
+    async def has_impression(self, group_id: int, day: str) -> bool:
+        async with self._sessions() as session:
+            row = (
+                await session.exec(
+                    select(GroupImpressionRow.id).where(
+                        GroupImpressionRow.group_id == group_id,
+                        GroupImpressionRow.day == day,
+                    )
+                )
+            ).first()
+            return row is not None
+
+    async def prune_impressions(self, before_day: str) -> int:
+        """删除 day 早于 before_day 的印象（day 是 ISO 格式，字典序即时间序）。"""
+        async with self._sessions() as session:
+            rows = (
+                await session.exec(
+                    select(GroupImpressionRow).where(
+                        col(GroupImpressionRow.day) < before_day
+                    )
+                )
+            ).all()
+            for row in rows:
+                await session.delete(row)
+            await session.commit()
+            return len(rows)
+
+    async def load_expressions(self, group_id: int) -> list[ExpressionEntry]:
+        async with self._sessions() as session:
+            rows = (
+                await session.exec(
+                    select(ExpressionRow).where(ExpressionRow.group_id == group_id)
+                )
+            ).all()
+            return [
+                ExpressionEntry(
+                    id=row.id,
+                    situation=row.situation,
+                    style=row.style,
+                    weight=max(row.count, 1),
+                    last_active_time=row.last_active_time,
+                )
+                for row in rows
+            ]
+
+    async def record_expression(
+        self, group_id: int, situation: str, style: str, ts: float
+    ) -> None:
+        """记录学到的一条表达；同群内容完全一致时只累计权重（去重）。"""
+        async with self._sessions() as session:
+            row = (
+                await session.exec(
+                    select(ExpressionRow).where(
+                        ExpressionRow.group_id == group_id,
+                        ExpressionRow.situation == situation,
+                        ExpressionRow.style == style,
+                    )
+                )
+            ).first()
+            if row is None:
+                session.add(
+                    ExpressionRow(
+                        group_id=group_id,
+                        situation=situation,
+                        style=style,
+                        count=1,
+                        created_ts=ts,
+                        last_active_time=0.0,
+                    )
+                )
+            else:
+                row.count += 1
+                session.add(row)
+            await session.commit()
+
+    async def touch_expressions(self, ids: Sequence[int], ts: float) -> None:
+        """更新被选中表达条目的最近使用时间。"""
+        if not ids:
+            return
+        async with self._sessions() as session:
+            for row_id in ids:
+                row = await session.get(ExpressionRow, row_id)
+                if row is not None:
+                    row.last_active_time = ts
+                    session.add(row)
+            await session.commit()
+
+    async def load_jargons(self, group_id: int) -> list[JargonEntry]:
+        async with self._sessions() as session:
+            rows = (
+                await session.exec(
+                    select(JargonRow).where(JargonRow.group_id == group_id)
+                )
+            ).all()
+            return [
+                JargonEntry(
+                    id=row.id,
+                    term=row.term,
+                    meaning=row.meaning,
+                    count=row.count,
+                    last_hit_time=row.last_hit_time,
+                )
+                for row in rows
+            ]
+
+    async def record_jargon(
+        self,
+        group_id: int,
+        term: str,
+        meaning: str,
+        ts: float,
+        max_entries: int,
+    ) -> None:
+        """写入一个黑话词条；同群已有词条只更新含义，新词插入后按上限
+        淘汰最久未命中的条目。"""
+        async with self._sessions() as session:
+            row = (
+                await session.exec(
+                    select(JargonRow).where(
+                        JargonRow.group_id == group_id, JargonRow.term == term
+                    )
+                )
+            ).first()
+            if row is None:
+                session.add(
+                    JargonRow(
+                        group_id=group_id,
+                        term=term,
+                        meaning=meaning,
+                        count=1,
+                        created_ts=ts,
+                        last_hit_time=ts,
+                    )
+                )
+                await session.commit()
+            else:
+                row.meaning = meaning
+                row.count += 1
+                session.add(row)
+                await session.commit()
+            if max_entries > 0:
+                await self._evict_jargons(session, group_id, max_entries)
+
+    async def _evict_jargons(
+        self, session: SQLModelAsyncSession, group_id: int, max_entries: int
+    ) -> None:
+        """某群黑话超出上限时淘汰最久未命中的条目。"""
+        rows = list(
+            (
+                await session.exec(
+                    select(JargonRow).where(JargonRow.group_id == group_id)
+                )
+            ).all()
+        )
+        overflow = len(rows) - max_entries
+        if overflow <= 0:
+            return
+        rows.sort(key=lambda r: (r.last_hit_time, r.created_ts))
+        for row in rows[:overflow]:
+            await session.delete(row)
+        await session.commit()
+
+    async def touch_jargons(self, ids: Sequence[int], ts: float) -> None:
+        """更新被机械匹配命中的黑话条目的最近命中时间。"""
+        if not ids:
+            return
+        async with self._sessions() as session:
+            for row_id in ids:
+                row = await session.get(JargonRow, row_id)
+                if row is not None:
+                    row.last_hit_time = ts
+                    session.add(row)
+            await session.commit()
 
     # ------------------------------------------------------------ 内部工具
 

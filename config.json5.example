@@ -60,6 +60,8 @@
     //                        tool_choice="auto"，由提示词引导模型主动调用
     "models": {
         "judge": "glm-4-flash",           // 兴趣评分模型
+        // "learning": "glm-4-flash",     // 学习任务模型（每日群印象/表达/黑话学习）；
+                                        // 注释掉则继承 judge 的配置
         "reply": {
             "model": "glm-4-flash",
             // "base_url": "https://api.deepseek.com/v1",
@@ -96,6 +98,22 @@
     // 聊天存储（data/candy.db，SQLite）：文本历史永久保留，原图按保留期回收
     "storage": {
         "image_retention_days": 7,        // 聊天原图保留天数；超期降级为总结/占位符
+    },
+
+    // 记忆与学习：每日群印象（中期记忆，注入 L2）、表达学习与黑话学习（后台任务，注入 L4）。
+    // 整段可省略（全部走默认值）；所有学习任务在后台 asyncio 任务中执行，失败只记日志跳过本次。
+    "learning": {
+        "enabled": true,                  // 学习任务总开关
+        "impression_enabled": true,       // 每日群印象单项开关
+        "impression_days": 3,             // 注入 L2 的最近印象天数
+        "impression_max_chars": 300,      // 单日印象字数上限
+        "expression_enabled": true,       // 表达学习单项开关
+        "expression_batch_size": 10,      // 同群被淘汰消息攒够多少条触发一次学习
+        "expression_max_inject": 3,       // 单次回复最多注入的表达条数
+        "expression_self_review": true,   // AI 自审过滤低质量表达条目
+        "jargon_enabled": true,           // 黑话学习单项开关
+        "jargon_max_entries": 50,         // 每群黑话条目上限，超限淘汰最久未命中
+        "jargon_max_inject": 5,           // 单次回复最多注入的命中黑话条数
     },
 
     // 输出层拟人化后处理：拆条发送、打字延迟、错别字与敷衍兜底、连发被打断后的重想（整段可省略，全部走默认值）

@@ -17,7 +17,7 @@ import random
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 
 import aiohttp
 
@@ -33,6 +33,7 @@ from .models import (
     Settings,
     load_settings,
 )
+from .learning import LearningService, day_bounds
 from .normalize import normalize_group_message
 from .postprocess import (
     ProcessedReply,
@@ -82,6 +83,23 @@ class GroupRuntime:
         self.recent_msg_times: deque[float] = deque()
         self._static_cache_key: tuple[int, str] | None = None
         self._static_cache: str = ""
+        # L2 群印象快照：按 (group_id, 日期) 缓存，天内字节级不变
+        # （KV Cache 硬纪律），跨过零点才从库里重新取一次。
+        self._impressions_day: str | None = None
+        self._impressions: tuple[tuple[str, str], ...] = ()
+
+    def impressions_snapshot(
+        self, today: str
+    ) -> tuple[tuple[str, str], ...] | None:
+        """该日缓存的印象快照；未缓存或已跨天返回 None（需要刷新）。"""
+        return self._impressions if self._impressions_day == today else None
+
+    def remember_impressions(
+        self, today: str, snapshot: tuple[tuple[str, str], ...]
+    ) -> None:
+        """写入某日的印象快照（tuple 固化，保证天内重建字节级相同）。"""
+        self._impressions_day = today
+        self._impressions = snapshot
 
     def static_system(self, kind: str, persona: str, *, via_tool: bool = True) -> str:
         """L1 静态层按 (kind, persona, via_tool) 缓存；persona 改热重载时自动重建。
@@ -119,6 +137,12 @@ class CandyBot:
             default_capacity=max(max_context * 2, 64),
             image_retention_days=settings.storage.image_retention_days,
         )
+        # 后台学习服务（每日群印象 / 表达 / 黑话）：热缓存淘汰的消息交给它
+        # 攒批触发学习；配置与 AI 客户端热重载后仍取到最新实例（回调注入）。
+        self._learning = LearningService(
+            self._memory, lambda: self._ai, lambda: self._settings
+        )
+        self._memory.evict_listener = self._learning.note_evicted
         self._http = aiohttp.ClientSession()
         self._ai = AIClient(
             models=settings.models,
@@ -152,6 +176,7 @@ class CandyBot:
 
     async def start(self) -> None:
         await self._memory.start()  # 建表 + 每日图片回收循环
+        await self._learning.start()  # 每日群印象循环（启动时先补昨天的）
         pp = self._settings.response_post_process
         if pp.enabled and (pp.typo_error_rate > 0 or pp.typo_word_replace_rate > 0):
             # 拼音反查表构建一次约 0.6 秒：在后台线程预热，避免首条带错字
@@ -185,6 +210,8 @@ class CandyBot:
         await self._server.stop()
         await self._http.close()
         await self._snowluma.stop()
+        # 学习任务可能正卡在数据库写入上：先停它们，再释放连接池
+        await self._learning.stop()
         await self._memory.close()
 
     # ------------------------------------------------------------ 配置热重载
@@ -203,6 +230,9 @@ class CandyBot:
 
         解析失败（典型场景：配置写坏）完整记日志但不拖垮服务：沿用旧配置，
         下一次保存自动重试。返回是否实际完成了替换。
+
+        learning 段与 models.learning 随快照/AI 客户端重建即时生效；已缓存
+        的 L2 印象快照当天不刷新（天内字节级不变），次日自然按新配置重建。
         """
         if self._settings_loader is None:
             logger.warning("未携带 settings_loader 的 CandyBot 实例，配置热重载不可用")
@@ -351,6 +381,98 @@ class CandyBot:
 
     # ------------------------------------------------------------ 决策与回复
 
+    async def _impressions_for(
+        self, group_id: int, runtime: GroupRuntime
+    ) -> tuple[tuple[str, str], ...]:
+        """L2 群印象注入：按 (group_id, 日期) 快照缓存。
+
+        同一天内直接返回缓存的 tuple，天内任意次重建 runtime_system_prompt
+        字节级相同（KV Cache 硬纪律）；跨过零点快照键变化，才从库里重取
+        一次——那时昨日印象已由每日任务生成。
+
+        零点竞态防护：每日印象任务是零点后逐群串行生成的，当天第一条消息
+        可能赶在昨日印象就位之前进来。此时暂不固化快照（下次回复前重查），
+        印象就位后才固化——代价是 L2 前缀当天可能多刷新一次，好过整日缺失
+        昨日的印象（见 _yesterday_impression_pending）。
+        """
+        ls = self._settings.learning
+        if not ls.enabled or not ls.impression_enabled:
+            return ()
+        today = date.today().isoformat()
+        cached = runtime.impressions_snapshot(today)
+        if cached is not None:
+            return cached
+        try:
+            rows = await self._memory.db.load_impressions(group_id, ls.impression_days)
+        except Exception:
+            # 注入是辅助能力：读库失败按「今天没有印象」处理并缓存空快照，
+            # 既不阻断决策，也保证天内字节级稳定
+            logger.warning("群 %d 读取群印象失败，本次运行日内不注入", group_id, exc_info=True)
+            rows = []
+        else:
+            if await self._yesterday_impression_pending(group_id, {row.day for row in rows}):
+                # 昨日印象还在生成途中：返回当前不完整的快照但暂不固化
+                return tuple((row.day, row.summary) for row in rows)
+        snapshot = tuple((row.day, row.summary) for row in rows)
+        runtime.remember_impressions(today, snapshot)
+        return snapshot
+
+    async def _yesterday_impression_pending(
+        self, group_id: int, present_days: set[str]
+    ) -> bool:
+        """判断「昨天有聊天、但印象还没生成」——即 L2 快照暂不完整。
+
+        昨日印象缺席且该群昨天有过消息时返回 True，调用方据此跳过快照
+        固化。存在性检查自身失败时按「无待生成」处理（照常固化）：竞态
+        防护不能反过来变成天内不稳定的来源。
+        """
+        yesterday = date.today() - timedelta(days=1)
+        if yesterday.isoformat() in present_days:
+            return False
+        try:
+            start_ts, end_ts = day_bounds(yesterday)
+            return await self._memory.db.has_day_records(group_id, start_ts, end_ts)
+        except Exception:
+            logger.warning(
+                "群 %d 检查昨日消息是否存在失败，跳过竞态防护照常固化快照",
+                group_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _learning_hints(
+        self, group_id: int, recent: list[ChatRecord]
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """回复前的 L4 注入准备：抽表达 + 匹配黑话（都只进指令层）。
+
+        辅助能力：任何失败只记日志、退化为不注入，绝不阻断回复本身。
+        """
+        ls = self._settings.learning
+        expression_hints: list[tuple[str, str]] = []
+        jargon_hints: list[tuple[str, str]] = []
+        if not ls.enabled:
+            return expression_hints, jargon_hints
+        try:
+            if ls.expression_enabled:
+                expression_hints = await self._learning.pick_expressions(
+                    group_id, ls.expression_max_inject
+                )
+            if ls.jargon_enabled:
+                context = "\n".join(
+                    r.text for r in recent if not r.is_self and r.text
+                )
+                jargon_hints = await self._learning.match_jargons(
+                    group_id, context, ls.jargon_max_inject
+                )
+        except Exception:
+            logger.warning("群 %d 学习注入准备失败，本次跳过注入", group_id, exc_info=True)
+            return [], []
+        if expression_hints or jargon_hints:
+            logger.debug(
+                "群 %d L4 注入：表达 %r，黑话 %r", group_id, expression_hints, jargon_hints
+            )
+        return expression_hints, jargon_hints
+
     async def _decide_and_reply(self, group_id: int, msg: NormalizedMessage) -> None:
         profile = self._settings.profile_for(group_id)
         assert profile is not None
@@ -384,7 +506,10 @@ class CandyBot:
             )
             nicknames = nickname_list_from_history([record_to_turn(r) for r in recent])
             runtime_system = runtime_system_prompt(
-                group_id, date.today().isoformat(), nicknames
+                group_id,
+                date.today().isoformat(),
+                nicknames,
+                impressions=await self._impressions_for(group_id, runtime),
             )
             draft = await self._generate_with_retry(
                 self._ai.reconsider_reply,
@@ -483,8 +608,12 @@ class CandyBot:
                 [record_to_turn(r) for r in recent[:-1]]
             )
             runtime_system = runtime_system_prompt(
-                group_id, date.today().isoformat(), nicknames
+                group_id,
+                date.today().isoformat(),
+                nicknames,
+                impressions=await self._impressions_for(group_id, runtime),
             )
+            expression_hints, jargon_hints = await self._learning_hints(group_id, recent)
             draft = await self._generate_with_retry(
                 self._ai.generate_reply,
                 static_system,
@@ -496,6 +625,8 @@ class CandyBot:
                 engaged=decision.engaged,
                 score=decision.score,
                 reason=decision.reason,
+                expression_hints=expression_hints,
+                jargon_hints=jargon_hints,
             )
             if draft is None or not draft.text:
                 return None
@@ -555,7 +686,10 @@ class CandyBot:
         static_system = runtime.static_system("judge", profile.persona)
         nicknames = nickname_list_from_history([record_to_turn(r) for r in recent[:-1]])
         runtime_system = runtime_system_prompt(
-            group_id, date.today().isoformat(), nicknames
+            group_id,
+            date.today().isoformat(),
+            nicknames,
+            impressions=await self._impressions_for(group_id, runtime),
         )
         try:
             verdict = await self._ai.judge_interest(

@@ -232,6 +232,9 @@ class ModelSettings:
     judge: ModelConfig
     reply: ModelConfig
     vision: ModelConfig | None
+    # learning 为可选的第四角色：群印象总结、表达/黑话学习等后台学习任务
+    # 用它；未配置时继承 judge（便宜快速）的配置（见 AIClient）。
+    learning: ModelConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +273,36 @@ class StorageSettings:
 @dataclass(frozen=True)
 class RateLimitSettings:
     global_daily_limit: int | None
+
+
+@dataclass(frozen=True)
+class LearningSettings:
+    """记忆与学习机制（每日群印象、表达学习、黑话学习）的配置。
+
+    总开关 enabled 关掉全部后台学习任务；impression_enabled /
+    expression_enabled / jargon_enabled 分别控制单项。学习任务在后台
+    asyncio 任务中执行，失败只记 warning 日志并跳过本次，不影响主链路。
+
+    impression_days：注入 L2 的最近印象天数（天内字节级稳定）；
+    impression_max_chars：单日印象的字数上限（提示词与入库裁剪同用它）；
+    expression_batch_size：同群被热缓存淘汰的消息攒够这么多条触发一次学习；
+    expression_max_inject：单次回复最多注入的表达条数（L4，加权随机）；
+    expression_self_review：是否让 AI 自审过滤低质量表达条目；
+    jargon_max_entries：每群黑话条目上限，超限淘汰最久未命中的；
+    jargon_max_inject：单次回复最多注入的命中黑话条数（L4，机械匹配）。
+    """
+
+    enabled: bool = True
+    impression_enabled: bool = True
+    impression_days: int = 3
+    impression_max_chars: int = 300
+    expression_enabled: bool = True
+    expression_batch_size: int = 10
+    expression_max_inject: int = 3
+    expression_self_review: bool = True
+    jargon_enabled: bool = True
+    jargon_max_entries: int = 50
+    jargon_max_inject: int = 5
 
 
 # 敷衍池内置默认：回复过长或拆条后为空时随机抽取其一代替发送。
@@ -337,6 +370,8 @@ class Settings:
     rate_limit: RateLimitSettings
     snowluma: SnowlumaSettings
     response_post_process: ResponsePostProcessSettings
+    # learning 段可整体省略（全部走默认值），故带默认值
+    learning: LearningSettings = LearningSettings()
 
     def profile_for(self, group_id: int) -> GroupProfile | None:
         """严格白名单语义。
@@ -522,6 +557,13 @@ def load_settings(cfg: Any) -> Settings:
             if models_cfg.get("vision") is not None
             else None
         ),
+        learning=(
+            _parse_model_config(
+                models_cfg["learning"], "models.learning", ai_settings
+            )
+            if models_cfg.get("learning") is not None
+            else None
+        ),
     )
 
     gen_cfg = _require_section(cfg, "generation")
@@ -670,6 +712,40 @@ def load_settings(cfg: Any) -> Settings:
         lazy_replies=tuple(str(item) for item in lazy_raw),
     )
 
+    # learning 段可整体省略（全部走默认值）
+    learn_cfg = _optional_section(cfg, "learning")
+
+    def _parse_positive_int(key: str, default: int) -> int:
+        value = _parse_int(learn_cfg, key, default)
+        if value < 1:
+            raise ValueError(
+                f"配置项 `learning.{key}` 不能小于 1，实际是 {value!r}"
+            )
+        return value
+
+    learning_settings = LearningSettings(
+        enabled=_parse_bool(learn_cfg.get("enabled", True), "learning.enabled"),
+        impression_enabled=_parse_bool(
+            learn_cfg.get("impression_enabled", True), "learning.impression_enabled"
+        ),
+        impression_days=_parse_positive_int("impression_days", 3),
+        impression_max_chars=_parse_positive_int("impression_max_chars", 300),
+        expression_enabled=_parse_bool(
+            learn_cfg.get("expression_enabled", True), "learning.expression_enabled"
+        ),
+        expression_batch_size=_parse_positive_int("expression_batch_size", 10),
+        expression_max_inject=_parse_positive_int("expression_max_inject", 3),
+        expression_self_review=_parse_bool(
+            learn_cfg.get("expression_self_review", True),
+            "learning.expression_self_review",
+        ),
+        jargon_enabled=_parse_bool(
+            learn_cfg.get("jargon_enabled", True), "learning.jargon_enabled"
+        ),
+        jargon_max_entries=_parse_positive_int("jargon_max_entries", 50),
+        jargon_max_inject=_parse_positive_int("jargon_max_inject", 5),
+    )
+
     return Settings(
         bot=BotSettings(
             self_qq=self_qq,
@@ -689,6 +765,7 @@ def load_settings(cfg: Any) -> Settings:
         rate_limit=rate_limit_settings,
         snowluma=snowluma_settings,
         response_post_process=post_process_settings,
+        learning=learning_settings,
     )
 
 

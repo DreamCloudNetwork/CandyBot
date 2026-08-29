@@ -4,10 +4,12 @@ API 侧的前缀缓存按 token 精确匹配自前往后命中，因此本模块
 恒定为四层，稳定性递减、位置靠后：
 
 L1 system·静态层   persona 与行为守则，字节级不变（不插值任何动态信息）；
-L2 system·状态层   群号、上下文昵称表、今天的日期——同一天内不变；
-L3 历史层          只追加、整块淘汰的群聊记录，映射为连续 user/assistant
+L2 system·状态层   群号、上下文昵称表、今天的日期、最近 N 天的群聊印象——
+                   同一天内不变（印象经 GroupRuntime 快照缓存，天内字节级稳定）；
+L3 历史层          只追加、从头整块淘汰的群聊记录，映射为连续 user/assistant
                    （direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
-L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分）与本次指令。
+L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分、学习注入的
+                   表达/黑话参考）与本次指令。
 
 任何时刻都不得把易变字段（秒级时间、计数、分数）塞进 L1/L2，也不得重排或
 重新格式化历史消息——否则其后的缓存全部失效。
@@ -112,11 +114,21 @@ def static_system_prompt(persona: str, kind: str, *, via_tool: bool = True) -> s
 
 # ---------------------------------------------------------------- L2 状态层
 
-def runtime_system_prompt(group_id: int, date_today: str, nicknames: Sequence[str]) -> str:
+def runtime_system_prompt(
+    group_id: int,
+    date_today: str,
+    nicknames: Sequence[str],
+    impressions: Sequence[tuple[str, str]] = (),
+) -> str:
     """L2：当天内稳定的运行状态。date_today 格式 YYYY-MM-DD。
 
     nicknames 传入「当前上下文中出现过的成员」的稳定排序结果；
     变化越少，L3 能复用的缓存越多。
+
+    impressions 传入最近 N 天的「今日群聊印象」（中期记忆），为
+    (day, summary) 序列、按 day 升序；调用方必须保证同一天内传入内容
+    字节级相同（GroupRuntime 的快照缓存），否则 L2 前缀缓存当天会失效。
+    缺省为空时输出与引入印象机制之前完全一致。
     """
     lines = [
         "【当前环境】",
@@ -127,6 +139,10 @@ def runtime_system_prompt(group_id: int, date_today: str, nicknames: Sequence[st
     if nicknames:
         shown = "、".join(nicknames[:12])
         lines.append(f"最近参与发言的成员：{shown}")
+    if impressions:
+        lines.append("【最近群聊印象】")
+        for day, summary in impressions:
+            lines.append(f"{day}：{summary}")
     return "\n".join(lines)
 
 
@@ -328,6 +344,20 @@ def final_user_prompt_judge_recheck(
     return "\n".join(lines)
 
 
+def expression_hint_block(hints: Sequence[tuple[str, str]]) -> str:
+    """L4 表达习惯参考块：从表达学习成果中加权抽出的 (情境, 风格) 条目。"""
+    lines = ["【表达习惯参考，请视情况自然使用（不用完全遵守）】"]
+    lines.extend(f'当"{situation}"时，可以用"{style}"' for situation, style in hints)
+    return "\n".join(lines)
+
+
+def jargon_hint_block(hints: Sequence[tuple[str, str]]) -> str:
+    """L4 黑话参考块：对当前上下文机械匹配命中的 (词条, 含义) 条目。"""
+    lines = ["【黑话参考】"]
+    lines.extend(f"{term}：{meaning}" for term, meaning in hints)
+    return "\n".join(lines)
+
+
 def final_user_prompt_reply(
     now_text: str,
     current_message: ChatRecord,
@@ -337,8 +367,14 @@ def final_user_prompt_reply(
     score: int | None = None,
     reason: str = "",
     via_tool: bool = True,
+    expression_hints: Sequence[tuple[str, str]] = (),
+    jargon_hints: Sequence[tuple[str, str]] = (),
 ) -> str:
-    """L4(reply)：触发原因说明 + 回复指令。"""
+    """L4(reply)：触发原因说明 + 表达/黑话参考（可选） + 回复指令。
+
+    expression_hints / jargon_hints 是每次回复都可能变化的易变信息，
+    只进 L4；两者都为空时输出与引入学习机制之前字节级一致。
+    """
     sender = record_label(current_message)
     body = current_message.text or "[图片]"
     if forced:
@@ -361,10 +397,13 @@ def final_user_prompt_reply(
         )
     else:
         tail = "现在以你的身份说一句自然的回应。只输出群聊正文，不要任何额外内容。"
-    return (
-        f"【当前时间】{now_text}\n{why}\n"
-        f"【需要回应的消息】来自 {sender}：\n{body}\n\n{tail}"
-    )
+    parts = [f"【当前时间】{now_text}\n{why}\n【需要回应的消息】来自 {sender}：\n{body}"]
+    if expression_hints:
+        parts.append(expression_hint_block(expression_hints))
+    if jargon_hints:
+        parts.append(jargon_hint_block(jargon_hints))
+    parts.append(tail)
+    return "\n\n".join(parts)
 
 
 def final_user_prompt_reconsider(
@@ -447,3 +486,161 @@ def nickname_list_from_history(history: Sequence[HistoryTurn]) -> list[str]:
 
 def now_text(dt: datetime | None = None) -> str:
     return (dt or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# -------------------------------------------------- 学习类提示词（后台任务专用）
+#
+# 以下 prompt 只服务于后台学习任务（每日印象、表达/黑话学习），走一次性的
+# 单消息调用，不参与 judge/reply 的 L1-L4 前缀缓存分层。
+
+def learning_chat_text(records: Sequence[ChatRecord]) -> str:
+    """把聊天记录渲染成学习/总结用的纯文本聊天流。
+
+    群友消息为「昵称(QQ号)：内容」，机器人自己的发言统一标成
+    【你自己】：内容——学习类 prompt 据此明确要求不从自己的发言里学。
+    """
+    lines: list[str] = []
+    for record in records:
+        body = record.text or "[图片]"
+        if record.is_self:
+            lines.append(f"【你自己】：{body}")
+        else:
+            lines.append(f"{record_label(record)}：{body}")
+    return "\n".join(lines)
+
+
+def impression_summary_prompt(day: str, chat_text: str, max_chars: int) -> str:
+    """每日「今日群聊印象」的总结指令（任务 A，中期记忆）。"""
+    return f"""{chat_text}
+
+以上是某个 QQ 群 {day} 一整天的聊天记录（「昵称(QQ号)：内容」逐条给出，前缀为【你自己】的是你本人的发言）。
+请把这一天的群聊总结成一段不超过 {max_chars} 字的「今日群聊印象」，内容包括：
+1. 群里主要聊了哪些话题；
+2. 发生过什么值得一提的事件；
+3. 你参与了什么、和谁发生过什么互动。
+只根据聊天记录总结，不要编造没有出现过的内容；直接输出总结正文，不要标题、不要 markdown、不要列条目。"""
+
+
+def expression_learning_prompt(chat_text: str) -> str:
+    """表达学习指令（任务 B）：从被淘汰的群聊记录中提取表达规律。"""
+    return f"""{chat_text}
+
+请从上面这段群聊中提取群友的语言风格和说话方式。
+1. 只考虑文字，不要考虑表情包和图片
+2. 不要从【你自己】的发言中学习——那是你自己的话，不要重复学习自己的说话方式；它只能作为理解上下文的参考
+3. 不要涉及具体的人名，也不要涉及具体名词
+4. 思考有没有特殊的梗，一并总结成语言风格
+5. 例子仅供参考，请严格根据群聊内容总结
+
+请总结成如下格式的规律：当 "AAAAA" 时，可以用 "BBBBB"。
+- AAAAA 表示某个情境，不超过 20 个字
+- BBBBB 表示对应的风格、特定句式或表达方式，不超过 20 个字
+- 表达方式在 3-5 个左右，不要超过 10 个
+
+输出要求：
+请仅输出 JSON 数组，不要输出重复内容，不要输出代码块标记。每个元素为一个对象：
+
+[
+  {{"situation": "对某件事表示十分惊叹", "style": "使用 我嘞个xxxx"}},
+  {{"situation": "表示讽刺的赞同", "style": "使用 对对对"}}
+]
+
+字段说明：
+- situation：「在什么情境下」的简短概括（不超过 20 个字）
+- style：对应的语言风格或常用表达（不超过 20 个字）
+
+输出 JSON："""
+
+
+def expression_evaluation_prompt(situation: str, style: str) -> str:
+    """AI 自审指令：过滤低质量/不当的表达条目（可选开关）。"""
+    return f"""请评估以下表达方式或语言风格以及使用条件或使用情景是否合适：
+使用条件或使用情景：{situation}
+表达方式或言语风格：{style}
+
+请从以下方面进行评估：
+- 是否是真实群聊中会出现的自然说法，有实际参考价值；
+- 是否涉及具体人名、隐私，或攻击性、不当内容；
+- 情境与表达是否对应，照此说话是否自然得体。
+
+请以JSON格式输出评估结果，不要输出其他任何内容：
+{{"suitable": true或false, "reason": "评估理由（如果不合适，请说明原因）"}}"""
+
+
+def jargon_extraction_prompt(chat_text: str) -> str:
+    """黑话候选提取指令（任务 C）：找出脱离语境看不懂的词。"""
+    return f"""{chat_text}
+
+请从上面这段群聊中提取「可能是黑话」的候选词条（黑话/俚语/网络缩写/圈内梗/口头禅）。
+
+提取规则：
+- 必须为对话中真实出现过的短词或短语
+- 必须是你无法确定含义、或需要当前聊天圈内语境才能理解的词语
+- 不要选择含义清晰的普通词语
+- 排除：人名、@、表情包/图片中的内容、纯标点、常规功能词（如的、了、呢、啊等）
+- 每个词条长度建议 2-8 个字符（不强制），尽量短小
+- 请尽量提取所有可能的黑话，最多 10 个
+
+黑话必须为以下几种类型：
+- 由字母构成的，汉语拼音首字母的简写词，例如：nb、yyds、xswl
+- 英文词语的缩写，用英文字母概括一个词汇或含义，例如：CPU、GPU、API
+- 中文词语的缩写，用几个汉字概括一个词汇或含义，例如：社死、内卷
+- 群聊内部反复使用、但脱离上下文不容易理解的短词或短语
+
+输出要求：
+请仅输出 JSON 数组，不要输出重复内容，不要输出代码块标记。每个元素为一个对象：
+
+[
+  {{"content": "词条"}},
+  {{"content": "词条2"}}
+]
+
+字段说明：
+- content：黑话候选词条的原文
+
+输出 JSON："""
+
+
+def jargon_inference_with_context_prompt(term: str, context_text: str) -> str:
+    """黑话含义推断·带上下文（双路推断的第一路）。"""
+    return f"""**词条内容**
+{term}
+**词条出现的上下文（前缀为【你自己】的是你本人的发言，其内容可能有错，不要参考）**
+{context_text}
+
+请根据上下文，推断"{term}"这个词条的含义。
+- 如果这是一个黑话、俚语、缩写或网络用语，请推断其含义
+- 如果含义明确（常规词汇），也请说明
+- 如果上下文信息不足，无法推断含义，请设置 no_info 为 true
+
+以 JSON 格式输出，不要输出其他任何内容：
+{{"meaning": "详细含义说明（包含使用场景、来源、具体解释等）", "no_info": false}}
+注意：如果信息不足无法推断，请设置 "no_info": true，此时 meaning 可以为空字符串"""
+
+
+def jargon_inference_alone_prompt(term: str) -> str:
+    """黑话含义推断·仅词条（双路推断的第二路，脱离上下文）。"""
+    return f"""**词条内容**
+{term}
+
+请仅根据这个词条本身，推断其含义。
+- 如果这是一个黑话、俚语、缩写或网络用语，请推断其含义
+- 如果含义明确（常规词汇），也请说明
+
+以 JSON 格式输出，不要输出其他任何内容：
+{{"meaning": "详细含义说明（包含使用场景、来源、具体解释等）"}}"""
+
+
+def jargon_compare_inference_prompt(meaning_with_context: str, meaning_alone: str) -> str:
+    """双路推断一致性比对：两次结果一致才认为「真的理解」并入库。"""
+    return f"""**推断结果1（基于上下文）**
+{meaning_with_context}
+
+**推断结果2（仅基于词条）**
+{meaning_alone}
+
+请比较这两个推断结果，判断它们是否相同或类似。
+请忽略细微的差别，关注主要含义是否一致。
+
+以 JSON 格式输出，不要输出其他任何内容：
+{{"is_similar": true或false, "reason": "判断理由"}}"""
