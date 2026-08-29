@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 from candybot.models import ChatRecord
 from candybot.prompts import (
@@ -18,9 +19,13 @@ from candybot.prompts import (
     temporary_style_block,
 )
 
+# 固定本地时刻：断言历史层时间前缀与消息编号用（fromtimestamp 与测试进程同时区）
+TS = datetime(2026, 8, 27, 10, 0, 0).timestamp()
 
-def rec(mid: int, uid: int, nick: str, text: str, is_self=False) -> ChatRecord:
-    return ChatRecord(mid, 42, uid, nick, text, time.time() + mid, is_self=is_self)
+
+def rec(mid: int, uid: int, nick: str, text: str, is_self=False, ts=None) -> ChatRecord:
+    stamp = time.time() + mid if ts is None else ts
+    return ChatRecord(mid, 42, uid, nick, text, stamp, is_self=is_self)
 
 
 PERSONA = "你叫测试君。"
@@ -79,18 +84,62 @@ def test_history_never_returns_empty_when_over_limit():
 
 
 def test_record_role_mapping_and_sender_label():
-    other = record_to_turn(rec(1, 5, "小明", "hi"))
-    mine = record_to_turn(rec(2, 99, "糖糖", "hello", is_self=True))
-    assert other.role == "user" and other.content == "小明(5)：hi"
-    assert mine.role == "assistant" and mine.content == "hello"
+    other = record_to_turn(rec(1, 5, "小明", "hi", ts=TS))
+    mine = record_to_turn(rec(2, 99, "糖糖", "hello", is_self=True, ts=TS))
+    assert other.role == "user" and other.content == "[08-27 10:00] #1 小明(5)：hi"
+    assert mine.role == "assistant" and mine.content == "[08-27 10:00] hello"
 
-    # 指令层同样暴露完整发送者信息
+    # 指令层同样暴露完整发送者信息（不带编号：当前消息的原图在本次调用内）
     prompt = final_user_prompt_judge("2026-08-27 10:00:00", rec(3, 6, "小红", "在吗"))
     assert "来自 小红(6)：" in prompt
+    assert "#" not in prompt.split("【最新消息】", 1)[1].splitlines()[0]
 
     # 昵称为空时退化为纯 QQ 标签
-    anon = rec(4, 7, "", "无昵称")
-    assert record_to_turn(anon).content == "QQ7：无昵称"
+    anon = rec(4, 7, "", "无昵称", ts=TS)
+    assert record_to_turn(anon).content == "[08-27 10:00] #4 QQ7：无昵称"
+
+
+def test_history_time_prefix_is_stable_and_optional():
+    """每条历史回合带发送时间前缀；前缀由 ts 决定、与渲染时刻无关。"""
+    r = rec(1, 5, "小明", "hi", ts=TS)
+    assert record_to_turn(r).content == "[08-27 10:00] #1 小明(5)：hi"
+    # 同一记录反复渲染逐字节相同 → L3 只追加的前缀缓存性质不受影响
+    assert record_to_turn(r).content == record_to_turn(r).content
+
+    # ts<=0（事件缺 time 字段、时间未知）不渲染假时间，编号仍在
+    unknown = rec(2, 5, "小明", "hi", ts=0)
+    assert record_to_turn(unknown).content == "#2 小明(5)：hi"
+
+
+def test_history_groupmate_turns_carry_message_id():
+    """群友回合渲染 #<message_id> 原值（与 drop/recall 的落地链路对齐）；
+    机器人自己的发言（合成负 id）不带编号。"""
+    turn = record_to_turn(rec(1234567890, 5, "小明", "hi", ts=TS))
+    assert turn.content == "[08-27 10:00] #1234567890 小明(5)：hi"
+    # 同一记录反复渲染逐字节相同：编号入库即固定，不破坏前缀缓存
+    r = rec(7, 5, "小明", "hi", ts=TS)
+    assert record_to_turn(r).content == record_to_turn(r).content
+
+    mine = record_to_turn(rec(-9876543210, 99, "糖糖", "hello", is_self=True, ts=TS))
+    assert mine.role == "assistant" and mine.content == "[08-27 10:00] hello"
+    assert "#" not in mine.content  # 绝不给自发言渲染编号
+
+
+def test_nickname_list_ignores_message_id():
+    """L2 成员表剥掉时间与编号前缀后，输出与编号引入之前逐字节一致。"""
+    hist = [
+        record_to_turn(rec(101, 3, "小明", "x", ts=TS)),
+        record_to_turn(rec(202, 4, "小红", "你好", ts=TS)),
+        record_to_turn(rec(303, 3, "小明", "再聊", ts=0)),  # 无时间前缀、只有编号
+        record_to_turn(rec(-5, 99, "糖糖", "me", is_self=True, ts=TS)),
+    ]
+    assert nickname_list_from_history(hist) == ["小明(3)", "小红(4)"]
+
+
+def test_nickname_list_ignores_time_prefix():
+    hist = [record_to_turn(rec(i, 3, "小明", "x", ts=TS)) for i in range(3)]
+    hist.append(record_to_turn(rec(9, 99, "糖糖", "me", is_self=True, ts=TS)))
+    assert nickname_list_from_history(hist) == ["小明(3)"]
 
 
 def test_build_messages_layer_order():

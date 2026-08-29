@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 import pytest
@@ -16,6 +17,15 @@ from candybot.prompts import HistoryTurn, reply_history_turns
 IMG_A = "data:image/png;base64,AAAA"
 IMG_B = "data:image/png;base64,BBBB"
 IMG_C = "data:image/png;base64,CCCC"
+
+# 历史回合开头的发送时间前缀（[MM-DD HH:MM] ）与 #消息编号，断言时先剥除
+TIME_PREFIX = re.compile(r"^\[\d{2}-\d{2} \d{2}:\d{2}\] ")
+ID_PREFIX = re.compile(r"^#\d+ ")
+
+
+def strip_prefixes(text: str) -> str:
+    """剥掉回合首行的时间前缀与 #消息编号，返回发送者标签起的正文。"""
+    return ID_PREFIX.sub("", TIME_PREFIX.sub("", text, count=1), count=1)
 
 
 def img_record(mid: int, *, images=(IMG_A,), states=(), summaries=None, text="看图") -> ChatRecord:
@@ -79,7 +89,10 @@ def test_reply_turn_renders_each_image_shape():
     (turn,) = turns
     assert turn.images == (IMG_C,)
     body_lines = turn.content.splitlines()
-    assert body_lines[0] == "u9(1009)：前文"
+    assert strip_prefixes(body_lines[0]) == "u9(1009)：前文"
+    assert TIME_PREFIX.match(body_lines[0]), "历史回合应带发送时间前缀"
+    numbered = TIME_PREFIX.sub("", body_lines[0], count=1)
+    assert numbered.startswith("#9 "), "群友回合应带 message_id 原值作 #消息编号"
     assert "[图片：一只猫]" in body_lines[1:]
     assert "[图片]" in body_lines[1:]
     assert turn.content.count("[图片]") == 1  # 占位行不再重复出现
@@ -105,7 +118,8 @@ def test_reply_turn_plain_when_no_extra_notes():
     plain = img_record(4, images=(), text="没图")
     turns, _ = reply_history_turns([rec, plain], max_chars=10**6, max_images=8)
     assert turns[0].images == ()
-    assert turns[1].content == "u4(1004)：没图" and isinstance(turns[1], HistoryTurn)
+    assert strip_prefixes(turns[1].content) == "u4(1004)：没图"
+    assert isinstance(turns[1], HistoryTurn)
 
 
 def test_reply_history_image_cap_drops_oldest_first():

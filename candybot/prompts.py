@@ -6,8 +6,11 @@ API 侧的前缀缓存按 token 精确匹配自前往后命中，因此本模块
 L1 system·静态层   persona 与行为守则，字节级不变（不插值任何动态信息）；
 L2 system·状态层   群号、上下文昵称表、今天的日期、最近 N 天的群聊印象——
                    同一天内不变（印象经 GroupRuntime 快照缓存，天内字节级稳定）；
-L3 历史层          只追加、从头整块淘汰的群聊记录，映射为连续 user/assistant
-                   （direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
+L3 历史层          只追加、从头整块淘汰的群聊记录，映射为连续 user/assistant；
+                   每条消息带入库即固定的发送时间前缀 [MM-DD HH:MM]，群友消息
+                   还带 #message_id 消息编号（两者由 ts 与 message_id 决定、
+                   入库后永不改写，前缀缓存的只追加性质不受影响；
+                   direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
 L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分、学习注入的
                    表达/黑话参考、重复回复提醒、临时随机风格、AI 味拦截重写
                    要求）与本次指令。
@@ -18,6 +21,7 @@ L4 user·指令层     即时信息（精确时间、触发类型、冷却状态
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -58,7 +62,7 @@ _RULES_TAIL_TOOLS = """
 5. 你发送到群里的消息应该像是一个真实的人类说的，而不是作为助手说的。
 6. Markdown是**绝对禁用**的，没有人会在实际回答中使用Markdown.
 7. 真实的人打字时极少使用Emoji，你的回复绝大多数时候应完全不含Emoji；即使偶尔想用也不要超过一个
-8. 历史消息以「昵称(QQ号)：内容」呈现，每条开头还有 #数字 消息编号。带编号消息里的图片可能以原图、「[图片：一句话总结]」或「[图片]」占位符三种形态出现。
+8. 历史消息以「昵称(QQ号)：内容」呈现，群友消息开头还有 #数字 消息编号，以及 [MM-DD HH:MM] 发送时间（年份同今天，跨年自行推断）；你自己的发言不带编号。drop_img/recall_img 要填的就是这个 # 后面的数字。带编号的群友消息里的图片可能以原图、「[图片：一句话总结]」或「[图片]」占位符三种形态出现。
 9. 如果历史里某张以原图出现的图片你确定以后用不到了，调用 send_reply 时把它所在消息的编号写进 drop_img 参数，之后系统只为你保留它的总结或占位符。
 10. 如果你需要查看某张此前已变成总结或占位符的旧图，把它的消息编号写进 send_reply 的 recall_img 参数，随后你会重新看到那张原图（本次回复会基于它重写）。两个参数都不要滥用。"""
 
@@ -71,7 +75,7 @@ _RULES_TAIL_TEXT = """
 5. 你发送到群里的消息应该像是一个真实的人类说的，而不是作为助手说的。
 6. Markdown是**绝对禁用**的，没有人会在实际回答中使用Markdown.
 7. 真实的人打字时极少使用Emoji，你的回复绝大多数时候应完全不含Emoji；即使偶尔想用也不要超过一个
-8. 历史消息以「昵称(QQ号)：内容」呈现，每条开头还有 #数字 消息编号。带编号消息里的图片可能以原图、「[图片：一句话总结]」或「[图片]」占位符三种形态出现。
+8. 历史消息以「昵称(QQ号)：内容」呈现，群友消息开头还有 #数字 消息编号，以及 [MM-DD HH:MM] 发送时间（年份同今天，跨年自行推断）；你自己的发言不带编号。drop_img/recall_img 要填的就是这个 # 后面的数字。带编号的群友消息里的图片可能以原图、「[图片：一句话总结]」或「[图片]」占位符三种形态出现。
 9. 如果历史里某张以原图出现的图片你确定以后用不到了，在回复最末尾另起一行输出 <drop_img 消息编号>，之后系统只为你保留它的总结或占位符；该标记会被剥除，不会发到群里。
 10. 如果你需要查看某张此前已变成总结或占位符的旧图，在回复最末尾另起一行输出 <recall_img 消息编号>，随后你会重新看到那张原图（本次回复会基于它重写）；同样不会发到群里。两个标记都不要滥用。"""
 
@@ -176,13 +180,49 @@ def record_label(record: ChatRecord) -> str:
     return f"QQ{record.user_id}"
 
 
+# ------------------------------------------------------ 发送时间前缀与消息编号
+
+# 与 record_time_prefix 的输出格式严格对应，供昵称解析剥除。
+_TIME_PREFIX_RE = re.compile(r"^\[\d{2}-\d{2} \d{2}:\d{2}\] ")
+
+# 与 _groupmate_head 渲染的编号段严格对应，供昵称解析剥除。
+_ID_PREFIX_RE = re.compile(r"^#\d+ ")
+
+
+def record_time_prefix(record: ChatRecord) -> str:
+    """历史消息的发送时间前缀：`[MM-DD HH:MM] `（含尾随空格）。
+
+    前缀由入库即固定的 ts 决定、永不改写，渲染结果逐字节稳定，
+    不破坏 L3 只追加的前缀缓存性质。年份不进前缀：L2 已有「今天」的
+    完整日期，模型可据此推断跨年。ts<=0（事件缺 time 字段、时间未知，
+    见 database 的图片回收约定）返回空串，绝不渲染一个假时间。
+    """
+    if record.ts <= 0:
+        return ""
+    return datetime.fromtimestamp(record.ts).strftime("[%m-%d %H:%M] ")
+
+
+def _groupmate_head(record: ChatRecord) -> str:
+    """群友历史回合的头部：时间前缀 + `#<message_id> ` + `昵称(QQ号)：`。
+
+    编号取 message_id 原值：模型在 drop_img/recall_img 里交回的编号，落地时
+    正是作为 message_id 经 bot._apply_image_ops 查库切换图片状态的；窗口内
+    另编的序号会随头部整块淘汰而漂移，也与这条链路对不上。message_id 入库
+    即固定、永不改写，编号渲染因此逐字节稳定。机器人自己的发言不走这里：
+    自发言的 id 是合成的负数（bot._next_self_message_id），标记解析只认非负
+    整数，且它们本就没有可供 drop/recall 的图片，故 assistant 回合不渲染编号。
+    """
+    return f"{record_time_prefix(record)}#{record.message_id} {record_label(record)}："
+
+
 # ---------------------------------------------------------------- L3 历史层
 
 def record_to_turn(record: ChatRecord) -> HistoryTurn:
-    """单条记录 → 历史回合。群友消息统一 '昵称(QQ号)：内容' 前缀，自己则是裸文本。"""
+    """单条记录 → 历史回合。群友消息为「[时间] #编号 昵称(QQ号)：内容」，
+    自己的发言是时间前缀后的裸文本、不带编号（编号语义见 _groupmate_head）。"""
     if record.is_self:
-        return HistoryTurn("assistant", record.text or "[空]")
-    return HistoryTurn("user", f"{record_label(record)}：{record.text}")
+        return HistoryTurn("assistant", f"{record_time_prefix(record)}{record.text or '[空]'}")
+    return HistoryTurn("user", f"{_groupmate_head(record)}{record.text}")
 
 
 def history_to_turns(
@@ -211,7 +251,7 @@ def _reply_turn(record: ChatRecord) -> HistoryTurn:
     一致的纯文本回合。
     """
     if record.is_self:
-        return HistoryTurn("assistant", record.text or "[空]")
+        return HistoryTurn("assistant", f"{record_time_prefix(record)}{record.text or '[空]'}")
     show: list[str] = []
     notes: list[str] = []
     for index, data_url in enumerate(record.images):
@@ -222,7 +262,7 @@ def _reply_turn(record: ChatRecord) -> HistoryTurn:
             # 非展示形态，或形态为 show 但原图已被回收（防御：按占位处理）
             summary = record.summary_of(index)
             notes.append(f"[图片：{summary}]" if summary else "[图片]")
-    plain = HistoryTurn("user", f"{record_label(record)}：{record.text}")
+    plain = HistoryTurn("user", f"{_groupmate_head(record)}{record.text}")
     if not show and not notes:
         return plain
     # 正文里入站时留下的 [图片] 行按各图实际形态重新落位，避免重复展示
@@ -231,7 +271,7 @@ def _reply_turn(record: ChatRecord) -> HistoryTurn:
         for ln in record.text.splitlines()
         if ln.strip() and ln.strip() != "[图片]"
     ).strip()
-    head = f"{record_label(record)}：{body or '[图片]'}"
+    head = f"{_groupmate_head(record)}{body or '[图片]'}"
     content = "\n".join([head, *notes]) if notes else head
     return HistoryTurn("user", content, tuple(show))
 
@@ -523,13 +563,18 @@ def build_messages(
 
 
 def nickname_list_from_history(history: Sequence[HistoryTurn]) -> list[str]:
-    """取历史 user 回合中的昵称集合（保序去重），供 L2 使用。"""
+    """取历史 user 回合中的昵称集合（保序去重），供 L2 使用。
+
+    首行的时间前缀与 #消息编号一并剥除后按「：」取发送者标签，
+    输出与编号引入之前逐字节一致（L2 成员表因此不受编号影响）。
+    """
     seen: set[str] = set()
     names: list[str] = []
     for turn in history:
         if turn.role != "user":
             continue
-        name = turn.content.split("：", 1)[0].strip()
+        text = _ID_PREFIX_RE.sub("", _TIME_PREFIX_RE.sub("", turn.content, count=1), count=1)
+        name = text.split("：", 1)[0].strip()
         if name and name not in seen:
             seen.add(name)
             names.append(name)

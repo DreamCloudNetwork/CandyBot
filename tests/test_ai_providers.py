@@ -274,8 +274,8 @@ async def test_reconsider_reply_keeps_full_history_and_uses_tool(monkeypatch):
     (called,) = _called_instances(instances)
     messages = called.create_kwargs["messages"]
     assert {"role": "assistant", "content": "涨是涨了"} in messages
-    # 插话没有被当「当前消息」剥出历史：它就是最后一回合
-    assert messages[-2] == {"role": "user", "content": "群友(3)：不是"}
+    # 插话没有被当「当前消息」剥出历史：它就是最后一回合（ts=0 只剩编号前缀）
+    assert messages[-2] == {"role": "user", "content": "#1 群友(3)：不是"}
     assert "但跟别家比还是便宜得离谱" in messages[-1]["content"]
     assert called.create_kwargs["tools"][0]["function"]["name"] == "send_reply"
 
