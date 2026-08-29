@@ -16,6 +16,7 @@ import logging
 import random
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable
 from datetime import date
 
 import aiohttp
@@ -96,8 +97,16 @@ class GroupRuntime:
 
 
 class CandyBot:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        settings_loader: Callable[[], Settings] | None = None,
+    ):
         self._settings = settings
+        # 热重载时重建 Settings 快照的来源（由 build_bot 传入
+        # lambda: load_settings(Config)）；不传则该实例不支持热重载
+        # （如测试里手工注入 settings）。
+        self._settings_loader = settings_loader
         self._dedup = MessageDedup()
         # 内存热缓存容量取全局最大上下文需求的 2 倍（仍有界）；文本历史
         # 在 candy.db 里全量保留，图片按 storage.image_retention_days 回收
@@ -177,6 +186,58 @@ class CandyBot:
         await self._http.close()
         await self._snowluma.stop()
         await self._memory.close()
+
+    # ------------------------------------------------------------ 配置热重载
+
+    def reload_settings(self) -> bool:
+        """重新解析 config.json5 并原子替换运行时配置（热重载入口）。
+
+        由 main.py 经 loop.call_soon_threadsafe 调度到事件循环线程调用，与
+        消息处理天然串行，无需额外加锁。启动时已烘进监听/子进程会话的字段
+        无法就地更换、改动仍需重启：bot.listen_host / listen_port /
+        event_secret（aiohttp 监听与签名校验已绑定）、bot.data_dir、
+        snowluma.*（MCP 子进程会话）；热缓存容量也在启动时按全局最大
+        context_size 定死（新配置超出时记警告）。其余（白名单、人设、护栏
+        阈值、模型与生成参数、多模态、输出后处理、限速、图片保留天数）
+        即时生效。
+
+        解析失败（典型场景：配置写坏）完整记日志但不拖垮服务：沿用旧配置，
+        下一次保存自动重试。返回是否实际完成了替换。
+        """
+        if self._settings_loader is None:
+            logger.warning("未携带 settings_loader 的 CandyBot 实例，配置热重载不可用")
+            return False
+        try:
+            new_settings = self._settings_loader()
+        except Exception:
+            logger.exception("配置重载失败，继续使用旧配置")
+            return False
+        self._settings = new_settings
+        # 模型端点、生成参数与多模态模式都烘在 AIClient 构造函数里，须随
+        # 配置重建；进行中的请求持有的是旧实例引用，会正常完成。工具协议
+        # 降级状态随之重置，最多多一次降级往返，不影响正确性。
+        self._ai = AIClient(
+            models=new_settings.models,
+            generation=new_settings.generation,
+            multimodal_mode=new_settings.multimodal.mode,
+        )
+        # 每日回收循环每轮现读该属性，替换后即生效
+        self._memory.image_retention_days = new_settings.storage.image_retention_days
+        # 与 __init__ 里容量推导同式的口径：新配置要求更长的上下文时热缓存
+        # 不会跟着扩，历史会偏短——提示重启而不是静默降容
+        max_context = max(
+            [p.context_size for p in new_settings.groups.values()]
+            + [new_settings.groups_default.context_size]
+        )
+        if max_context * 2 > self._memory.default_capacity:
+            logger.warning(
+                "新配置的 context_size（%d）超出启动时确定的热缓存容量（%d），"
+                "历史会偏短，如需完全生效请重启",
+                max_context,
+                self._memory.default_capacity,
+            )
+        logger.info("配置已热重载")
+        return True
 
     # ------------------------------------------------------------ 事件入口
 
@@ -812,9 +873,13 @@ class CandyBot:
 
 
 def build_bot(config_file: str = "config.json5") -> CandyBot:
-    """从项目根目录 config.py 的 ConfigClass 构造 CandyBot。"""
+    """从项目根目录 config.py 的 ConfigClass 构造 CandyBot。
+
+    同时传入 settings_loader：配置热重载时基于 Config 单例当前内存中的
+    原始配置重新解析与校验，无需重启进程。
+    """
     from config import Config  # 用户已有的 JSON5 配置单例
 
     Config._config_file = config_file
     Config.load_config()
-    return CandyBot(load_settings(Config))
+    return CandyBot(load_settings(Config), settings_loader=lambda: load_settings(Config))

@@ -70,6 +70,13 @@ uv run main.py                   # 启动
 
 `bot.self_qq` 也可在机器人名字上体现——发送的记忆里机器人昵称固定为「糖糖」，若你在 persona 里另取了名字请保持一致或修改 `candybot/bot.py` 中的昵称常量。
 
+## 配置热重载
+
+程序监听 `config.json5` 所在目录（而非文件本身，编辑器原子保存会替换 inode、单文件 watch 会静默失效），保存后自动重新解析并替换运行时配置，日志出现「配置文件被修改，正在重载」即成功；配置写坏时完整记录解析错误并沿用旧配置继续运行，修好再保存自动恢复（替换动作在事件循环线程上执行，与消息处理串行）。
+
+- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置）、`generation`、`multimodal`、`response_post_process`、`rate_limit`、`storage.image_retention_days`、`bot.self_qq`、`bot.log_level`。
+- **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret`（aiohttp 监听与签名校验在启动时已绑定）、`bot.data_dir`、`snowluma.*`（MCP 子进程会话）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
+
 ## 行为逻辑
 
 ```mermaid

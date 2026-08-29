@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+
 from watchdog.observers import Observer
 
 from candybot import __version__
 from candybot.bot import build_bot
-from config import ConfigFileEventHandler
+from config import Config, ConfigFileEventHandler
 
 logging.basicConfig(
     level=logging.INFO,  # 配置加载前先用默认级别；读取 bot.log_level 后再覆盖
@@ -57,8 +59,25 @@ async def run() -> int:
     logger.info("CandyBot v%s 启动中…", __version__)
     await bot.start()
     logger.info("CandyBot 已就绪，等待事件…")
+    # 配置热重载：watchdog 观察线程触发 → call_soon_threadsafe 调回事件循环
+    # 原子替换运行时配置（与消息处理串行，见 CandyBot.reload_settings），
+    # 日志级别随之更新。监听的是配置文件所在目录而非文件本身，原因见
+    # config.ConfigFileEventHandler 的 docstring。
+    config_path = os.path.abspath(Config._config_file)
+
+    def on_config_reload() -> None:
+        if bot.reload_settings():
+            apply_log_level(bot.log_level)
+
     observer = Observer()
-    observer.schedule(ConfigFileEventHandler(), "./config.json5", recursive=True)
+    observer.schedule(
+        ConfigFileEventHandler(
+            config_file=config_path,
+            on_reload=lambda: loop.call_soon_threadsafe(on_config_reload),
+        ),
+        os.path.dirname(config_path),
+        recursive=False,
+    )
     observer.start()
     try:
         await stop_event.wait()
