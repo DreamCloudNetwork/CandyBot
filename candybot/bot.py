@@ -3,12 +3,17 @@
 每群一个串行 asyncio 队列保证决策顺序。@ 必答与「对方正在和我说话」的
 消息（judge 判定为延续与本机器人的对话）不受冷却和护栏限制；其余主动
 插话需依次通过冷却、发言间隔、热闹静默三道护栏及判定门槛。
+
+连发期间（生成中或打字延迟中）一旦有他人新消息进入记忆，下一条发出前
+会先让 reply 模型对剩余腹稿重想一次：可以放弃、改写或照原样继续，防止
+别人已经插话、AI 却把打好的字一条条硬发完。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import defaultdict, deque
 from datetime import date
@@ -28,6 +33,12 @@ from .models import (
     load_settings,
 )
 from .normalize import normalize_group_message
+from .postprocess import (
+    ProcessedReply,
+    ensure_indexes,
+    estimate_typing_time,
+    process_reply,
+)
 from .prompts import (
     nickname_list_from_history,
     now_text as fmt_now_text,
@@ -38,6 +49,24 @@ from .prompts import (
 from .snowluma import SnowlumaClient
 
 logger = logging.getLogger(__name__)
+
+# 一轮连发最多几次「被打断后重想」：每次重想是一回额外的 reply 模型调用，
+# 预算用尽后剩下的腹稿按原计划发完，防止病态刷屏把发送环节变成无限往返。
+_MAX_RECONSIDER_PER_BURST = 2
+
+
+def _verbatim_match(text: str, pending: list[str]) -> bool:
+    """重想输出是否与腹稿一字不差（忽略行间空白差异）。
+
+    模型的复读常带尾部空白或空行，也可能沿用「一行一条」之外的换行习惯；
+    不规范化就会误判成改写，让已经掷好的错别字与更正被 process_reply
+    重新加工一遍。
+    """
+
+    def norm(s: str) -> str:
+        return "\n".join(line.strip() for line in s.splitlines() if line.strip())
+
+    return norm(text) == norm("\n".join(pending))
 
 
 class GroupRuntime:
@@ -101,6 +130,9 @@ class CandyBot:
         self._daily_replies: int = 0
         self._last_self_message_id: int = 0
         self._stopping = False
+        # 输出层后处理的随机源（拆条兜底/错别字/更正掷点）；与 ai.py 的
+        # 约定一致走加密安全随机，测试可替换为固定种子的 random.Random。
+        self._pp_rng: random.Random = random.SystemRandom()
 
     # ------------------------------------------------------------ 生命周期
 
@@ -111,6 +143,11 @@ class CandyBot:
 
     async def start(self) -> None:
         await self._memory.start()  # 建表 + 每日图片回收循环
+        pp = self._settings.response_post_process
+        if pp.enabled and (pp.typo_error_rate > 0 or pp.typo_word_replace_rate > 0):
+            # 拼音反查表构建一次约 0.6 秒：在后台线程预热，避免首条带错字
+            # 的回复把事件循环卡住（所有群的队列和事件接收一起冻半秒）
+            await asyncio.to_thread(ensure_indexes)
         await self._snowluma.start()
         await self._snowluma.probe()
         login = await self._snowluma.query_login_info()
@@ -128,8 +165,14 @@ class CandyBot:
 
     async def stop(self) -> None:
         self._stopping = True
-        for task in list(self._queue_workers.values()):
+        workers = list(self._queue_workers.values())
+        for task in workers:
             task.cancel()
+        # 必须等 worker 真正退出再关连接池：连发写回内存里，被取消的 worker
+        # 可能正卡在一次数据库写入上（sqlalchemy aiosqlite 用 shield 保护
+        # 在途操作），此时并行 dispose 会让双方互相等待，进程退出被挂死。
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         await self._server.stop()
         await self._http.close()
         await self._snowluma.stop()
@@ -256,6 +299,57 @@ class CandyBot:
         if not decision.should_reply:
             return
 
+        # 以决策时刻的消息集为基线：之后（生成中或连发打字中）只要记忆里
+        # 新进了他人的消息，就算「被打断」——下一条发出前先让 reply 模型对
+        # 剩下的腹稿重想一次（见 _send_reply_segments 与 reconsider）。
+        memory = await self._memory.get(group_id)
+        seen_ids = {r.message_id for r in memory.tail(len(memory))}
+        reconsider_left = _MAX_RECONSIDER_PER_BURST
+
+        async def reconsider(sent: list[str], pending: list[str]) -> ProcessedReply | None:
+            """被打断后的重想调用。
+
+            返回新发送计划；返回 None 表示没法重想（预算用尽或调用失败，
+            调用方按原计划继续）；返回空计划表示模型决定放弃剩余消息。
+            """
+            nonlocal reconsider_left
+            if reconsider_left <= 0:
+                logger.debug("群 %d 本轮连发的重想预算用尽，按原计划继续", group_id)
+                return None
+            reconsider_left -= 1
+            recent = memory.tail(profile.context_size)
+            static_system = runtime.static_system(
+                "reply", profile.persona, via_tool=self._ai.reply_tool_use
+            )
+            nicknames = nickname_list_from_history([record_to_turn(r) for r in recent])
+            runtime_system = runtime_system_prompt(
+                group_id, date.today().isoformat(), nicknames
+            )
+            draft = await self._generate_with_retry(
+                self._ai.reconsider_reply,
+                static_system,
+                runtime_system,
+                recent,
+                fmt_now_text(),
+                sent_segments=tuple(sent),
+                pending_segments=tuple(pending),
+            )
+            if draft is None:
+                logger.warning("群 %d 被打断后重想调用失败，按原计划继续", group_id)
+                return None
+            if draft.ops:
+                await self._apply_image_ops(group_id, memory, list(draft.ops))
+            if not draft.text:
+                return ProcessedReply([], [])  # 空计划＝放弃剩余
+            if _verbatim_match(draft.text, pending):
+                # 一字不改地要继续：沿用原计划本身（连同已经掷好的错别字
+                # 与更正），别让「重想」把该发的话再重新加工一遍
+                logger.debug("群 %d 重想后决定照原样继续", group_id)
+                return None
+            return process_reply(
+                draft.text, self._settings.response_post_process, rng=self._pp_rng
+            )
+
         reply_text = await self._compose_reply(group_id, msg, profile, runtime, decision)
         if not reply_text:
             logger.info("群 %d 回复生成为空，放弃发送", group_id)
@@ -263,29 +357,43 @@ class CandyBot:
         if not decision.forced and not self._consume_daily_quota():
             logger.info("达到 global_daily_limit，本次主动回复被拦截")
             return
+        # 输出层拟人化后处理：拆条 + 打字延迟 + 错别字/更正（见 postprocess）
+        processed = process_reply(
+            reply_text, self._settings.response_post_process, rng=self._pp_rng
+        )
+        # 插话重想链路同受后处理总开关约束：enabled=False 时发送链路必须
+        # 与未引入后处理前完全一致（整条单发、不放弃不改写、不多花调用）。
+        sent_count = 0
         try:
-            await self._send_with_retry(group_id, reply_text)
-        except Exception as exc:
-            logger.error("群 %d 发送失败：%s", group_id, exc)
+            sent_count = await self._send_reply_segments(
+                group_id,
+                processed,
+                seen_ids=seen_ids,
+                reconsider=(
+                    reconsider if self._settings.response_post_process.enabled else None
+                ),
+            )
+        except Exception:
+            # 发送链路内部已消化重试耗尽的失败；走到这里说明是预期外的
+            # 错误（如重想闭包里的缺陷），不记账也不退配额，保守放过。
+            logger.exception("群 %d 回复发送环节异常", group_id)
             return
-
-        # 只有主动插话消耗并刷新冷却；@ 必答和对话延续都不该把正在进行的
-        # 交流掐断。无论哪种触发，间隔都从本条发言后重新累计。
+        if not sent_count:
+            # 一条正文也没发出去（重想后全部放弃，或首条即发送失败）：
+            # 退还本次主动回复的日配额、不刷新冷却与发言间隔——什么都没
+            # 说却消耗节制，会把 prompts 里承诺「稍后照常回应」的插话本身
+            # 拦在护栏之外。
+            if not decision.forced:
+                self._refund_daily_quota()
+            return
+        # 哪怕后续条目发送失败，只要已经开口就该记账：护栏的语义是「距
+        # 上次发言」，已发出的消息在群里是真实存在的。只有主动插话消耗并
+        # 刷新冷却；@ 必答和对话延续都不该把正在进行的交流掐断。
+        # 自发言的记忆写回不在这里：_send_reply_segments 每成功发出一条就
+        # 立即把该条写回，连发期间穿插进来的他人消息才能落在真实位置。
         if not decision.forced and not decision.engaged:
             runtime.last_proactive_ts = time.time()
         runtime.msgs_since_reply = 0
-
-        sent_record = ChatRecord(
-            message_id=self._next_self_message_id(),
-            group_id=group_id,
-            user_id=self._settings.bot.self_qq,
-            nickname="糖糖",
-            text=reply_text,
-            ts=time.time(),
-            is_self=True,
-        )
-        memory = await self._memory.get(group_id)
-        await memory.append(sent_record)
 
     async def _compose_reply(
         self,
@@ -317,6 +425,7 @@ class CandyBot:
                 group_id, date.today().isoformat(), nicknames
             )
             draft = await self._generate_with_retry(
+                self._ai.generate_reply,
                 static_system,
                 runtime_system,
                 recent,
@@ -503,12 +612,17 @@ class CandyBot:
 
     # ------------------------------------------------------------ 重试包装
 
-    async def _generate_with_retry(self, *args, **kwargs) -> ReplyDraft | None:
+    async def _generate_with_retry(self, fn, *args, **kwargs) -> ReplyDraft | None:
+        """带指数退避地调用一个 reply 模型的生成函数（generate/reconsider）。
+
+        两次都失败返回 None——调用方须把它与「模型主动输出空正文」区分开：
+        前者按原计划继续，后者才是模型的明确决定。
+        """
         delay = 2.0
         last_exc: Exception | None = None
         for attempt in range(2):
             try:
-                return await self._ai.generate_reply(*args, **kwargs)
+                return await fn(*args, **kwargs)
             except Exception as exc:
                 last_exc = exc
                 logger.warning("生成回复第 %d 次失败：%s", attempt + 1, exc)
@@ -517,18 +631,156 @@ class CandyBot:
         logger.error("生成回复最终失败：%s", last_exc)
         return None
 
-    async def _send_with_retry(self, group_id: int, text: str) -> None:
+    async def _send_reply_segments(
+        self,
+        group_id: int,
+        processed: ProcessedReply,
+        *,
+        seen_ids: set[int],
+        reconsider=None,
+    ) -> int:
+        """逐条发送拆条结果，制造真人连发多条的打字节奏。
+
+        返回实际成功发出的正文条数（更正不计）：调用方据此决定护栏记账与
+        日配额退还——「一条都没发出去」和「发过言」是两种必须区分的结局。
+        第一条不等待：LLM 生成本身的耗时就是自然延迟。后续每条（含错别字
+        更正）先按本条文本估算打字时长 sleep，再走现有的 3 次重试发送；
+        任何一条最终失败都记错误日志并放弃剩余条目（不再向上抛出，
+        已经发出的条数不能随异常一起丢失）。
+        发出每一条之前先看有没有被打断：基线（seen_ids）之后新入库的他人
+        消息即插话，此时先请 reconsider 对剩余腹稿重想——放弃（直接返回，
+        旧计划的更正也随之作废）、换上新计划继续，或（重想不可得时）按原
+        计划照发。被打断却对插话视若无睹地刷屏，比闭嘴更像机器人。
+        每条正文发送成功后立即以对应的无错字原文单独写回记忆
+        （memory_segments 与 messages 下标对齐）：写回时机跟着发送走，
+        插话才会落在真实的时间位置，自己的多条发言在历史里也是各自独立
+        的 assistant 回合；被放弃的腹稿从未发出，也就从不进入记忆。
+        错别字更正只是面向群友的表层噪音，不进记忆。
+        更正消息用 OneBot v11 reply 消息段引用最后一条正文（SnowLuma 的
+        send_group_msg 返回 message_id）；拿不到 id 时退回不带引用的纯文本，
+        并记警告日志。
+        """
+        memory = await self._memory.get(group_id)
+        speed = self._settings.response_post_process.typing_speed
+        plan = processed
+        index = 0
+        sent_clean: list[str] = []
+        last_sent_id: int | None = None
+        while True:
+            if sent_clean:  # 本轮连发已开口：每条之前都要有打字间隔
+                await self._typing_delay(
+                    group_id,
+                    len(sent_clean) + 1,
+                    len(sent_clean) + len(plan.messages) - index,
+                    plan.messages[index],
+                    speed,
+                )
+            if reconsider is not None:
+                interrupted = [
+                    r
+                    for r in memory.tail(len(memory))
+                    if not r.is_self and r.message_id not in seen_ids
+                ]
+                if interrupted:
+                    logger.info(
+                        "群 %d 连发被 %d 条新消息打断，重想剩下的 %d 条腹稿",
+                        group_id,
+                        len(interrupted),
+                        len(plan.messages) - index,
+                    )
+                    seen_ids.update(r.message_id for r in interrupted)
+                    outcome = await reconsider(
+                        sent_clean, plan.memory_segments[index:]
+                    )
+                    if outcome is not None:
+                        if not outcome.messages:
+                            logger.info(
+                                "群 %d 重想后决定到此为止：剩余腹稿不再发送", group_id
+                            )
+                            return len(sent_clean)
+                        plan, index = outcome, 0
+                        continue  # 新计划同样先延迟、再查一次是否又被插话
+            try:
+                mid = await self._send_with_retry(group_id, plan.messages[index])
+            except Exception as exc:
+                logger.error(
+                    "群 %d 发送失败：%s（已发出 %d 条，放弃剩余条目）",
+                    group_id,
+                    exc,
+                    len(sent_clean),
+                )
+                return len(sent_clean)
+            await memory.append(
+                self._self_record(group_id, plan.memory_segments[index])
+            )
+            sent_clean.append(plan.memory_segments[index])
+            if mid is not None:
+                last_sent_id = mid  # message_id 0 是合法 id，不能走 or 短路
+            index += 1
+            if index >= len(plan.messages):
+                break
+        if plan.correction:
+            total = len(sent_clean) + 1
+            await self._typing_delay(group_id, total, total, plan.correction, speed)
+            segments: list[dict] = []
+            if last_sent_id is not None:
+                segments.append({"type": "reply", "data": {"id": str(last_sent_id)}})
+            else:
+                logger.warning(
+                    "群 %d 发送响应未返回 message_id，错别字更正不带引用直接发送", group_id
+                )
+            segments.append({"type": "text", "data": {"text": plan.correction}})
+            try:
+                await self._send_with_retry(group_id, segments)
+            except Exception as exc:
+                # 正文已全部发出，只是更正这条噪音没送出去：记日志即可，
+                # 不能让已发言的记账跟着丢失。
+                logger.error("群 %d 发送失败：%s（更正消息作废）", group_id, exc)
+        return len(sent_clean)
+
+    async def _typing_delay(
+        self,
+        group_id: int,
+        index: int,
+        total: int,
+        message: str,
+        speed: float,
+    ) -> None:
+        """按下一条消息的估算打字时长等待；speed 为 0 时直接跳过。"""
+        delay = estimate_typing_time(message, speed)
+        logger.debug(
+            "群 %d 第 %d/%d 条预计打字 %.1f 秒", group_id, index, total, delay
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _send_with_retry(
+        self, group_id: int, message: str | list[dict]
+    ) -> int | None:
+        """发送一条消息（文本或 OneBot 段数组），返回其 message_id。"""
         delay = 1.5
         for attempt in range(3):
             try:
-                await self._snowluma.send_group_msg(group_id, text)
-                return
+                return await self._snowluma.send_group_msg(group_id, message)
             except Exception as exc:
                 if attempt == 2:
                     raise
                 logger.warning("发送第 %d 次失败：%s", attempt + 1, exc)
                 await asyncio.sleep(delay)
                 delay *= 2
+        return None  # pragma: no cover —— 最后一次失败必抛
+
+    def _self_record(self, group_id: int, text: str) -> ChatRecord:
+        """自己发出的一条消息对应的记忆记录（发送成功后逐条写回）。"""
+        return ChatRecord(
+            message_id=self._next_self_message_id(),
+            group_id=group_id,
+            user_id=self._settings.bot.self_qq,
+            nickname="糖糖",
+            text=text,
+            ts=time.time(),
+            is_self=True,
+        )
 
     def _next_self_message_id(self) -> int:
         """自发言的合成负 id：绝不与真实消息的正 id 冲突，且进程内严格
@@ -550,6 +802,13 @@ class CandyBot:
             return False
         self._daily_replies += 1
         return True
+
+    def _refund_daily_quota(self) -> None:
+        """退还一次主动回复的日配额：配额语义是「每日主动发言数」，
+        重想全部放弃或首条即发送失败时其实一句话都没说。跨天重置后计数
+        已属于新的一天，不退昨天的账。"""
+        if date.today() == self._daily_date and self._daily_replies > 0:
+            self._daily_replies -= 1
 
 
 def build_bot(config_file: str = "config.json5") -> CandyBot:

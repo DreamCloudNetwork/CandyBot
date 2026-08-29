@@ -21,17 +21,19 @@ import logging
 import os
 import random
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from .models import ChatRecord, GenerationSettings, ModelConfig, ModelSettings
+from .postprocess import EMOJI_RE as _EMOJI_RE
 from .prompts import (
     Message,
     final_user_prompt_judge,
     final_user_prompt_judge_recheck,
+    final_user_prompt_reconsider,
     final_user_prompt_reply,
     history_to_turns,
     reply_history_turns,
@@ -53,20 +55,7 @@ _IMAGE_OP_ANY_RE = re.compile(r"</?(?:drop_img|recall_img)\b[^<>]*>")
 # 从 <think> 起全部删除；孤立的 </think> 一并清理。思考内容绝不能参与判定或回复。
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>|<think>[\s\S]*$|</think>")
 
-# 基础 emoji 字符范围。刻意不含几何符号（U+25A0~25FF）等普通文本符号区，
-# 颜文字 (=^ω^=)、(・ω・) 与箭头 ↑ 不会误伤。
-_EMOJI_CHARS = (
-    "\U0001F000-\U0001FAFF"  # 象形符号/表情/补充表情各区
-    "\u2600-\u27BF"          # 杂项符号与装饰符（☀ ✅ ❤）
-    "\u2B00-\u2BFF"          # 星形与常见聊天箭头（⭐ ⭕ ⬛）
-)
-# emoji 序列：国旗按成对区域指示符算一个，键帽含数字本身，
-# 其余为单个基础字符 + 变体选择符/肤色修饰 + ZWJ 组合的完整序列。
-_EMOJI_RE = re.compile(
-    "[\U0001F1E6-\U0001F1FF]{2}"
-    "|[1-9#*]\uFE0F?\u20E3"
-    f"|[{_EMOJI_CHARS}](?:[\uFE0F\U0001F3FB-\U0001F3FF]|\u200D[{_EMOJI_CHARS}])*"
-)
+# emoji 序列的识别规则与输出层后处理共用，定义见 postprocess.EMOJI_RE。
 
 # 概率掷点统一用加密安全随机源：emoji 掷点本身没有安全属性，但安全扫描
 # 会把 random.random() 按「不安全随机数」告警，走 SystemRandom 消除噪音。
@@ -573,31 +562,86 @@ class AIClient:
         工具调用模式下经 send_reply 的强制调用拿到（正文, 图片操作）；纯文本
         协议下按旧约定解析正文（标记写在末尾）。返回 None 表示无话可说。
         """
-        use_tools = self._tools_on["reply"]
-        text_part = final_user_prompt_reply(
-            now_text,
+        return await self._reply_call(
+            static_system,
+            runtime_system,
+            recent_records[:-1],
             current_message,
-            forced=forced,
-            engaged=engaged,
-            score=score,
-            reason=reason,
-            via_tool=use_tools,
+            lambda via_tool: final_user_prompt_reply(
+                now_text,
+                current_message,
+                forced=forced,
+                engaged=engaged,
+                score=score,
+                reason=reason,
+                via_tool=via_tool,
+            ),
         )
+
+    async def reconsider_reply(
+        self,
+        static_system: str,
+        runtime_system: str,
+        recent_records: list[ChatRecord],
+        now_text: str,
+        *,
+        sent_segments: Sequence[str],
+        pending_segments: Sequence[str],
+    ) -> ReplyDraft:
+        """连发期间被他人插话后，重新裁定腹稿里还没发出去的部分。
+
+        与 generate_reply 的区别：历史层直接用截至当下的完整尾部（插来的
+        消息与自己已发出的连发片段都已如实入库），不再剥离「当前消息」；
+        指令层转述未发送的腹稿请模型取舍。返回的 ReplyDraft 可能正文为空，
+        空即「模型决定不发了」；调用失败照常抛异常，由上层重试后按原计划
+        继续——两种「没有内容」必须可区分，故这里不把空正文折成 None。
+        """
+        draft = await self._reply_call(
+            static_system,
+            runtime_system,
+            list(recent_records),
+            None,
+            lambda via_tool: final_user_prompt_reconsider(
+                now_text, sent_segments, pending_segments, via_tool=via_tool
+            ),
+        )
+        return draft or ReplyDraft("")
+
+    async def _reply_call(
+        self,
+        static_system: str,
+        runtime_system: str,
+        history_records: list[ChatRecord],
+        current_message: ChatRecord | None,
+        build_text_part: Callable[[bool], str],
+    ) -> ReplyDraft | None:
+        """generate_reply / reconsider_reply 共用的 reply 模型调用。
+
+        history_records 即历史层内容（「当前消息」的剥离位置由调用方按其
+        约定完成）；build_text_part 按协议生成本次 L4 指令层，端点拒绝
+        tools 降级补发时以 via_tool=False 重建。正文为空返回 None。
+        """
+        use_tools = self._tools_on["reply"]
+        text_part = build_text_part(use_tools)
         # 预算需扣除 L4 文本本身，故先构造指令层再裁历史；原图 token 开销不参与估算
         prompt_chars = len(static_system) + len(runtime_system) + len(text_part)
         budget = self._history_chars(self._reply, prompt_chars)
         if self._multimodal_mode == "direct":
             turns, _ = reply_history_turns(
-                recent_records[:-1],
+                history_records,
                 budget,
                 self._generation.max_history_images,
             )
             history_messages = [_turn_to_message(t) for t in turns]
         else:
-            turns, _ = history_to_turns(recent_records[:-1], budget)
+            turns, _ = history_to_turns(history_records, budget)
             history_messages = [{"role": t.role, "content": t.content} for t in turns]
         final_user: str | list[dict]
-        if self._multimodal_mode == "direct" and current_message.images:
+        if (
+            self._multimodal_mode == "direct"
+            and current_message is not None
+            and current_message.images
+        ):
             blocks: list[dict] = [{"type": "text", "text": text_part}]
             for data_url in current_message.images:
                 blocks.append({"type": "image_url", "image_url": {"url": data_url}})
@@ -633,15 +677,7 @@ class AIClient:
             # 降级补发：仅把 L4 指令换成纯文本契约（direct 模式保留图片块）。
             # L1 守则由调用方按当时的角色状态生成，此处无法重建、仍带工具措辞，
             # 但 L4 是最后的明确指令（只输出正文），输出契约以它为准。
-            retry_text = final_user_prompt_reply(
-                now_text,
-                current_message,
-                forced=forced,
-                engaged=engaged,
-                score=score,
-                reason=reason,
-                via_tool=False,
-            )
+            retry_text = build_text_part(False)
             last = chat[-1]["content"]
             content = (
                 [{"type": "text", "text": retry_text}, *last[1:]]

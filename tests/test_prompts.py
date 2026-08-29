@@ -7,6 +7,7 @@ from candybot.prompts import (
     build_messages,
     final_user_prompt_judge,
     final_user_prompt_judge_recheck,
+    final_user_prompt_reconsider,
     final_user_prompt_reply,
     history_to_turns,
     nickname_list_from_history,
@@ -190,3 +191,26 @@ def test_output_contract_follows_via_tool_flag():
         "t", msg, prev_score=7, prev_reason="r", threshold=8, min_score=4, via_tool=False
     )
     assert "submit_judgment" not in recheck and "JSON" in recheck
+
+
+# ---------------------------------------------------------------- 连发重想（L4）
+
+def test_reconsider_prompt_lists_sent_and_pending_script():
+    p = final_user_prompt_reconsider(
+        "2026-08-29 12:00:00",
+        ["涨是涨了"],
+        ["但跟别家比还是便宜得离谱", "之前那个价我总觉得是在做慈善"],
+    )
+    assert "涨是涨了" in p  # 已发出部分点名，模型知道哪些收不回
+    assert "但跟别家比还是便宜得离谱" in p  # 未发出的腹稿逐条转述
+    assert "之前那个价我总觉得是在做慈善" in p
+    assert "收不回" in p  # 明确「已发不可撤、未发可取舍」的语义边界
+    assert "send_reply" in p and "留空" in p  # 工具契约：空 text＝放弃
+
+
+def test_reconsider_prompt_nothing_sent_and_text_contract():
+    p = final_user_prompt_reconsider("t", [], ["甲乙"], via_tool=False)
+    assert "（还没有）" in p
+    assert "甲乙" in p
+    assert "send_reply" not in p
+    assert "一个字都不要输出" in p  # 纯文本契约：沉默＝放弃

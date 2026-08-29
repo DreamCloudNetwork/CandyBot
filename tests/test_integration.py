@@ -13,7 +13,7 @@ from candybot.ai import JudgeVerdict, ReplyDraft
 from tests.test_models_settings import DictCfg
 
 
-def make_settings(tmp_path, generation_overrides: dict | None = None):
+def make_settings(tmp_path, generation_overrides: dict | None = None, *, post_process: dict | None = None):
     cfg = {
         "bot": {"self_qq": 99, "data_dir": str(tmp_path / "data")},
         "groups": {
@@ -34,6 +34,9 @@ def make_settings(tmp_path, generation_overrides: dict | None = None):
             "mode": "write",
             "allow_private_endpoint": True,
         },
+        # 本文件各用例断言的是未引入后处理时的整条单发行为，默认关闭拆条/
+        # 错别字等随机加工；后处理自身的编排用例见 test_bot_postprocess.py
+        "response_post_process": dict(post_process or {"enabled": False}),
     }
     return load_settings(DictCfg(cfg))
 
@@ -69,7 +72,9 @@ def recall_event(mid: int, *, uid=1000, group_id=42):
 
 class FakeSnowluma:
     def __init__(self):
-        self.sent: list[tuple[int, str]] = []
+        # sent 记录原始 message 参数（str 或 OneBot 段数组）
+        self.sent: list[tuple[int, object]] = []
+        self._next_id = 1000
 
     async def start(self):
         pass
@@ -83,8 +88,10 @@ class FakeSnowluma:
     async def query_login_info(self):
         return {"user_id": 99}
 
-    async def send_group_msg(self, group_id: int, text: str) -> None:
-        self.sent.append((group_id, text))
+    async def send_group_msg(self, group_id: int, message) -> int:
+        self.sent.append((group_id, message))
+        self._next_id += 1
+        return self._next_id
 
 
 class FakeAI:
@@ -95,6 +102,7 @@ class FakeAI:
         self.verdict = verdict
         self.judge_calls = 0
         self.reply_calls: list[dict] = []
+        self.reconsider_calls: list[dict] = []
 
     async def judge_interest(self, *args, **kwargs) -> JudgeVerdict:
         self.judge_calls += 1
@@ -113,6 +121,16 @@ class FakeAI:
             "score": score,
         })
         return ReplyDraft("哈哈确实")
+
+    async def reconsider_reply(self, static_system, runtime_system, recent,
+                               now_text, *, sent_segments, pending_segments):
+        self.reconsider_calls.append({
+            "recent_len": len(recent),
+            "sent": tuple(sent_segments),
+            "pending": tuple(pending_segments),
+        })
+        # 默认「一字不改地继续」：bot 据此沿用原计划，等价于没有重想这回事
+        return ReplyDraft("\n".join(pending_segments))
 
     async def describe_image(self, data_url: str):
         return "一张图"

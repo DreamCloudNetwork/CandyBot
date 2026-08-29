@@ -35,7 +35,7 @@ def base_cfg(**over):
         },
     }
     for section, values in over.items():
-        cfg[section].update(values)
+        cfg.setdefault(section, {}).update(values)
     return cfg
 
 
@@ -259,6 +259,92 @@ def test_storage_image_retention_validation():
     for bad in (0, -1, -100):
         with pytest.raises(ValueError):
             load_settings(DictCfg(base_cfg(storage={"image_retention_days": bad})))
+
+
+# ---------------------------------------------------------------- 输出层后处理
+
+
+def test_response_post_process_defaults_when_section_absent():
+    """response_post_process 整段省略：enabled 默认开启、各率走默认值。"""
+    s = load_settings(DictCfg(base_cfg()))
+    pp = s.response_post_process
+    assert pp.enabled is True
+    assert pp.typing_speed == 1.0
+    assert pp.max_split == 3
+    assert pp.max_length == 120
+    assert pp.keep_strong_punctuation is True
+    assert pp.typo_error_rate == 0.05
+    assert pp.typo_tone_error_rate == 0.3
+    assert pp.typo_word_replace_rate == 0.2
+    assert pp.typo_correction_probability == 0.5
+    assert pp.typo_polyphone_mode == "word_reading"
+    assert "呃呃" in pp.lazy_replies
+
+
+def test_response_post_process_custom_values():
+    cfg = base_cfg(
+        response_post_process={
+            "enabled": False,
+            "typing_speed": 2.5,
+            "max_split": 5,
+            "max_length": 200,
+            "keep_strong_punctuation": False,
+            "typo_error_rate": 0,
+            "typo_correction_probability": 1,
+            "typo_polyphone_mode": "skip",
+            "lazy_replies": ["哦"],
+        }
+    )
+    s = load_settings(DictCfg(cfg))
+    pp = s.response_post_process
+    assert pp.enabled is False
+    assert pp.typing_speed == 2.5
+    assert pp.max_split == 5
+    assert pp.max_length == 200
+    assert pp.keep_strong_punctuation is False
+    assert pp.typo_error_rate == 0
+    assert pp.typo_correction_probability == 1
+    assert pp.typo_polyphone_mode == "skip"
+    assert pp.lazy_replies == ("哦",)
+
+
+def test_response_post_process_validation():
+    for bad in (
+        {"enabled": "yes"},
+        {"typing_speed": -0.1},
+        {"max_split": 0},
+        {"max_length": -5},
+        {"typo_error_rate": 1.5},
+        {"typo_tone_error_rate": -0.2},
+        {"typo_word_replace_rate": 2},
+        {"typo_correction_probability": 1.1},
+        {"typo_polyphone_mode": "first"},
+        {"typing_speed": []},
+        # json5 能写出 Infinity / NaN 字面量：inf 会挂死连发的 sleep，
+        # nan 会静默关闭延迟，都必须按非法值拒收
+        {"typing_speed": float("inf")},
+        {"typing_speed": float("-inf")},
+        {"typing_speed": float("nan")},
+        {"typo_error_rate": "abc"},
+        {"lazy_replies": []},
+        {"lazy_replies": ["  "]},
+        {"lazy_replies": "呃呃"},
+        {"lazy_replies": [1]},
+    ):
+        with pytest.raises(ValueError):
+            load_settings(DictCfg(base_cfg(response_post_process=bad)))
+
+
+def test_response_post_process_error_messages_name_the_key():
+    """类型写错的数字项也要报出键名（而不是 float() 的原生报错）。"""
+    with pytest.raises(ValueError, match="typing_speed"):
+        load_settings(DictCfg(base_cfg(response_post_process={"typing_speed": []})))
+    with pytest.raises(ValueError, match="typo_error_rate"):
+        load_settings(DictCfg(base_cfg(response_post_process={"typo_error_rate": "abc"})))
+    with pytest.raises(ValueError, match="typo_polyphone_mode"):
+        load_settings(
+            DictCfg(base_cfg(response_post_process={"typo_polyphone_mode": "first"}))
+        )
 
 
 # ---------------------------------------------------------------- 多提供商模型

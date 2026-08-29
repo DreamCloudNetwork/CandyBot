@@ -8,6 +8,7 @@ dependencies = [
     "json5>=0.15.0",
     "mcp>=2.1.1",
     "openai>=3.5.0",
+    "pypinyin>=0.55.0",
     "sqlmodel>=0.0.39",
     "watchdog>=6.0.0",
 ]

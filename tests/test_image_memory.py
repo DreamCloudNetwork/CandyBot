@@ -323,6 +323,9 @@ def make_settings(tmp_path, multimodal_mode):
             "mode": "write",
             "allow_private_endpoint": True,
         },
+        # 本文件断言的是发送原文（标记剥除等），关闭拟人化后处理的
+        # 拆条/错别字随机加工；后处理自身用例见 test_bot_postprocess.py
+        "response_post_process": {"enabled": False},
     }
 
     class DictCfg:

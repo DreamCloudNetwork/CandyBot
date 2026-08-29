@@ -98,6 +98,22 @@
         "image_retention_days": 7,        // 聊天原图保留天数；超期降级为总结/占位符
     },
 
+    // 输出层拟人化后处理：拆条发送、打字延迟、错别字与敷衍兜底、连发被打断后的重想（整段可省略，全部走默认值）
+    "response_post_process": {
+        "enabled": true,                  // false 时行为与未引入后处理前完全一致（整条单发、零延迟、不触发重想）
+        "typing_speed": 1.0,              // 打字延迟全局倍率；0 关闭延迟；须为非负有限数，单条封顶 60 秒
+        "max_split": 3,                   // 一次回复最多拆成几条消息
+        "max_length": 120,                // 单条超过该字数则不发送原文，改抽敷衍回复（按显示字数：emoji/颜文字算 1 字）
+        "keep_strong_punctuation": true,  // 拆条时是否保留句末的 ! ?（含全角 ！ ？）；其余句末标点总是去掉
+        "typo_error_rate": 0.05,          // 单字被同音替换的概率
+        "typo_tone_error_rate": 0.3,      // 替换时选用错误声调拼音的概率
+        "typo_word_replace_rate": 0.2,    // 整词替换为同音词的概率
+        "typo_correction_probability": 0.5, // 出现错字后追加「＊正确词」更正消息（引用最后一条正文）的概率
+        "typo_polyphone_mode": "word_reading", // 多音字错字策略：word_reading=取词内读音照常替换 / skip=跳过多音字；读音无法确定时两种模式都不替换
+        // 敷衍池：随机抽一条代替过长回复
+        "lazy_replies": ["呃呃", "不晓得", "懒得说", "不知道", "emm"],
+    },
+
     "snowluma": {
         "mcp_command": "npx",
         "mcp_args": ["-y", "@snowluma/mcp"],

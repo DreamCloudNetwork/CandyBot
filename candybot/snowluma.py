@@ -2,6 +2,8 @@
 
 通过 stdio 启动 ``@snowluma/mcp`` 子进程并保持长会话；发消息走 write 模式
 的 ``invoke_action`` 工具（封装 OneBot v11 的 send_group_msg）。
+send_group_msg 支持纯文本与 OneBot v11 消息段数组（如 reply 引用段），
+并从响应中解出 message_id 供引用更正使用。
 """
 
 from __future__ import annotations
@@ -19,6 +21,47 @@ from .models import SnowlumaSettings
 logger = logging.getLogger(__name__)
 
 _SEND_GROUP_MSG_RE = re.compile(r"send[_-]?group[_-]?msg|group.*send.*message", re.I)
+
+
+def _text_segments(message: str | list[dict]) -> list[dict]:
+    """纯文本包成单个 text 段；段数组原样透传（OneBot v11 segment[]）。"""
+    if isinstance(message, str):
+        return [{"type": "text", "data": {"text": message}}]
+    return message
+
+
+def _send_params(action: str, group_id: int, segments: list[dict]) -> dict:
+    return {
+        "action": action,
+        "params": {"group_id": group_id, "message": segments},
+    }
+
+
+def _raise_for_failed_response(payload: object) -> None:
+    """按 OneBot 信封判定逻辑失败：SnowLuma MCP 对 retcode≠0 不报 MCP 错误，
+    而是把完整响应当数据返回。不检查 retcode 会把发送失败当成功，
+    后续拿不到 message_id 的引用更正也会静默丢失。"""
+    if isinstance(payload, dict):
+        envelope = payload.get("data") if "retcode" not in payload else payload
+        if isinstance(envelope, dict) and envelope.get("retcode", 0) != 0:
+            raise SnowlumaError(
+                "发送群消息失败："
+                f"retcode={envelope.get('retcode')!r} "
+                f"wording={envelope.get('wording')!r} "
+                f"status={envelope.get('status')!r}"
+            )
+
+
+def _extract_message_id(payload: object) -> int | None:
+    """从 OneBot 响应 {retcode, data:{message_id}} 里取发出的消息 id。"""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    source = data if isinstance(data, dict) else payload
+    try:
+        return int(source["message_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 class SnowlumaError(RuntimeError):
@@ -118,31 +161,39 @@ class SnowlumaClient:
                 '请把 snowluma.mode 设为 "write"'
             )
 
-    async def send_group_msg(self, group_id: int, text: str) -> None:
-        """发送群文本消息；unknown action 时自动从目录模糊匹配一次。"""
+    async def send_group_msg(
+        self, group_id: int, message: str | list[dict]
+    ) -> int | None:
+        """发送群消息，返回 OneBot 给出的 message_id（响应未携带时为 None）。
+
+        message 可以是纯文本（包成单个 text 段，内容按字面发送、不解析 CQ
+        码），也可以是 OneBot v11 消息段数组（如 [{"type": "reply", ...}]
+        引用段）；unknown action 时自动从目录模糊匹配一次。
+        """
+        segments = _text_segments(message)
         action = self._resolved_send_action or "send_group_msg"
-        params = {
-            "action": action,
-            "params": {"group_id": group_id, "message": [{"type": "text", "data": {"text": text}}]},
-        }
+        params = _send_params(action, group_id, segments)
         try:
             is_error, payload = await self._call_tool_json("invoke_action", params)
         except Exception as exc:
-            message = str(exc).lower()
-            if not ("unknown" in message and "action" in message):
+            detail = str(exc).lower()
+            if not ("unknown" in detail and "action" in detail):
                 raise
-            is_error, payload = await self._retry_with_fuzzy_action(group_id, text)
+            is_error, payload = await self._retry_with_fuzzy_action(group_id, segments)
+        _raise_for_failed_response(payload)
         if is_error:
             raise SnowlumaError(f"发送群消息被拒绝：{payload!r}")
         logger.info("已发送群消息到 %d，响应：%r", group_id, payload)
+        return _extract_message_id(payload)
 
-    async def _retry_with_fuzzy_action(self, group_id: int, text: str) -> tuple[bool, object]:
+    async def _retry_with_fuzzy_action(
+        self, group_id: int, segments: list[dict]
+    ) -> tuple[bool, object]:
         async with self._send_tool_lock:
             if self._resolved_send_action:
-                params = {
-                    "action": self._resolved_send_action,
-                    "params": {"group_id": group_id, "message": [{"type": "text", "data": {"text": text}}]},
-                }
+                params = _send_params(
+                    self._resolved_send_action, group_id, segments
+                )
                 return await self._call_tool_json("invoke_action", params)
             names = await self._list_tool_names()
             matches = [n for n in names if _SEND_GROUP_MSG_RE.search(n)]
@@ -151,10 +202,7 @@ class SnowlumaClient:
             chosen = sorted(matches)[0]
             logger.warning("send_group_msg 不存在，改用目录匹配到的 %r", chosen)
             self._resolved_send_action = chosen
-            params = {
-                "action": chosen,
-                "params": {"group_id": group_id, "message": [{"type": "text", "data": {"text": text}}]},
-            }
+            params = _send_params(chosen, group_id, segments)
             return await self._call_tool_json("invoke_action", params)
 
     async def query_login_info(self) -> dict | None:

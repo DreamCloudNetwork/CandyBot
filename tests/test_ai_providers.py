@@ -255,6 +255,42 @@ async def test_reply_tool_text_strips_residual_markers(monkeypatch):
     assert [(o.action, o.message_id) for o in reply.ops] == [("drop_img", 51)]
 
 
+async def test_reconsider_reply_keeps_full_history_and_uses_tool(monkeypatch):
+    """重想调用：历史层保留到当下的全部记录（含插话与自己的连发片段），
+    指令层转述腹稿——被打断的上下文必须完整交给模型。"""
+    instances = _install_fake(
+        monkeypatch,
+        {"kr": _tool_msg("send_reply", '{"text": "行，那这句还是要说的"}')},
+    )
+    ai = AIClient(models=_models(), generation=_gen())
+    mine = ChatRecord(1, 2, 99, "糖糖", "涨是涨了", 0, is_self=True)
+    interrupt = _record("不是")
+    reply = await ai.reconsider_reply(
+        "L1", "L2", [mine, interrupt], "now",
+        sent_segments=["涨是涨了"],
+        pending_segments=["但跟别家比还是便宜得离谱"],
+    )
+    assert reply is not None and reply.text == "行，那这句还是要说的"
+    (called,) = _called_instances(instances)
+    messages = called.create_kwargs["messages"]
+    assert {"role": "assistant", "content": "涨是涨了"} in messages
+    # 插话没有被当「当前消息」剥出历史：它就是最后一回合
+    assert messages[-2] == {"role": "user", "content": "群友(3)：不是"}
+    assert "但跟别家比还是便宜得离谱" in messages[-1]["content"]
+    assert called.create_kwargs["tools"][0]["function"]["name"] == "send_reply"
+
+
+async def test_reconsider_reply_empty_text_means_abort_not_failure(monkeypatch):
+    """模型明确选择「不发了」：返回空正文的 ReplyDraft，而非 None。"""
+    _install_fake(monkeypatch, {"kr": _tool_msg("send_reply", '{"text": ""}')})
+    ai = AIClient(models=_models(), generation=_gen())
+    reply = await ai.reconsider_reply(
+        "L1", "L2", [_record()], "now", sent_segments=[], pending_segments=["还没发的腹稿"]
+    )
+    assert reply is not None
+    assert reply.text == ""
+
+
 async def test_per_model_max_output_tokens_override(monkeypatch):
     instances = _install_fake(monkeypatch, {"kj": _JUDGE_JSON, "kr": "好"})
     ai = AIClient(

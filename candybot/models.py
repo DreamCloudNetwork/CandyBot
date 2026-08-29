@@ -8,6 +8,7 @@ endpoint 的 SSRF 校验也在本模块。
 from __future__ import annotations
 
 import ipaddress
+import math
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -271,6 +272,47 @@ class RateLimitSettings:
     global_daily_limit: int | None
 
 
+# 敷衍池内置默认：回复过长或拆条后为空时随机抽取其一代替发送。
+LAZY_REPLIES_DEFAULT = ("呃呃", "不晓得", "懒得说", "不知道", "emm")
+
+# 多音字（如「银行」的行）的错字策略：word_reading 取词典词内读音照常替换；
+# skip 则多音字整体跳过、只替换单一读音的字。两种策略下读音无法确定的
+# 多音字（单独成词等）都绝不替换，避免产出读音对不上的「假同音」错字。
+TYPO_POLYPHONE_MODES = ("word_reading", "skip")
+TYPO_POLYPHONE_MODE_DEFAULT = "word_reading"
+
+
+@dataclass(frozen=True)
+class ResponsePostProcessSettings:
+    """输出层拟人化后处理配置（拆条 / 打字延迟 / 错别字 / 敷衍兜底）。
+
+    enabled=False 时发送链路与未引入后处理前完全一致（整条单发、零延迟、
+    不触发连发被打断后的重想）。打字延迟 = 逐字估时 × typing_speed，
+    单条封顶 60 秒；错别字三率的语义：
+    typo_error_rate 为单字被同音替换的概率，typo_tone_error_rate 为替换时
+    选用错误声调拼音的概率，typo_word_replace_rate 为整词替换的概率；
+    产生错字后以 typo_correction_probability 的概率追加一条「＊正确词」更正。
+    keep_strong_punctuation 控制拆条时句末的 ! ?（含全半角）是否保留，
+    其余句末标点总去掉；typo_polyphone_mode 控制多音字错字策略
+    （见 TYPO_POLYPHONE_MODES 注释）；max_length 按显示字数计，
+    emoji/颜文字序列整体算 1 个字。
+    更正经 OneBot v11 reply 消息段引用最后一条正文发送（见 bot.py 与
+    snowluma.py）。
+    """
+
+    enabled: bool = True
+    typing_speed: float = 1.0
+    max_split: int = 3
+    max_length: int = 120
+    keep_strong_punctuation: bool = True
+    typo_error_rate: float = 0.05
+    typo_tone_error_rate: float = 0.3
+    typo_word_replace_rate: float = 0.2
+    typo_correction_probability: float = 0.5
+    typo_polyphone_mode: str = TYPO_POLYPHONE_MODE_DEFAULT
+    lazy_replies: tuple[str, ...] = LAZY_REPLIES_DEFAULT
+
+
 @dataclass(frozen=True)
 class SnowlumaSettings:
     mcp_command: str
@@ -294,6 +336,7 @@ class Settings:
     storage: StorageSettings
     rate_limit: RateLimitSettings
     snowluma: SnowlumaSettings
+    response_post_process: ResponsePostProcessSettings
 
     def profile_for(self, group_id: int) -> GroupProfile | None:
         """严格白名单语义。
@@ -398,6 +441,14 @@ def _parse_int(section: dict[str, Any], key: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"配置项 `{key}` 应为整数，实际是 {value!r}") from exc
+
+
+def _parse_float(section: dict[str, Any], key: str, default: float) -> float:
+    value = _get(section, key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"配置项 `{key}` 应为数字，实际是 {value!r}") from exc
 
 
 def _parse_optional_int(section: dict[str, Any], key: str) -> int | None:
@@ -555,6 +606,70 @@ def load_settings(cfg: Any) -> Settings:
             'snowluma.mode 必须是 "write"，否则机器人无法调用 send_group_msg 发言'
         )
 
+    # response_post_process 段可整体省略（全部走默认值）
+    pp_cfg = _optional_section(cfg, "response_post_process")
+
+    def _parse_probability(key: str, default: float) -> float:
+        value = _parse_float(pp_cfg, key, default)
+        if not 0 <= value <= 1:
+            raise ValueError(
+                f"配置项 `response_post_process.{key}` 应在 0~1 之间，实际是 {value!r}"
+            )
+        return value
+
+    typing_speed = _parse_float(pp_cfg, "typing_speed", 1.0)
+    # json5 支持 Infinity / NaN 字面量且 float() 一律照收：inf 会让连发的
+    # asyncio.sleep 永久挂起该群队列，nan 会静默关闭延迟，都必须拒收。
+    if not math.isfinite(typing_speed) or typing_speed < 0:
+        raise ValueError(
+            "配置项 `response_post_process.typing_speed` 应为非负有限数字，"
+            f"实际是 {typing_speed!r}"
+        )
+    polyphone_mode = _parse_str(pp_cfg, "typo_polyphone_mode", TYPO_POLYPHONE_MODE_DEFAULT)
+    if polyphone_mode not in TYPO_POLYPHONE_MODES:
+        raise ValueError(
+            "配置项 `response_post_process.typo_polyphone_mode` 应为 "
+            f"{' / '.join(map(repr, TYPO_POLYPHONE_MODES))} 之一，"
+            f"实际是 {polyphone_mode!r}"
+        )
+    max_split = _parse_int(pp_cfg, "max_split", 3)
+    if max_split < 1:
+        raise ValueError(
+            f"配置项 `response_post_process.max_split` 不能小于 1，实际是 {max_split!r}"
+        )
+    max_length = _parse_int(pp_cfg, "max_length", 120)
+    if max_length < 1:
+        raise ValueError(
+            f"配置项 `response_post_process.max_length` 不能小于 1，实际是 {max_length!r}"
+        )
+    lazy_raw = _get(pp_cfg, "lazy_replies", list(LAZY_REPLIES_DEFAULT))
+    if (
+        not isinstance(lazy_raw, (list, tuple))
+        or not lazy_raw
+        or not all(isinstance(item, str) and item.strip() for item in lazy_raw)
+    ):
+        raise ValueError(
+            "配置项 `response_post_process.lazy_replies` 应为非空的字符串列表"
+        )
+    post_process_settings = ResponsePostProcessSettings(
+        enabled=_parse_bool(pp_cfg.get("enabled", True), "response_post_process.enabled"),
+        typing_speed=typing_speed,
+        max_split=max_split,
+        max_length=max_length,
+        keep_strong_punctuation=_parse_bool(
+            pp_cfg.get("keep_strong_punctuation", True),
+            "response_post_process.keep_strong_punctuation",
+        ),
+        typo_error_rate=_parse_probability("typo_error_rate", 0.05),
+        typo_tone_error_rate=_parse_probability("typo_tone_error_rate", 0.3),
+        typo_word_replace_rate=_parse_probability("typo_word_replace_rate", 0.2),
+        typo_correction_probability=_parse_probability(
+            "typo_correction_probability", 0.5
+        ),
+        typo_polyphone_mode=polyphone_mode,
+        lazy_replies=tuple(str(item) for item in lazy_raw),
+    )
+
     return Settings(
         bot=BotSettings(
             self_qq=self_qq,
@@ -573,6 +688,7 @@ def load_settings(cfg: Any) -> Settings:
         storage=storage_settings,
         rate_limit=rate_limit_settings,
         snowluma=snowluma_settings,
+        response_post_process=post_process_settings,
     )
 
 
