@@ -1,6 +1,6 @@
 """SQLite 持久层：SQLModel 表定义与异步数据操作（data 目录下的 candy.db）。
 
-六个表：
+七个表：
 - chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留。
 - chat_image       消息内每个图片槽位（展示状态、总结、指向原图的指纹）；
                    随消息永久保留，回收图片时只摘除数据引用、降级展示状态。
@@ -12,6 +12,9 @@
                    同群按内容去重，count 作加权随机抽取的权重。
 - jargons          黑话词条：term + meaning，同群去重，超出条目上限时
                    淘汰最久未命中的条目。
+- sticker          表情包收藏（最小版）：同群按 (群, 内容指纹) 去重，
+                   全局数量超上限时替换最久未使用的条目——本表只删记录，
+                   图片文件的写入与删除由 stickers.StickerStore 负责。
 
 展示状态与总结属于历史语义内容，回收后仍然保留（占位/总结随历史照常
 送入模型），只有 base64 数据消失；恢复后的记录里对应槽位 images 为空串。
@@ -154,6 +157,28 @@ class JargonRow(SQLModel, table=True):
     last_hit_time: float = Field(default=0.0, nullable=False)
 
 
+class StickerRow(SQLModel, table=True):
+    """sticker：表情包收藏（最小版）。
+
+    同群按 (group_id, sha256) 去重（sha256 为整条 data URL 的内容指纹，
+    与 image_blob 同一算法）；path 为相对表情包根目录的文件路径，
+    文件实体由 stickers.StickerStore 读写。(last_used_time, created_ts)
+    是全局超上限时「替换最久未使用」的排序键。
+    """
+
+    __tablename__ = "sticker"
+    __table_args__ = (UniqueConstraint("group_id", "sha256"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    group_id: int = Field(nullable=False, index=True)
+    sha256: str = Field(default="", nullable=False)
+    path: str = Field(default="", nullable=False)
+    summary: str = Field(default="", nullable=False)
+    use_count: int = Field(default=0, nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+    last_used_time: float = Field(default=0.0, nullable=False)
+
+
 @dataclass(frozen=True)
 class ImpressionEntry:
     """一条群印象（day 为 YYYY-MM-DD）。"""
@@ -182,6 +207,18 @@ class JargonEntry:
     meaning: str
     count: int
     last_hit_time: float
+
+
+@dataclass(frozen=True)
+class StickerEntry:
+    """一条表情包收藏。path 为相对表情包根目录的文件路径。"""
+
+    id: int
+    group_id: int
+    sha256: str
+    path: str
+    summary: str
+    use_count: int
 
 
 def _set_sqlite_pragmas(dbapi_conn, _record) -> None:
@@ -668,6 +705,93 @@ class CandyDatabase:
                     row.last_hit_time = ts
                     session.add(row)
             await session.commit()
+
+    # ------------------------------------------------------------ 表情包收藏
+
+    async def insert_sticker(
+        self, group_id: int, sha256: str, path: str, summary: str, ts: float
+    ) -> bool:
+        """新增一条表情包收藏；同群已有相同内容指纹时返回 False（去重）。
+
+        last_used_time 以入库时间起步：刚收藏的图绝不因为「还没用过」
+        被新来的收藏立刻挤掉，LRU 淘汰按「用过或收来」的最久时间排序。
+        """
+        async with self._sessions() as session:
+            row = StickerRow(
+                group_id=group_id,
+                sha256=sha256,
+                path=path,
+                summary=summary,
+                created_ts=ts,
+                last_used_time=ts,
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if "unique constraint" not in str(exc.orig).lower():
+                    raise  # 非唯一键冲突如实上抛
+                return False
+            return True
+
+    async def load_stickers(self, group_id: int) -> list[StickerEntry]:
+        """某群收藏的全部表情包（顺序无所谓：抽发是随机的）。"""
+        async with self._sessions() as session:
+            rows = (
+                await session.exec(
+                    select(StickerRow).where(StickerRow.group_id == group_id)
+                )
+            ).all()
+            return [
+                StickerEntry(
+                    id=row.id,
+                    group_id=row.group_id,
+                    sha256=row.sha256,
+                    path=row.path,
+                    summary=row.summary,
+                    use_count=row.use_count,
+                )
+                for row in rows
+            ]
+
+    async def touch_sticker(self, sticker_id: int, ts: float) -> None:
+        """记录一次使用：使用数 +1、刷新最近使用时间（LRU 的排序键）。"""
+        async with self._sessions() as session:
+            row = await session.get(StickerRow, sticker_id)
+            if row is None:  # 并发替换刚把它删了：本次使用统计作废
+                return
+            row.use_count += 1
+            row.last_used_time = ts
+            session.add(row)
+            await session.commit()
+
+    async def evict_stickers_over(self, max_total: int) -> list[str]:
+        """全局收藏超过 max_total 时按「最久未使用」删到上限，
+        返回被删条目的相对文件路径（图片文件由调用方删除）。
+
+        排序键 (last_used_time, created_ts)；last_used_time 以入库时间
+        起步（见 insert_sticker），因此先淘汰「最久既没用过也没收进来」
+        的条目。
+        """
+        async with self._sessions() as session:
+            rows = list(
+                (
+                    await session.exec(
+                        select(StickerRow)
+                        .order_by(col(StickerRow.last_used_time), col(StickerRow.created_ts))
+                    )
+                ).all()
+            )
+            overflow = len(rows) - max_total
+            if overflow <= 0:
+                return []
+            removed_paths: list[str] = []
+            for row in rows[:overflow]:
+                removed_paths.append(row.path)
+                await session.delete(row)
+            await session.commit()
+            return removed_paths
 
     # ------------------------------------------------------------ 内部工具
 

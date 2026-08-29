@@ -9,7 +9,8 @@ L2 system·状态层   群号、上下文昵称表、今天的日期、最近 N 
 L3 历史层          只追加、从头整块淘汰的群聊记录，映射为连续 user/assistant
                    （direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
 L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分、学习注入的
-                   表达/黑话参考、重复回复提醒）与本次指令。
+                   表达/黑话参考、重复回复提醒、临时随机风格、AI 味拦截重写
+                   要求）与本次指令。
 
 任何时刻都不得把易变字段（秒级时间、计数、分数）塞进 L1/L2，也不得重排或
 重新格式化历史消息——否则其后的缓存全部失效。
@@ -359,8 +360,24 @@ def jargon_hint_block(hints: Sequence[tuple[str, str]]) -> str:
 
 
 def repetition_warning_block() -> str:
-    """L4 重复提醒块：判定本次很可能是在重复自己刚发过的话时注入。"""
+    """L4 重复提醒块：判定本次很可能在重复自己刚发过的话时注入。"""
     return "【重复提醒】你刚刚已经回复过这条消息，不要和之前的发言重复。"
+
+
+def temporary_style_block(style: str) -> str:
+    """L4 临时风格块（任务 A）：本次回复随机抽到的一条额外风格要求。"""
+    return f"【临时风格】本次回复请遵循这个额外风格：{style}"
+
+
+def ai_flavor_retry_block(rejected_text: str, reason: str) -> str:
+    """L4 AI 味拦截重写块（任务 B）：把被拦截的回复与原因转述给模型，请它
+    用更口语的说法重写。被拦截文本压掉换行、限长 100 字，防止撑爆指令层。"""
+    squeezed = " ".join((rejected_text or "").split())[:100]
+    return (
+        f"【需要重新生成】你上一次的回复『{squeezed}』因为太像 AI 被拦截"
+        f"（原因：{reason}）。请用更口语、更随意的说法重写：像群友随手打的字，"
+        "不要客套、不要列条目、不要 markdown。"
+    )
 
 
 def final_user_prompt_reply(
@@ -375,6 +392,7 @@ def final_user_prompt_reply(
     expression_hints: Sequence[tuple[str, str]] = (),
     jargon_hints: Sequence[tuple[str, str]] = (),
     repetition_warning: bool = False,
+    temporary_style: str | None = None,
 ) -> str:
     """L4(reply)：触发原因说明 + 表达/黑话参考（可选） + 重复提醒（可选） + 回复指令。
 
@@ -384,6 +402,10 @@ def final_user_prompt_reply(
     repetition_warning=True 时（bot 层判定目标消息之后已有自己的发言、
     对方也没再开口，见 bot._already_replied_to）在【需要回应的消息】之后
     注入一段重复提醒；False 时输出与引入前字节级一致。
+
+    temporary_style 非空时（任务 A：bot 每条回复独立掷点随机抽到的临时
+    风格）在回复指令之前注入一段临时风格块；None/空串时输出与引入前
+    字节级一致。
     """
     sender = record_label(current_message)
     body = current_message.text or "[图片]"
@@ -414,6 +436,9 @@ def final_user_prompt_reply(
         parts.append(expression_hint_block(expression_hints))
     if jargon_hints:
         parts.append(jargon_hint_block(jargon_hints))
+    style = (temporary_style or "").strip()
+    if style:
+        parts.append(temporary_style_block(style))
     parts.append(tail)
     return "\n\n".join(parts)
 

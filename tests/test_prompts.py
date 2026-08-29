@@ -4,6 +4,7 @@ import time
 
 from candybot.models import ChatRecord
 from candybot.prompts import (
+    ai_flavor_retry_block,
     build_messages,
     final_user_prompt_judge,
     final_user_prompt_judge_recheck,
@@ -14,6 +15,7 @@ from candybot.prompts import (
     record_to_turn,
     runtime_system_prompt,
     static_system_prompt,
+    temporary_style_block,
 )
 
 
@@ -214,3 +216,40 @@ def test_reconsider_prompt_nothing_sent_and_text_contract():
     assert "甲乙" in p
     assert "send_reply" not in p
     assert "一个字都不要输出" in p  # 纯文本契约：沉默＝放弃
+
+
+# ---------------------------------------------------------------- 临时风格与 AI 味拦截（L4）
+
+
+def test_temporary_style_block_format_and_byte_compat():
+    """注入格式与向后兼容：不传/空串时输出与引入前逐字节一致。"""
+    target = rec(1, 5, "小明", "在吗")
+    plain = final_user_prompt_reply("2026-08-29 10:00:00", target, forced=True)
+    style = "用 1-2 个字进行回复"
+    block = temporary_style_block(style)
+    assert block == f"【临时风格】本次回复请遵循这个额外风格：{style}"
+    for blank in (None, "", "   "):
+        assert (
+            final_user_prompt_reply(
+                "2026-08-29 10:00:00", target, forced=True, temporary_style=blank
+            )
+            == plain
+        )
+    styled = final_user_prompt_reply(
+        "2026-08-29 10:00:00", target, forced=True, temporary_style=style
+    )
+    assert "临时风格" not in plain
+    assert block in styled
+    # 除多出的风格块（含其后的段落分隔）外逐字节一致
+    assert styled.replace(block + "\n\n", "", 1) == plain
+
+
+def test_ai_flavor_retry_block_content():
+    """约束文案：转述被拦截回复与原因、要求口语重写；换行压平、超长裁剪。"""
+    block = ai_flavor_retry_block("作为AI，\n我很乐意帮您", "命中规则 'xxx'（片段「作为AI」）")
+    assert "『作为AI， 我很乐意帮您』" in block  # 换行压成单空格
+    assert "太像 AI 被拦截" in block
+    assert "命中规则" in block
+    assert "更口语" in block
+    long = ai_flavor_retry_block("长" * 300, "原因")
+    assert "长" * 100 in long and "长" * 101 not in long  # 被拦截文本限长

@@ -29,6 +29,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from datetime import date, timedelta
+from pathlib import Path
 
 import aiohttp
 
@@ -60,6 +61,7 @@ from .prompts import (
     static_system_prompt,
 )
 from .snowluma import SnowlumaClient
+from .stickers import STICKER_RECORD_TEXT, StickerStore
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +102,10 @@ def _self_reply_after(
     """目标消息是否还在上下文里、其后是否已有自己的发言。
 
     返回 (目标存在, 其后有 is_self 记录)。观望到点时据此决定要不要取消
-    重评：连发写回紧跟发送，目标之后出现的 is_self 记录即「已经通过其他
-    路径（@必答/接话等）回复过这一带」的信号——保守取消，避免同一话题被
-    连说两遍。目标不存在（被撤回或被淘汰出热缓存）时同样按取消处理。
+    重评：连发写回紧跟发送，目标之后出现的 is_self 记录即「这一带已经
+    回复过了」的信号——无论那条发言实际是在回哪条消息（哪怕是回另一条
+    无关的 @），都按有意保留的保守规则取消，避免同一话题被连说两遍。
+    目标不存在（被撤回或被淘汰出热缓存）时同样按取消处理。
     """
     index = _index_of(records, target_id)
     if index < 0:
@@ -244,6 +247,15 @@ class CandyBot:
             multimodal_mode=settings.multimodal.mode,
         )
         self._snowluma = SnowlumaClient(settings.snowluma)
+        # 表情包（任务 C 最小版）：收图时在 _on_event 收集，文字回复发送
+        # 成功后按小概率跟发；配置经回调现取，热重载即时生效。
+        self._stickers = StickerStore(
+            Path(settings.bot.data_dir) / "stickers",
+            self._memory.db,
+            lambda: self._settings,
+        )
+        # 跟发掷点与随机抽图的随机源；测试可替换为固定种子的 random.Random。
+        self._sticker_rng: random.Random = random.SystemRandom()
         self._server = EventsServer(
             self._on_event,
             host=settings.bot.listen_host,
@@ -434,6 +446,14 @@ class CandyBot:
             # 「明确指向自己」的消息 id，供发送前比对生成期间的新消息
             self._runtimes[group_id].recent_mentions.append(normalized.record.message_id)
         logger.debug("收到消息 %s : %s",group_id,normalized)
+        if normalized.sticker_flags:
+            # 表情包收集（任务 C）：辅助能力，失败只记日志，不挡这条消息的决策
+            try:
+                await self._stickers.collect(
+                    normalized.record, normalized.sticker_flags
+                )
+            except Exception:
+                logger.warning("群 %d 表情包收集失败", group_id, exc_info=True)
         await self._enqueue(group_id, normalized)
 
     async def _find_record(self, event: dict, ref_id: int) -> ChatRecord | None:
@@ -561,6 +581,10 @@ class CandyBot:
     ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         """回复前的 L4 注入准备：抽表达 + 匹配黑话（都只进指令层）。
 
+        由 _decide_and_reply 每轮调用一次，结果喂给该轮全部 _compose_reply
+        生成（含新鲜度重生成）：抽中会刷新表达条目的最近使用时间，同一轮
+        内重复调用等于重复采样，必须避免。
+
         辅助能力：任何失败只记日志、退化为不注入，绝不阻断回复本身。
         """
         ls = self._settings.learning
@@ -596,6 +620,11 @@ class CandyBot:
 
         observe=True 表示这是观望到点后的二次处理：护栏与配额路径与首评
         完全相同（见 _make_decision），但不再安排新的观望。
+
+        L4 的学习注入（抽表达 + 匹配黑话）每轮只准备一次：抽中会刷新
+        表达条目的最近使用时间，若让新鲜度重生成再抽一遍就是二次采样、
+        二次刷新，纯属多余；提前的代价是初稿与重生成稿共享同一组 hints，
+        反而让两轮生成看到一致的风格参考，语义更自洽。
         """
         profile = self._settings.profile_for(group_id)
         assert profile is not None
@@ -612,6 +641,12 @@ class CandyBot:
         # 剩下的腹稿重想一次（见 _send_reply_segments 与 reconsider）。
         memory = await self._memory.get(group_id)
         seen_ids = {r.message_id for r in memory.tail(len(memory))}
+        # L4 学习注入每轮决策只算一次（见本方法 docstring），初稿与
+        # 新鲜度重生成共享同一组 hints；失败容错在 _learning_hints 内部，
+        # 退化为不注入
+        expression_hints, jargon_hints = await self._learning_hints(
+            group_id, memory.tail(profile.context_size)
+        )
         reconsider_left = _MAX_RECONSIDER_PER_BURST
 
         async def reconsider(sent: list[str], pending: list[str]) -> ProcessedReply | None:
@@ -661,7 +696,15 @@ class CandyBot:
                 draft.text, self._settings.response_post_process, rng=self._pp_rng
             )
 
-        reply_text = await self._compose_reply(group_id, msg, profile, runtime, decision)
+        reply_text = await self._compose_reply(
+            group_id,
+            msg,
+            profile,
+            runtime,
+            decision,
+            expression_hints,
+            jargon_hints,
+        )
         if not reply_text:
             logger.info("群 %d 回复生成为空，放弃发送", group_id)
             return
@@ -680,7 +723,13 @@ class CandyBot:
                     "、".join(f"{r.nickname}({r.message_id})" for r in directed),
                 )
                 regenerated = await self._compose_reply(
-                    group_id, msg, profile, runtime, decision
+                    group_id,
+                    msg,
+                    profile,
+                    runtime,
+                    decision,
+                    expression_hints,
+                    jargon_hints,
                 )
                 if regenerated:
                     reply_text = regenerated
@@ -729,6 +778,51 @@ class CandyBot:
         if not decision.forced and not decision.engaged:
             runtime.last_proactive_ts = time.time()
         runtime.msgs_since_reply = 0
+        # 任务 C：文字回复成功发出后，按小概率跟发一张表情包（辅助能力，
+        # 内部消化全部失败，不影响本轮记账）
+        await self._maybe_send_sticker(group_id, memory)
+
+    async def _maybe_send_sticker(self, group_id: int, memory: GroupMemory) -> None:
+        """表情包跟发（任务 C 最小版）：每条文字回复后独立掷点，命中且该群
+        收藏非空时随机抽一张，以 OneBot v11 image 消息段（file:// 绝对路径）
+        跟发；不做模型选择。
+
+        发送成功后写回一条 is_self 的「[表情包]」占位记录，让模型在历史里
+        知道自己发过图（路径与 base64 都不进历史）。任何失败（含 image 段
+        被端点拒绝、重试耗尽）只记日志——文字已经发出去了，不能让跟发的
+        失败反过来动摇本轮发言的记账。
+
+        选中图片后不秒发：先按占位文本「[表情包]」估算一段「挑图 + 打字」
+        时长 sleep（复用 postprocess.estimate_typing_time 与全局
+        typing_speed 倍率，约 1 秒量级；倍率为 0 时估算即 0、自然不延迟），
+        仿真人挑图要一会儿的节奏。
+        """
+        st = self._settings.stickers
+        if not st.enabled or st.send_probability <= 0:
+            return
+        try:
+            if self._sticker_rng.random() >= st.send_probability:
+                return
+            picked = await self._stickers.pick_for_send(group_id, self._sticker_rng)
+            if picked is None:
+                logger.debug("群 %d 掷点命中但收藏为空，不跟发表情包", group_id)
+                return
+            speed = self._settings.response_post_process.typing_speed
+            delay = estimate_typing_time(STICKER_RECORD_TEXT, speed)
+            logger.debug("群 %d 跟发表情包前预计挑图打字 %.1f 秒", group_id, delay)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self._send_with_retry(group_id, [self._stickers.image_segment(picked)])
+            await memory.append(self._self_record(group_id, STICKER_RECORD_TEXT))
+            await self._stickers.mark_used(picked)
+            logger.info(
+                "群 %d 跟发表情包：%s（该图累计使用 %d 次）",
+                group_id,
+                picked.path,
+                picked.use_count + 1,
+            )
+        except Exception:
+            logger.warning("群 %d 表情包跟发失败", group_id, exc_info=True)
 
     async def _compose_reply(
         self,
@@ -737,8 +831,14 @@ class CandyBot:
         profile: GroupProfile,
         runtime: GroupRuntime,
         decision: Decision,
+        expression_hints: list[tuple[str, str]],
+        jargon_hints: list[tuple[str, str]],
     ) -> str | None:
         """生成回复并处理其中的图片生命周期操作。
+
+        expression_hints / jargon_hints 是本轮决策的 L4 学习注入内容，由
+        _decide_and_reply 调 _learning_hints 计算一次后传入：新鲜度重生成
+        再次进入本方法时复用同一组 hints，绝不二次抽样、二次刷新表达条目。
 
         首稿通过 send_reply 工具参数携带 drop/recall 操作：立即把操作落到
         记忆；若发生过成功的召回（模型想重新查看某张旧图），重建上下文后
@@ -776,7 +876,6 @@ class CandyBot:
                 nicknames,
                 impressions=await self._impressions_for(group_id, runtime),
             )
-            expression_hints, jargon_hints = await self._learning_hints(group_id, recent)
             draft = await self._generate_with_retry(
                 self._ai.generate_reply,
                 static_system,

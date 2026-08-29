@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -104,10 +105,16 @@ class ChatRecord:
 
 @dataclass(slots=True)
 class NormalizedMessage:
-    """normalize 后的群消息事件。"""
+    """normalize 后的群消息事件。
+
+    sticker_flags 与 record.images 下标对齐，标记每张图是否像「表情包类」
+    （识别来源按 multimodal 模式而异，见 normalize.py 与 stickers.py）；
+    只在收图当次事件处理里使用，不入库。
+    """
 
     record: ChatRecord
     mentioned_me: bool
+    sticker_flags: tuple[bool, ...] = ()
 
 
 @dataclass(slots=True)
@@ -237,6 +244,28 @@ class ModelSettings:
     learning: ModelConfig | None = None
 
 
+# 临时随机回复风格的内置默认示例（generation.multiple_reply_style）：
+# 打破固定腔调，每条回复按概率抽一条注入 L4，风格贴合群聊场景。
+MULTIPLE_REPLY_STYLE_DEFAULT = (
+    "用 1-2 个字进行回复",
+    "只回一个语气词，比如「嗯」「哦」「哈」",
+    "只说半句话，像打了一半就顺手发了出去",
+    "用反问或吐槽接一句，别一本正经地回答",
+    "像赶时间一样，能省的字全省掉",
+)
+
+# 「太像 AI」检测的内置默认正则规则（generation.ai_flavor_rules）：
+# 按 re.MULTILINE 编译，^ 类规则因此能命中任意一行行首。
+AI_FLAVOR_RULES_DEFAULT = (
+    r"作为(一)?(个|位)?(AI|ai|人工智能|语言模型|大模型)",
+    r"很(高兴|乐意|荣幸)(为|帮)您",
+    r"^\s*以下是",
+    r"^\s*#{1,6}\s",          # markdown 标题残留
+    r"\*\*[^*\n]+\*\*",       # markdown 加粗残留
+    r"^\s*[-*]\s+\S",         # 行首 markdown 列表残留
+)
+
+
 @dataclass(frozen=True)
 class GenerationSettings:
     reply_max_tokens: int
@@ -265,6 +294,16 @@ class GenerationSettings:
     #   对方没再开口时（判定规则见 bot._already_replied_to），在 L4 注入
     #   「不要和之前的发言重复」的提醒。
     repetition_guard_enabled: bool = True
+    # ---- 风格多样性与内容拦截（关闭时行为与引入前完全一致）----
+    # 任务 A 临时随机风格：每条回复独立按 multiple_probability 掷点，命中时
+    #   从 multiple_reply_style 随机抽一条注入 L4；概率 0 或列表为空即关闭。
+    multiple_reply_style: tuple[str, ...] = MULTIPLE_REPLY_STYLE_DEFAULT
+    multiple_probability: float = 0.0
+    # 任务 B AI 味拦截：回复清洗完成后过一轮 ai_flavor_rules 正则检测，
+    #   命中则把被拦截回复与原因附进 L4 重生成一次；ai_flavor_retries 为
+    #   最大重试次数（0 关闭整个环节），重试后仍命中则放行并记 warning。
+    ai_flavor_rules: tuple[str, ...] = AI_FLAVOR_RULES_DEFAULT
+    ai_flavor_retries: int = 1
 
 
 @dataclass(frozen=True)
@@ -361,6 +400,21 @@ class ResponsePostProcessSettings:
 
 
 @dataclass(frozen=True)
+class StickerSettings:
+    """表情包最小版（收集 + 小概率跟发，见 stickers.py）。
+
+    enabled：总开关（关掉既不收集也不跟发）；
+    send_probability：成功发送一条文字回复后跟发一张表情包的概率；
+    max_count：全局收藏上限（跨群合计），超限替换最久未使用的条目
+      （删除记录并删除图片文件）。
+    """
+
+    enabled: bool = True
+    send_probability: float = 0.05
+    max_count: int = 64
+
+
+@dataclass(frozen=True)
 class SnowlumaSettings:
     mcp_command: str
     mcp_args: list[str]
@@ -386,6 +440,8 @@ class Settings:
     response_post_process: ResponsePostProcessSettings
     # learning 段可整体省略（全部走默认值），故带默认值
     learning: LearningSettings = LearningSettings()
+    # stickers 段同样可整体省略
+    stickers: StickerSettings = StickerSettings()
 
     def profile_for(self, group_id: int) -> GroupProfile | None:
         """严格白名单语义。
@@ -608,6 +664,39 @@ def load_settings(cfg: Any) -> Settings:
             f"配置项 `generation.observe_band` 应在 0~10 之间（0 关闭观望），"
             f"实际是 {observe_band!r}"
         )
+    multiple_probability = _parse_float(gen_cfg, "multiple_probability", 0.0)
+    if not 0 <= multiple_probability <= 1:
+        raise ValueError(
+            f"配置项 `generation.multiple_probability` 应在 0~1 之间，"
+            f"实际是 {multiple_probability!r}"
+        )
+
+    def _parse_str_tuple(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        raw = _get(gen_cfg, key, list(default))
+        if (
+            not isinstance(raw, (list, tuple))
+            or not all(isinstance(item, str) and item.strip() for item in raw)
+        ):
+            raise ValueError(f"配置项 `generation.{key}` 应为非空字符串的列表")
+        return tuple(str(item).strip() for item in raw)
+
+    multiple_reply_style = _parse_str_tuple(
+        "multiple_reply_style", MULTIPLE_REPLY_STYLE_DEFAULT
+    )
+    ai_flavor_rules = _parse_str_tuple("ai_flavor_rules", AI_FLAVOR_RULES_DEFAULT)
+    for pattern in ai_flavor_rules:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"配置项 `generation.ai_flavor_rules` 含非法正则 {pattern!r}：{exc}"
+            ) from exc
+    ai_flavor_retries = _parse_int(gen_cfg, "ai_flavor_retries", 1)
+    if ai_flavor_retries < 0:
+        raise ValueError(
+            f"配置项 `generation.ai_flavor_retries` 不能为负数（0 表示关闭），"
+            f"实际是 {ai_flavor_retries!r}"
+        )
     observe_delay_seconds = _parse_float(gen_cfg, "observe_delay_seconds", 45.0)
     # 观望延时直接喂给 asyncio.sleep：inf/nan 会让任务永久挂起或行为未定，
     # 与 typing_speed 同口径拒收
@@ -638,6 +727,10 @@ def load_settings(cfg: Any) -> Settings:
             gen_cfg.get("repetition_guard_enabled", True),
             "generation.repetition_guard_enabled",
         ),
+        multiple_reply_style=multiple_reply_style,
+        multiple_probability=multiple_probability,
+        ai_flavor_rules=ai_flavor_rules,
+        ai_flavor_retries=ai_flavor_retries,
     )
 
     mm_cfg = _require_section(cfg, "multimodal")
@@ -784,6 +877,25 @@ def load_settings(cfg: Any) -> Settings:
         jargon_max_inject=_parse_positive_int("jargon_max_inject", 5),
     )
 
+    # stickers 段可整体省略（全部走默认值）
+    sticker_cfg = _optional_section(cfg, "stickers")
+    send_probability = _parse_float(sticker_cfg, "send_probability", 0.05)
+    if not 0 <= send_probability <= 1:
+        raise ValueError(
+            f"配置项 `stickers.send_probability` 应在 0~1 之间，"
+            f"实际是 {send_probability!r}"
+        )
+    sticker_max_count = _parse_int(sticker_cfg, "max_count", 64)
+    if sticker_max_count < 1:
+        raise ValueError(
+            f"配置项 `stickers.max_count` 不能小于 1，实际是 {sticker_max_count!r}"
+        )
+    sticker_settings = StickerSettings(
+        enabled=_parse_bool(sticker_cfg.get("enabled", True), "stickers.enabled"),
+        send_probability=send_probability,
+        max_count=sticker_max_count,
+    )
+
     return Settings(
         bot=BotSettings(
             self_qq=self_qq,
@@ -804,6 +916,7 @@ def load_settings(cfg: Any) -> Settings:
         snowluma=snowluma_settings,
         response_post_process=post_process_settings,
         learning=learning_settings,
+        stickers=sticker_settings,
     )
 
 

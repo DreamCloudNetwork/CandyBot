@@ -5,7 +5,10 @@ text/face/at/reply/image 等 segment 转为内部 ChatRecord；
 - placeholder：文本只留 ``[图片]`` 占位符（默认），但 base64 仍随记录落盘；
 - direct：下载图片转 base64 data URL，附在 record.images 供直传模型，
   入库时由视觉模型判定后续对话继续展示原图还是只用总结；
-- describe：下载后调用视觉模型转文字描述，写进正文。
+- describe：下载后调用视觉模型转文字描述，写进正文；base64 同样随记录落盘。
+
+三种模式还会为每张下载成功的图产出 sticker_flags（是否像表情包类，
+供表情包收集，见 stickers.py）。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from .models import (
     NormalizedMessage,
     validate_request_url,
 )
+from .stickers import is_small_image, is_sticker_by_summary
 
 logger = logging.getLogger(__name__)
 
@@ -170,25 +174,39 @@ async def normalize_group_message(
     text = "\n".join(p for p in parts if p)
 
     # 图片增强：direct 下载转 data URL 并入库判定；describe 转文字并入正文；
-    # placeholder 不给模型看图，但 base64 照常随记忆落盘备查。
+    # placeholder 不给模型看图。三种模式下载到的 base64 都随记忆落盘备查。
+    # sticker_flags 与 images 下标对齐：标记每张图是否像「表情包类」，供
+    # bot 的表情包收集（来源分模式：direct 用入库评估的 is_sticker 判定，
+    # describe 按总结文本关键词，placeholder 按「尺寸小」启发式）。
     images: tuple[str, ...] = ()
     image_states: tuple[str, ...] = ()
     image_summaries: dict[int, str] | None = None
+    sticker_flags: tuple[bool, ...] = ()
     if image_urls and multimodal.download_media and http_session is not None:
         data_urls: list[str] = []
         descriptions: list[str] = []
+        describe_flags: list[bool] = []  # describe 模式：与 data_urls 一一对应
         for url in image_urls[:4]:  # 至多取 4 张，防刷屏
             data_url = await _download_as_data_url(http_session, url)
             if data_url is None:
                 continue
             data_urls.append(data_url)
-            if multimodal.mode == "describe" and describe_image is not None:
-                try:
-                    descriptions.append(await describe_image(data_url))
-                except Exception as exc:
-                    logger.warning("图片转述失败：%s", exc)
+            if multimodal.mode == "describe":
+                if describe_image is not None:
+                    try:
+                        desc = await describe_image(data_url)
+                    except Exception as exc:
+                        logger.warning("图片转述失败：%s", exc)
+                        desc = None
+                else:
+                    desc = None
+                if desc:
+                    descriptions.append(desc)
+                describe_flags.append(is_sticker_by_summary(desc))
 
         if multimodal.mode == "describe":
+            images = tuple(data_urls)
+            sticker_flags = tuple(describe_flags)
             for desc in descriptions:
                 text += f"\n[图片：{desc}]"
             if not descriptions:
@@ -197,6 +215,7 @@ async def normalize_group_message(
             images = tuple(data_urls)
             states: list[str] = []
             summaries: dict[int, str] = {}
+            flags: list[bool] = []
             for index, data_url in enumerate(images):
                 summary: str | None = None
                 keep_raw = True
@@ -205,8 +224,13 @@ async def normalize_group_message(
                         assessment = await assess_image(data_url)
                         summary = assessment.summary
                         keep_raw = assessment.keep_raw
+                        sticker_is_sticker = assessment.is_sticker
                     except Exception as exc:
                         logger.warning("图片入库评估失败，默认保留原图：%s", exc)
+                        sticker_is_sticker = is_small_image(data_url)
+                else:
+                    # 未配置 vision：没有入库评估结论可复用，退回尺寸启发式
+                    sticker_is_sticker = is_small_image(data_url)
                 state = IMAGE_STATE_SHOW
                 # 判定无需继续展示原图：能总结就转为总结，否则保守保留原图
                 if not keep_raw and summary:
@@ -214,13 +238,16 @@ async def normalize_group_message(
                 if summary:
                     summaries[index] = summary
                 states.append(state)
+                flags.append(sticker_is_sticker)
             image_states = tuple(states)
             image_summaries = summaries or None
+            sticker_flags = tuple(flags)
             if not images:
                 text = text.replace("[图片]", "").strip()
                 text = (text + "\n[图片]").strip()
         else:  # placeholder：一律只展示占位符，图本身仍要写进本地记忆
             images = tuple(data_urls)
+            sticker_flags = tuple(is_small_image(url) for url in data_urls)
 
     if not text.strip() and not images:
         return None
@@ -236,7 +263,9 @@ async def normalize_group_message(
         image_states=image_states,
         image_summaries=image_summaries,
     )
-    return NormalizedMessage(record=record, mentioned_me=mentioned_me)
+    return NormalizedMessage(
+        record=record, mentioned_me=mentioned_me, sticker_flags=sticker_flags
+    )
 
 
 async def _resolve_reply(

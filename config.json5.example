@@ -88,6 +88,16 @@
         "emoji_chance": 0.25,             // 随机附加 emoji 的概率（0~1）
         "emoji_max": 2,                   // 单条回复最多 emoji 数
         "max_history_images": 8,      // 历史中最多携带的图片数（默认 8）
+        // 临时随机回复风格：每条回复独立按 multiple_probability 掷点，命中时从
+        // 列表随机抽一条注入指令层（如「用 1-2 个字进行回复」）。默认 0 关闭；
+        // 不写列表时使用代码内置的 5 条群聊风格示例。
+        // "multiple_probability": 0.15,
+        // "multiple_reply_style": ["用 1-2 个字进行回复", "只回一个语气词"],
+        // AI 味拦截：回复清洗完成后过一轮正则检测，命中则把被拦截回复与原因
+        // 附进指令层重生成一次；重试后仍命中则放行并记 warning。
+        // ai_flavor_retries=0 关闭整个环节；ai_flavor_rules=[] 同样关闭。
+        // "ai_flavor_retries": 1,
+        // "ai_flavor_rules": ["作为(一)?(个|位)?(AI|人工智能|语言模型)", "^\\s*以下是"],
     },
 
     "multimodal": {
@@ -134,6 +144,16 @@
         "typo_polyphone_mode": "word_reading", // 多音字错字策略：word_reading=取词内读音照常替换 / skip=跳过多音字；读音无法确定时两种模式都不替换
         // 敷衍池：随机抽一条代替过长回复
         "lazy_replies": ["呃呃", "不晓得", "懒得说", "不知道", "emm"],
+    },
+
+    // 表情包（最小版）：识别收到的表情包类图片存入 data/stickers/，
+    // 成功发送文字回复后按概率随机跟发一张。整段可省略（全部走默认值）。
+    // 注意：跟发用 OneBot v11 image 消息段（file:// 绝对路径），要求
+    // SnowLuma 与 CandyBot 同机或共享磁盘；端点不支持时仅记错误日志。
+    "stickers": {
+        "enabled": true,                  // 总开关（关掉既不收集也不跟发）
+        "send_probability": 0.05,         // 每条文字回复后跟发一张的概率（0 关闭跟发）
+        "max_count": 64,                  // 全局收藏上限，超限替换最久未使用的
     },
 
     "snowluma": {

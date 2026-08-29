@@ -30,10 +30,12 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from .aiflavor import detect_ai_flavor
 from .models import ChatRecord, GenerationSettings, ModelConfig, ModelSettings
 from .postprocess import EMOJI_RE as _EMOJI_RE
 from .prompts import (
     Message,
+    ai_flavor_retry_block,
     expression_evaluation_prompt,
     expression_learning_prompt,
     final_user_prompt_judge,
@@ -81,10 +83,12 @@ class JudgeVerdict:
 
 @dataclass(frozen=True)
 class ImageAssessment:
-    """收图入库时视觉模型的判定：总结文本 + 是否继续向模型展示原图。"""
+    """收图入库时视觉模型的判定：总结文本 + 是否继续向模型展示原图 +
+    是否为表情包类（供 stickers 收集，见 normalize / stickers）。"""
 
     summary: str | None
     keep_raw: bool
+    is_sticker: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,14 +166,18 @@ _ASSESS_TOOL = {
     "type": "function",
     "function": {
         "name": "submit_assessment",
-        "description": "提交图片入库评估：一句话总结与是否保留原图。",
+        "description": "提交图片入库评估：一句话总结、是否保留原图、是否表情包类。",
         "parameters": {
             "type": "object",
             "properties": {
                 "summary": {"type": "string", "description": "不超过40字的内容总结"},
                 "keep": {"type": "boolean", "description": "后续对话是否还需要查看原图"},
+                "sticker": {
+                    "type": "boolean",
+                    "description": "是否为表情包/梗图这类主要用于斗图的图",
+                },
             },
-            "required": ["summary", "keep"],
+            "required": ["summary", "keep", "sticker"],
         },
     },
 }
@@ -590,13 +598,24 @@ class AIClient:
         prompts.final_user_prompt_reply），属于每次回复都可变的易变信息，
         只进 L4 指令层。repetition_warning 同理：bot 层判定很可能在重复
         刚才的发言时为 True，L4 注入重复提醒。
+
+        风格多样性与内容拦截两层附加处理（注入都只进 L4，reconsider_reply
+        均不走这两层）：
+
+        - 任务 A：每次调用独立掷点抽一条临时风格（见 _pick_temporary_style），
+          命中注入 L4；发生下面的 AI 味重生成时沿用同一条风格，不再重掷。
+        - 任务 B：生成与清洗完成后过一轮 AI 味正则检测（aiflavor），命中时
+          把被拦截回复与原因附进 L4 重新生成，至多 ai_flavor_retries 次
+          （0 关闭整个环节）；重试后仍命中则放行并记 warning——宁可留着
+          这句稍假的话，也绝不死循环卡住决策队列。这是内容级重试，与 bot
+          层 _generate_with_retry 的网络重试相互独立；重试调用自身抛出的
+          网络异常照常上抛，交网络重试处理。
         """
-        return await self._reply_call(
-            static_system,
-            runtime_system,
-            recent_records[:-1],
-            current_message,
-            lambda via_tool: final_user_prompt_reply(
+        temporary_style = self._pick_temporary_style()
+        retry_notes: list[str] = []
+
+        def build_text_part(via_tool: bool) -> str:
+            text = final_user_prompt_reply(
                 now_text,
                 current_message,
                 forced=forced,
@@ -607,8 +626,68 @@ class AIClient:
                 expression_hints=expression_hints,
                 jargon_hints=jargon_hints,
                 repetition_warning=repetition_warning,
-            ),
+                temporary_style=temporary_style,
+            )
+            return "\n\n".join([text, *retry_notes]) if retry_notes else text
+
+        draft = await self._reply_call(
+            static_system,
+            runtime_system,
+            recent_records[:-1],
+            current_message,
+            build_text_part,
         )
+        gen = self._generation
+        if draft is not None and draft.text and gen.ai_flavor_rules and gen.ai_flavor_retries > 0:
+            violation = detect_ai_flavor(draft.text, gen.ai_flavor_rules)
+            attempts = 0
+            while violation is not None and attempts < gen.ai_flavor_retries:
+                attempts += 1
+                logger.info(
+                    "[reply] AI 味拦截（第 %d/%d 次重生成）：%s，被拦截回复：%r",
+                    attempts,
+                    gen.ai_flavor_retries,
+                    violation,
+                    draft.text[:120],
+                )
+                retry_notes.append(ai_flavor_retry_block(draft.text, violation))
+                draft = await self._reply_call(
+                    static_system,
+                    runtime_system,
+                    recent_records[:-1],
+                    current_message,
+                    build_text_part,
+                )
+                violation = (
+                    detect_ai_flavor(draft.text, gen.ai_flavor_rules)
+                    if draft is not None and draft.text
+                    else None
+                )
+            if violation is not None:
+                logger.warning(
+                    "[reply] AI 味重生成 %d 次后仍命中，放行：%s（回复：%r）",
+                    attempts,
+                    violation,
+                    (draft.text if draft else "")[:120],
+                )
+        return draft
+
+    def _pick_temporary_style(self) -> str | None:
+        """任务 A：每条回复独立掷点抽一条临时风格；未命中或关闭返回 None。
+
+        概率为 0 或池为空时直接短路、不消耗随机数；掷点与抽取统一走加密
+        安全的 _RNG（与 emoji 掷点同一约定）。
+        """
+        gen = self._generation
+        if gen.multiple_probability <= 0 or not gen.multiple_reply_style:
+            return None
+        if _RNG.random() >= gen.multiple_probability:
+            return None
+        style = str(_RNG.choice(gen.multiple_reply_style)).strip()
+        if not style:
+            return None
+        logger.debug("[reply] 注入临时风格：%r", style)
+        return style
 
     async def reconsider_reply(
         self,
@@ -797,13 +876,15 @@ class AIClient:
                                 "这是一张群聊里发来的图片。请先用不超过40个字总结它的内容要点，"
                                 "再判断后续对话是否还需要继续查看这张原图：只有当图片包含未来"
                                 "可能被反复引用的具体信息（文字截图、代码、表格、关键画面细节等）"
-                                "才值得保留原图；表情包、梗图之类的总结即可。\n"
+                                "才值得保留原图；表情包、梗图之类的总结即可。最后判断它是不是"
+                                "「表情包类」图片：以玩梗、表达情绪为目的的斗图表情、梗图、"
+                                "搞笑动图都算；截图、照片、信息图不算。\n"
                                 + (
                                     "完成后调用 submit_assessment 工具提交：summary 为一句话总结，"
-                                    "keep 表示后续对话是否还需要查看原图。"
+                                    "keep 表示后续对话是否还需要查看原图，sticker 表示是否为表情包类。"
                                     if via_tool
                                     else '只输出一个 JSON 对象：{"summary": "一句话总结",'
-                                    ' "keep": true 或 false}'
+                                    ' "keep": true 或 false, "sticker": true 或 false}'
                                 )
                             ),
                         },
@@ -842,8 +923,13 @@ class AIClient:
     def _assessment_from_args(args: dict) -> ImageAssessment:
         summary = args.get("summary")
         summary = str(summary).strip()[:200] if isinstance(summary, str) else None
-        # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图
-        return ImageAssessment(summary=summary or None, keep_raw=args.get("keep") is not False)
+        # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图；
+        # sticker 反过来只认显式 true：歧义一律不收集表情包
+        return ImageAssessment(
+            summary=summary or None,
+            keep_raw=args.get("keep") is not False,
+            is_sticker=args.get("sticker") is True,
+        )
 
     @staticmethod
     def _parse_assessment(raw: str) -> ImageAssessment:
@@ -857,9 +943,12 @@ class AIClient:
             if isinstance(obj, dict):
                 summary = obj.get("summary")
                 summary = str(summary).strip()[:200] if isinstance(summary, str) else None
-                # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图
+                # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图；
+                # sticker 只认显式 true：歧义一律不收集
                 return ImageAssessment(
-                    summary=summary or None, keep_raw=obj.get("keep") is not False
+                    summary=summary or None,
+                    keep_raw=obj.get("keep") is not False,
+                    is_sticker=obj.get("sticker") is True,
                 )
         logger.warning("图片入库评估输出无法解析：%r", raw[:200])
         return ImageAssessment(summary=None, keep_raw=True)

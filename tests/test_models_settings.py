@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from candybot.models import (
+    AI_FLAVOR_RULES_DEFAULT,
     CONTEXT_SIZE_DEFAULT,
+    MULTIPLE_REPLY_STYLE_DEFAULT,
     GroupProfile,
     Settings,
     load_settings,
@@ -534,3 +536,70 @@ def test_models_limits_validation():
     ):
         with pytest.raises(ValueError):
             load_settings(DictCfg(base_cfg(models={"reply": bad})))
+
+
+# ---------------------------------------------------------------- 风格多样性与内容拦截
+
+
+def test_style_flavor_sticker_defaults():
+    """整段不写时全部落到带默认值的向后兼容配置。"""
+    s = load_settings(DictCfg(base_cfg()))
+    gen = s.generation
+    assert gen.multiple_probability == 0.0            # 临时风格默认关闭
+    assert gen.multiple_reply_style == MULTIPLE_REPLY_STYLE_DEFAULT  # 内置示例池
+    assert len(gen.multiple_reply_style) >= 3
+    assert all(isinstance(x, str) and x.strip() for x in gen.multiple_reply_style)
+    assert gen.ai_flavor_rules == AI_FLAVOR_RULES_DEFAULT  # AI 味检测默认开
+    assert gen.ai_flavor_retries == 1
+    st = s.stickers
+    assert st.enabled is True
+    assert st.send_probability == 0.05
+    assert st.max_count == 64
+
+
+def test_style_flavor_sticker_custom_values():
+    cfg = base_cfg(
+        generation={
+            "multiple_reply_style": [" 只回一个字 ", "用反问接话"],
+            "multiple_probability": 0.3,
+            "ai_flavor_rules": ["哈哈"],
+            "ai_flavor_retries": 0,
+        },
+        stickers={"enabled": False, "send_probability": 0.5, "max_count": 10},
+    )
+    s = load_settings(DictCfg(cfg))
+    assert s.generation.multiple_reply_style == ("只回一个字", "用反问接话")  # 自动 strip
+    assert s.generation.multiple_probability == 0.3
+    assert s.generation.ai_flavor_rules == ("哈哈",)
+    assert s.generation.ai_flavor_retries == 0
+    assert s.stickers.enabled is False
+    assert s.stickers.send_probability == 0.5
+    assert s.stickers.max_count == 10
+
+    # 空列表是合法显式值：分别关闭风格注入与 AI 味检测
+    cfg2 = base_cfg(generation={"multiple_reply_style": [], "ai_flavor_rules": []})
+    s2 = load_settings(DictCfg(cfg2))
+    assert s2.generation.multiple_reply_style == ()
+    assert s2.generation.ai_flavor_rules == ()
+
+
+def test_style_flavor_sticker_validation_errors():
+    for bad_gen, frag in [
+        ({"multiple_probability": 1.5}, "multiple_probability"),
+        ({"multiple_probability": -0.1}, "multiple_probability"),
+        ({"multiple_reply_style": "字符串不是列表"}, "multiple_reply_style"),
+        ({"multiple_reply_style": ["ok", "  "]}, "multiple_reply_style"),
+        ({"ai_flavor_rules": ["("]}, "ai_flavor_rules"),
+        ({"ai_flavor_rules": [42]}, "ai_flavor_rules"),
+        ({"ai_flavor_retries": -1}, "ai_flavor_retries"),
+    ]:
+        with pytest.raises(ValueError, match=frag):
+            load_settings(DictCfg(base_cfg(generation=bad_gen)))
+    for bad_st, frag in [
+        ({"send_probability": 2.0}, "send_probability"),
+        ({"max_count": 0}, "max_count"),
+        ({"max_count": -5}, "max_count"),
+        ({"enabled": "yes"}, "stickers.enabled"),
+    ]:
+        with pytest.raises(ValueError, match=frag):
+            load_settings(DictCfg(base_cfg(stickers=bad_st)))

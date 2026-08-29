@@ -173,6 +173,44 @@ async def test_freshness_disabled_by_config(tmp_path):
         await bot.stop()
 
 
+async def test_freshness_regeneration_reuses_learning_hints(tmp_path, monkeypatch):
+    """新鲜度重生成复用本轮决策的学习注入：抽表达/touch 每轮只发生一次，
+    初稿与重生成稿看到一致的风格参考（不二次采样、不二次刷新）。"""
+    bot = await build(tmp_path)
+    try:
+        await bot._memory.get(42)  # 生产上 bot.start() 已建表；测试里手动触发
+        await bot._memory.db.record_expression(42, "被群里@时", "用一两个字回复", time.time())
+        # 监听对表达条目的刷新：pick_expressions 每抽中一次就 touch 一次
+        touch_calls: list[list[int]] = []
+        original_touch = bot._memory.db.touch_expressions
+
+        async def spy_touch(ids, ts):
+            if list(ids):
+                touch_calls.append(list(ids))
+            return await original_touch(ids, ts)
+
+        monkeypatch.setattr(bot._memory.db, "touch_expressions", spy_touch)
+        bot._ai = DraftQueuedAI(
+            [JudgeVerdict(9, "值得回")],
+            ["草稿1", "草稿2", "草稿3"],
+            hook=lambda: bot._on_event(group_event(2, "糖糖你看这个", at_me=True)),
+        )
+
+        await bot._on_event(group_event(1, "讨论个话题"))
+        await wait_until(lambda: len(bot._snowluma.sent) == 2, timeout=3)
+
+        # 与既有新鲜度用例相同的流程：msg1 初稿 + 一次重生成，再加 msg2 必答
+        assert len(bot._ai.reply_calls) == 3
+        picked = [("被群里@时", "用一两个字回复")]
+        assert bot._ai.reply_calls[0]["expression_hints"] == picked  # 初稿有注入
+        assert bot._ai.reply_calls[1]["expression_hints"] == picked  # 重生成同一组
+        # 每轮 _decide_and_reply 只抽一次：msg1 轮（含重生成）1 次、msg2 必答轮 1 次。
+        # 若重生成仍走 _learning_hints，这里会是 3 次
+        assert len(touch_calls) == 2
+    finally:
+        await bot.stop()
+
+
 # ------------------------------------------------------------ 任务 B：观望重评
 
 
@@ -245,7 +283,9 @@ async def test_observe_at_most_once_per_message(tmp_path):
 
 
 async def test_observe_cancelled_when_already_replied(tmp_path):
-    """观望期间该消息一带已通过其他路径（@必答）回复过 → 取消重评。"""
+    """观望期间目标消息之后出现过 bot 自己的发言（这里是 msg2 的必答回复，
+    并非在回 msg1）→ 按有意保留的保守规则取消重评：只要目标之后自己说过
+    话、无论实际在回哪条，都不重评，防止同一话题被连说两遍。"""
     bot = await build(
         tmp_path,
         generation_overrides={"recheck_enabled": False, "observe_delay_seconds": 0.4},
@@ -262,7 +302,8 @@ async def test_observe_cancelled_when_already_replied(tmp_path):
 
         await bot._on_event(group_event(1, "半吊子话题"))
         await drain_tick()
-        # 观望期间被 @（另一条消息走必答路径，回复落在 msg1 之后）
+        # 观望期间被 @：msg2 走必答路径，它的回答落在 msg1 之后——
+        # 保守取消不看「这条回答在回谁」，只看「目标之后有没有自己发言」
         await bot._on_event(group_event(2, "糖糖你说呢", at_me=True))
         await wait_until(lambda: len(bot._snowluma.sent) == 1, timeout=3)
 
