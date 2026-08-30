@@ -75,6 +75,10 @@
             // "forced_tool_choice": false, // 思考模式不支持 required 强制指定时打开
         },
         // "vision": "glm-4v-flash",      // 视觉模型；注释掉表示禁用图片理解
+        // "embedding": "bge-m3",         // 向量模型（可选）：learning.expression_selection_mode
+                                        // 设为 "vector"（表达按语境语义检索）时必配，
+                                        // 写法与 judge/reply 一致（字符串或对象）；
+                                        // 未配置时该项必须保持 weighted_random，否则启动报错
     },
 
     "generation": {
@@ -140,6 +144,9 @@
         "expression_batch_size": 10,      // 同群被淘汰消息攒够多少条触发一次学习
         "expression_max_inject": 3,       // 单次回复最多注入的表达条数
         "expression_self_review": true,   // AI 自审过滤低质量表达条目
+        "expression_selection_mode": "weighted_random", // 表达选取：weighted_random = 按权重随机（现状默认）；vector = 按当前聊天语境做 embedding 语义检索（需配 models.embedding）
+        "expression_vector_top_k": 10,    // vector 模式召回的候选数
+        "expression_min_similarity": 0.30, // vector 模式相似度下限：低于视为语境无关、宁缺毋滥（0~1）
         "jargon_enabled": true,           // 黑话学习单项开关
         "jargon_max_entries": 50,         // 每群黑话条目上限，超限淘汰最久未命中
         "jargon_max_inject": 5,           // 单次回复最多注入的命中黑话条数

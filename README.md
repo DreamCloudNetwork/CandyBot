@@ -47,6 +47,7 @@ uv run main.py                   # 启动
 |                       | reply                                                              | 参与回答生成回复的模型。每个角色既可写模型名字符串（继承 ai_backend），也可写对象覆盖 `base_url` / `api_key`，并配置 `context_window`（上下文窗口，token，用于约束历史长度）与 `max_output_tokens`（单次输出上限）                                                                                         |
 |                       | vision                                                             | 视觉模型：describe 模式的转述、direct 模式收图入库时的总结/保留判定（含表情包 sticker 判定）都靠它；同样支持按模型覆盖提供商与限额                                                                                                                                                                                                  |
 |                       | learning                                                           | 学习任务模型：每日群印象总结、表达/黑话学习与自审都靠它（建议与 judge 同为便宜快速的模型）；**不配置则继承 judge 的配置**；同样支持对象写法覆盖提供商与限额                                                                                                                                                |
+|                       | embedding                                                          | 向量模型（可选，无继承）：表达选取走 `learning.expression_selection_mode: "vector"` 时用它把聊天语境与表达条目向量化（OpenAI 兼容 `/embeddings`）；写法与 judge/reply 一致（字符串或对象，继承 `ai_backend`）。**`vector` 模式未配置该角色会启动即报错**，不做静默降级                                                                                                    |
 |                       | （各角色均可加 `tool_use`）                                        | 模型是否支持工具调用（默认 `true`）。判定/回复/入库评估默认经强制工具调用提交结构化结果；`false` 时该角色走纯文本协议（judge 在正文输出 JSON，reply 用末尾 `<drop_img>/<recall_img>` 标记），提示词契约随之一致。运行中若端点报工具相关错误或忽略 `tools` 参数，该角色也会自动降级为纯文本协议并记警告日志 |
 |                       | （各角色均可加 `forced_tool_choice`）                              | 是否强制指定工具（`tool_choice=required`，默认 `true`）。思考（thinking）模式的模型普遍不支持 required/object 强制指定（如 qwen3 系列直接报 400）：这类模型设为 `false`，请求改用 `tool_choice="auto"` 并由提示词引导模型主动调用；模型没调用工具时同样自动降级为纯文本协议                                |
 | generation            | reply_max_tokens / temperature                                     | 回复生成长度与随机性（reply 模型配置了 max_output_tokens 时以其为准）                                                                                                                                                                                                                                      |
@@ -68,8 +69,10 @@ uv run main.py                   # 启动
 | storage               | image_retention_days                                               | 聊天原图保留天数（默认 7）：超期自动回收为总结/占位符；文本历史永久保留。整段可省略                                                                                                                                                                                                                        |
 | learning              | enabled                                                            | 记忆与学习总开关（每日群印象 + 表达学习 + 黑话学习，见下文「记忆与学习机制」）。整段可省略、全部走默认值                                                                                                                                                                                                   |
 |                       | impression_enabled / impression_days / impression_max_chars        | 每日群印象单项开关 / 注入 L2 的最近印象天数（默认 3）/ 单日印象字数上限（默认 300）                                                                                                                                                                                                                        |
-|                       | expression_enabled / expression_batch_size / expression_max_inject | 表达学习单项开关 / 同群被热缓存淘汰的消息攒够多少条触发一次后台学习（默认 10）/ 单次回复最多注入 L4 的表达条数（默认 3，加权随机）                                                                                                                                                                         |
+|                       | expression_enabled / expression_batch_size / expression_max_inject | 表达学习单项开关 / 同群被热缓存淘汰的消息攒够多少条触发一次后台学习（默认 10）/ 单次回复最多注入 L4 的表达条数（默认 3，两种选取方式共用）                                                                                                                                                                 |
 |                       | expression_self_review                                             | 是否对学到的表达条目做 AI 自审、过滤低质量与不当内容（默认开）                                                                                                                                                                                                                                             |
+|                       | expression_selection_mode                                          | 表达条目注入前的选取方式（默认 `weighted_random`，行为与引入语义检索之前完全一致；`vector` 按当前聊天语境做 embedding 语义召回，须配置 `models.embedding`，否则启动即报错）。vector 模式：top_k 与相似度阈值过滤后仍在存活候选内加权随机（保留随机性），全部低于阈值则本次不注入（宁缺毋滥）；运行期 embed 调用失败记 WARNING、本次退回加权随机 |
+|                       | expression_vector_top_k / expression_min_similarity                | vector 模式语义召回的候选数（默认 10）/ 相似度下限（默认 0.30，范围 0~1，低于它视为语境无关）                                                                                                                                                                                                              |
 |                       | jargon_enabled / jargon_max_entries / jargon_max_inject            | 黑话学习单项开关 / 每群黑话条目上限（默认 50，超限淘汰最久未命中的）/ 单次回复最多注入 L4 的命中黑话条数（默认 5）                                                                                                                                                                                         |
 |                       | pending_buffer_factor / impression_text_budget                     | 被淘汰消息缓冲容量 = 批大小 × 该系数（默认 3，溢出丢最旧）/ 每日印象总结送入的聊天文本字符预算（默认 6000）                                                                                                       |
 |                       | jargon_candidates_per_batch / jargon_meaning_max_chars             | 每批黑话学习实际做双路推断的候选数上限（默认 5，每候选至少 3 次 LLM 调用）/ 黑话含义入库长度上限（默认 200 字）                                                                                              |
@@ -103,7 +106,7 @@ uv run main.py                   # 启动
 
 程序监听 `config.json5` 所在目录（而非文件本身，编辑器原子保存会替换 inode、单文件 watch 会静默失效），保存后自动重新解析并替换运行时配置，日志出现「配置文件被修改，正在重载」即成功；配置写坏时完整记录解析错误并沿用旧配置继续运行，修好再保存自动恢复（替换动作在事件循环线程上执行，与消息处理串行）。
 
-- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning`；已缓存的 L2 印象快照当天不刷新，次日按新配置重建）、`stickers`（含识别启发式参数与跟发的图片引用方式 `send_mode` / `http_base_url`——表情包供图路由在事件服务上常驻挂载，切到 `http` 即刻可发外链）、`plugins.enabled` / `plugins.timeout_seconds` / `plugins.include_commands_in_history`、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
+- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置；含 `models.embedding`——embedding 模型变更后表达向量缓存整体作废、由学习入库/下次启动的后台补算按新模型重算）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning` 与表达语义检索三参数 `expression_selection_mode` / `expression_vector_top_k` / `expression_min_similarity`——改成 `vector` 却没配 `models.embedding` 的新配置会在解析阶段报错、自动沿用旧配置；已缓存的 L2 印象快照当天不刷新，次日按新配置重建）、`stickers`（含识别启发式参数与跟发的图片引用方式 `send_mode` / `http_base_url`——表情包供图路由在事件服务上常驻挂载，切到 `http` 即刻可发外链）、`plugins.enabled` / `plugins.timeout_seconds` / `plugins.include_commands_in_history`、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
 - **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret` / `bot.max_event_body_bytes`（aiohttp 监听与签名校验、请求体上限在启动时已绑定）、`bot.data_dir`、`plugins.dir` 与插件文件本身（命令注册表在构建期装载，新增/修改/删除 `plugins/` 下的插件需重启机器人生效）、`snowluma` 的连接类字段（`endpoint` / `api_key` / `timeout_ms` / `allow_private_endpoint`，HTTP 客户端会话在启动时建好）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
 
 ## 行为逻辑
@@ -189,13 +192,14 @@ flowchart TD
 
 ## 记忆与学习机制
 
-三项后台学习能力（配置 `learning` 段，`enabled: false` 整体关闭；LLM 调用统一用 `models.learning` 角色，未配置则继承 `judge`）。所有学习任务都在后台 asyncio 任务中执行，绝不阻塞每群决策队列；失败只记 warning 日志并跳过本次，不重试、不堆积。
+三项后台学习能力（配置 `learning` 段，`enabled: false` 整体关闭；LLM 调用统一用 `models.learning` 角色，未配置则继承 `judge`；表达选取的 vector 模式另用 `models.embedding` 角色做文本向量化，见下）。所有学习任务都在后台 asyncio 任务中执行，绝不阻塞每群决策队列；失败只记 warning 日志并跳过本次，不重试、不堆积。
 
 - **每日群印象（中期记忆）**：每天零点定时从 `candy.db` 取刚过去那一天该群的全部消息，总结成不超过 `impression_max_chars`（默认 300）字的「今日群聊印象」——聊了什么话题、发生过什么事件、bot 参与了什么、和谁发生过什么互动——存入 `group_impression` 表；最近 `impression_days`（默认 3）天的印象注入提示词 **L2 状态层**。注入按 (群, 日期) 做快照缓存：天内任意次重建字节级相同、跨过零点才刷新，不破坏前缀缓存；旧印象过期自动清理。启动时会先补一次漏做的「昨日印象」（覆盖跨零点停机的情况）。每日任务是零点后逐群串行生成的：若当天消息赶在昨日印象就位之前进来，当天暂不固化 L2 快照、每次重查直到就位（代价是前缀当天多刷新一次），避免整日缺失昨日印象。
-- **表达学习（越聊越像群友）**：每群热缓存（deque）装满后每次新消息会静默挤出最旧一条；被挤出的消息按群收集，攒够 `expression_batch_size`（默认 10）条就在后台学习一次：提取「当"情境"时，可以用"风格"」格式的说话规律（情境与风格各 ≤20 字），明确排除 bot 自己的发言（不学自己）；`expression_self_review` 开启时再经一轮 AI 自审过滤低质量/不当条目，存入 `expressions` 表（同群按内容去重，重复学到只累计权重）。每次回复前从该群候选**加权随机**抽 ≤`expression_max_inject`（默认 3）条注入 **L4 指令层**（「【表达习惯参考，请视情况自然使用】当…时，可以用…」，并注明不用完全遵守），被选中的条目刷新最近使用时间。
+- **表达学习（越聊越像群友）**：每群热缓存（deque）装满后每次新消息会静默挤出最旧一条；被挤出的消息按群收集，攒够 `expression_batch_size`（默认 10）条就在后台学习一次：提取「当"情境"时，可以用"风格"」格式的说话规律（情境与风格各 ≤20 字），明确排除 bot 自己的发言（不学自己）；`expression_self_review` 开启时再经一轮 AI 自审过滤低质量/不当条目，存入 `expressions` 表（同群按内容去重，重复学到只累计权重）。每次回复前从该群候选中抽 ≤`expression_max_inject`（默认 3）条注入 **L4 指令层**（「【表达习惯参考，请视情况自然使用】当…时，可以用…」，并注明不用完全遵守），被选中的条目刷新最近使用时间。
+- **表达选取方式**（`expression_selection_mode`）：`weighted_random`（默认）按权重（学习次数）随机抽取，与引入语义检索之前完全一致；`vector` 用 embedding 按当前聊天语境做语义召回——把该群最近若干条消息 + 触发消息（截 ≤600 字符尾部）向量化为查询，与该群全部表达向量算余弦相似度，取 `expression_vector_top_k`（默认 10）、过滤掉相似度低于 `expression_min_similarity`（默认 0.30）的条目，**在存活候选内仍按现有加权随机抽取**（保留随机性，防每次都同一批）；一个候选都不过阈值就返回空、不注入——这本身就是人类行为（想不起贴切的说法就不硬用）。L4 注入文案与格式两种模式完全相同。配套基建：表达向量存独立新表 `expression_embedding`（float32 小端字节 + 维数 + 产生它的模型名，不 ALTER 旧表）；计算全部在后台——学习入库成功后立即分批补算（每批一次 embed 调用），启动时懒补存量缺向量/模型变更的条目（不阻塞启动，embedding 未配置时静默跳过），运行期另维护每群 `{expression_id: 向量}` 内存缓存与按 (群, 触发消息 id) 缓存的查询向量（同一条消息的多次生成不重复请求）。配置 `models.embedding` 才可用；启动时 vector 模式缺该角色直接报错，运行期 embed 调用失败则记 WARNING、本次退回加权随机（不卡决策队列）。DEBUG 日志可见「表达向量召回 top_N（相似度）」与「表达 L4 注入（含相似度）」行。
 - **黑话学习**：与表达学习同批触发。先提取「脱离语境看不懂」的候选词（网络梗、缩写、圈内黑话），对每个候选做**两次含义推断**——一次带上下文、一次只看词条本身——只有两次结果一致才认为「真的理解」并入库（防止把幻觉含义写进词典），存入 `jargons` 表（同群去重，超过 `jargon_max_entries` 上限时淘汰最久未命中的）。回复前对当前上下文做机械匹配（中文按包含、西文按词边界且大小写不敏感），命中的注入 **L4**：「【黑话参考】词条：含义」，最多 `jargon_max_inject` 条，并刷新命中时间。
 
-数据都在 `candy.db`（`group_impression` / `expressions` / `jargons` 三表）。DEBUG 日志可见学习任务触发与产出、每次回复 L4 注入了哪些表达/黑话。连续跑几天后应能观察到：L2 稳定携带群印象，回复开始出现从群友身上学到的表达。
+数据都在 `candy.db`（`group_impression` / `expressions` / `jargons` 三表，vector 模式下表达条目的语义向量另存 `expression_embedding` 新表）。DEBUG 日志可见学习任务触发与产出、每次回复 L4 注入了哪些表达/黑话（vector 模式还带相似度分数）。连续跑几天后应能观察到：L2 稳定携带群印象，回复开始出现从群友身上学到的表达。
 
 ## 表情包（最小版）
 
@@ -242,7 +246,7 @@ async def hello(ctx):
 1. system·静态层：persona + 守则，字节级不变；
 2. system·状态层：群号、当天日期、成员昵称表、最近 N 天群聊印象（天内稳定，快照缓存保证字节级一致）；
 3. 历史层：只追加、从头整块淘汰，绝不重排；
-4. user·指令层：秒级时间、触发类型等易变信息（含 L4 注入的表达/黑话参考、重复回复提醒、临时随机风格与 AI 味拦截重写要求）全部压到最后一层。
+4. user·指令层：秒级时间、触发类型等易变信息（含 L4 注入的表达/黑话参考、重复回复提醒、临时随机风格与 AI 味拦截重写要求）全部压到最后一层。表达条目无论走加权随机还是 vector 语义召回，注入文案与格式完全相同、都只进这一层，检索结果绝不触碰 L1/L2 前缀。
 
 相邻两次调用中 L1-L3 构成完全相同的前缀，API 侧前缀缓存命中率最大化。
 
@@ -270,7 +274,7 @@ async def hello(ctx):
 
 9. **每日群印象**：跨过零点后（或启动补做昨日）DEBUG 日志出现「群 %d <日期> 群印象已生成」；此后该群每次 judge/reply 请求的 L2 段带「【最近群聊印象】」，同一自然日内多次请求逐字节相同。
 
-10. **表达与黑话学习**：群活跃到热缓存开始挤出旧消息（同群累计淘汰 ≥ `expression_batch_size` 条）后，DEBUG 出现「后台触发表达/黑话学习」与入库日志（`expressions` / `jargons` 表可见条目）；之后的回复请求 L4 出现「【表达习惯参考…】当…时，可以用…」与「【黑话参考】词条：含义」注入（DEBUG 行「群 %d L4 注入」列出所选条目）。
+10. **表达与黑话学习**：群活跃到热缓存开始挤出旧消息（同群累计淘汰 ≥ `expression_batch_size` 条）后，DEBUG 出现「后台触发表达/黑话学习」与入库日志（`expressions` / `jargons` 表可见条目）；之后的回复请求 L4 出现「【表达习惯参考…】当…时，可以用…」与「【黑话参考】词条：含义」注入（DEBUG 行「群 %d L4 注入」列出所选条目）。表达选取升级为语义检索后的验证见第 18 项。
 
 11. **发送前新鲜度检查**：让 bot 正在生成一条较长回复（可先调大 reply 模型延迟或用慢端点），生成期间用另一个号 @它插一句话 → INFO 日志出现「生成期间来了 N 条明确指向自己的新消息…并入最新上下文重生成一次」，最终发出的回复体现插话内容（且不会因此卡住或反复重写）。只发普通新话题 → 无该行、不重生成。`generation.freshness_check_enabled: false` 时同样无该行。
 
@@ -285,6 +289,8 @@ async def hello(ctx):
 16. **表情包**：在群里连发几张表情包图片 → INFO 日志出现「群 %d 收藏表情包」，`data/stickers/<群号>/` 下出现文件、`candy.db` 的 `sticker` 表有记录与统计；direct 模式 DEBUG 里 `submit_assessment` 多带 `"sticker": true`。把 `stickers.send_probability` 调到 1 → 之后每次文字回复都跟发一张图，DEBUG prompt 的历史里出现自己发的「[表情包]」占位（无路径/base64）、`use_count` 递增；连发超 `max_count` 张不同的图 → 出现「已替换最久未使用」且最久那张的文件消失。**跨机发送**：默认 `send_mode=base64`（图片字节内嵌在 `send_group_msg` 请求里、不写日志也不进历史），SnowLuma 与 bot 不同机也能在群里收到图；改 `send_mode=http` 并配 `http_base_url` 后 image 段变成 `…/stickers/<群号>/<指纹>.png` 外链（浏览器直接打开该 URL 可验，换个大写/缺字的文件名返回 404，启动日志有「表情包供图路由已挂载」）；改 `send_mode=file` 回到旧行为（`file://` 绝对路径，端点读不到本机磁盘时发送失败只记错误日志、文字回复不受影响）。
 
 17. **命令插件**：启动日志出现「命令插件已启用，注册命令：/echo、/help、/roll…」；群里发 `/echo 你好 "带空格 的词"` → 原样收到 `你好 带空格 的词`（不走大模型：judge 无该条请求日志、DEBUG 无生成请求）；`/echo --upper hello 世界` → `HELLO 世界`；`/roll 3 --sides 20` 收 3 个 1-20 的点数；`/help` 列出命令、`/help roll` 出用法行；`/echo` 裸发 → 回「参数有误…用法…」；`/不存在的命令` → 照常走大模型。把 `plugins.enabled` 改 false 保存 → `/echo hi` 也走大模型（改完即时生效）；往 `plugins/` 丢一个新 .py 注册命令 → 重启后可用。
+
+18. **表达语义检索（vector 模式）**：配 `models.embedding`（任意 OpenAI 兼容 `/embeddings` 端点）并把 `learning.expression_selection_mode` 设为 `"vector"` 后重启（没配该角色会启动即报「配置有误」、退出码 2，不做静默降级）。该群攒下表达条目后：发一条与某条目情境强相关的消息 → DEBUG 出现「群 %d 表达向量召回 top_N（阈值 0.30）：情境→风格=相似度…」与「群 %d 表达 L4 注入（向量召回，含相似度）：…=相似度」两行，注入的【表达习惯参考】条目与当前话题明显相关（权重高但语境无关的条目不再被随机抽中）；发一条与所有条目无关的话题 → L4 不出现【表达习惯参考】块（全部低于阈值、宁缺毋滥）。同一条触发消息的新鲜度重生成/观望重评不会重复请求 embedding（查询向量按 (群, 消息 id) 缓存）。关掉 embedding 服务再跑一轮：只出现 WARNING「表达向量检索：embedding 调用失败，本次退回加权随机」，回复照常、决策队列不卡。
 
 ## 开发
 
@@ -308,4 +314,4 @@ uv run pytest -k names  # 单测命名过滤
 
 配置错误（非法级别名）会在启动时直接报错，便于及时发现。
 
-模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `migrations.py`(独立数据库迁移：补列+存量 is_command 回填；仅手动 `python -m candybot.migrations` 执行，启动只做兼容检查) · `events_server.py`(aiohttp 接收) · `snowluma.py`(HTTP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类 prompt) · `ai.py`(LLM 四角色：judge/reply/vision/learning) · `learning.py`(后台学习：每日群印象/表达/黑话) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包最小版：识别启发式+收集/上限替换/跟发，图片引用方式 base64/http/file) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。
+模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `migrations.py`(独立数据库迁移：补列+存量 is_command 回填；仅手动 `python -m candybot.migrations` 执行，启动只做兼容检查) · `events_server.py`(aiohttp 接收) · `snowluma.py`(HTTP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类 prompt) · `ai.py`(LLM 角色：judge/reply/vision/learning + 可选 embedding 向量化) · `learning.py`(后台学习：每日群印象/表达/黑话；表达选取支持加权随机与 embedding 语义检索两种模式) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包最小版：识别启发式+收集/上限替换/跟发，图片引用方式 base64/http/file) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。

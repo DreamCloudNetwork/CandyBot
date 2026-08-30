@@ -1,6 +1,6 @@
 """SQLite 持久层：SQLModel 表定义与异步数据操作（data 目录下的 candy.db）。
 
-八个表：
+九个表：
 - chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留；
                    is_command 标记命令插件产生的消息（补列与存量回填见
                    migrations.py 的启动迁移）。
@@ -12,6 +12,10 @@
                    最近 N 天注入提示词 L2，更旧的按保留期清理。
 - expressions      表达学习成果：「当 situation 时，可以用 style」规律，
                    同群按内容去重，count 作加权随机抽取的权重。
+- expression_embedding 表达条目的语义向量（表达选择的 vector 检索模式）：
+                   独立新表（不 ALTER expressions），expression_id 唯一外键；
+                   vector 为 float32 小端字节，model 记录产生它的 embedding
+                   模型名（模型变更即视为向量过期，由后台补算重算）。
 - jargons          黑话词条：term + meaning，同群去重，超出条目上限时
                    淘汰最久未命中的条目。
 - sticker          表情包收藏（最小版）：同群按 (群, 内容指纹) 去重，
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +60,16 @@ logger = logging.getLogger(__name__)
 def image_fingerprint(data_url: str) -> str:
     """图片内容指纹：对整条 data URL 取 SHA-256，作 image_blob 主键去重。"""
     return hashlib.sha256(data_url.encode("utf-8")).hexdigest()
+
+
+def pack_vector(values: Sequence[float]) -> bytes:
+    """浮点向量 → float32 小端字节（expression_embedding.vector 列的存储格式）。"""
+    return struct.pack(f"<{len(values)}f", *values)
+
+
+def unpack_vector(blob: bytes, dim: int) -> list[float]:
+    """pack_vector 的逆运算；列里 dim 即写入时的向量长度。"""
+    return list(struct.unpack(f"<{dim}f", bytes(blob)))
 
 
 class ChatHistoryRow(SQLModel, table=True):
@@ -143,6 +158,29 @@ class ExpressionRow(SQLModel, table=True):
     count: int = Field(default=1, nullable=False)
     created_ts: float = Field(default=0.0, nullable=False)
     last_active_time: float = Field(default=0.0, nullable=False)
+
+
+class ExpressionEmbeddingRow(SQLModel, table=True):
+    """expression_embedding：表达条目的语义向量（vector 检索式表达选择）。
+
+    独立新表（create_all 自动建、不改 expressions——见 CandyDatabase.create_tables
+    的注释）；expression_id 唯一并外键指向 expressions.id。vector 为 float32
+    小端打包字节（pack_vector），dim 记录维数，model 为产生它的 embedding
+    模型名：模型配置变更后旧向量即过期，learning.py 的补算按 model 匹配查缺
+    重算。表达条目按内容去重、永不改写文本，因此 (situation, style) 不变时
+    向量无需重算（同 id 的 upsert 只可能发生在换模型重算时）。
+    """
+
+    __tablename__ = "expression_embedding"
+
+    id: int | None = Field(default=None, primary_key=True)
+    expression_id: int = Field(
+        foreign_key="expressions.id", nullable=False, unique=True
+    )
+    vector: bytes = Field(nullable=False)
+    dim: int = Field(default=0, nullable=False)
+    model: str = Field(default="", nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
 
 
 class JargonRow(SQLModel, table=True):
@@ -641,6 +679,95 @@ class CandyDatabase:
                     row.last_active_time = ts
                     session.add(row)
             await session.commit()
+
+    # ------------------------------------------------------------ 表达向量（vector 检索）
+
+    async def upsert_expression_embeddings(
+        self, entries: Sequence[tuple[int, bytes, int, str]], ts: float | None = None
+    ) -> None:
+        """批量写入/覆盖表达向量。entries 为
+        (expression_id, pack_vector 字节, 维数, embedding 模型名)。"""
+        if not entries:
+            return
+        stamp = time.time() if ts is None else ts
+        ids = [expression_id for expression_id, _v, _d, _m in entries]
+        async with self._sessions() as session:
+            existing = {
+                row.expression_id: row
+                for row in (
+                    await session.exec(
+                        select(ExpressionEmbeddingRow).where(
+                            col(ExpressionEmbeddingRow.expression_id).in_(ids)
+                        )
+                    )
+                ).all()
+            }
+            for expression_id, vector, dim, model in entries:
+                row = existing.get(expression_id)
+                if row is None:
+                    row = ExpressionEmbeddingRow(expression_id=expression_id)
+                row.vector = vector
+                row.dim = dim
+                row.model = model
+                row.created_ts = stamp
+                session.add(row)
+            await session.commit()
+
+    async def list_expressions_missing_embedding(
+        self, model: str, group_id: int | None = None
+    ) -> list[tuple[int, int, str, str]]:
+        """缺向量、或向量由旧模型产生（model 不一致）的表达条目，返回
+        (expression_id, group_id, situation, style) 列表供补算；group_id
+        为 None 时跨全部群（启动懒补）。"""
+        stmt = (
+            select(
+                ExpressionRow.id,
+                ExpressionRow.group_id,
+                ExpressionRow.situation,
+                ExpressionRow.style,
+            )
+            .outerjoin(
+                ExpressionEmbeddingRow,
+                ExpressionEmbeddingRow.expression_id == ExpressionRow.id,
+            )
+            .where(
+                col(ExpressionEmbeddingRow.id).is_(None)
+                | (ExpressionEmbeddingRow.model != model)
+            )
+        )
+        if group_id is not None:
+            stmt = stmt.where(ExpressionRow.group_id == group_id)
+        async with self._sessions() as session:
+            return [
+                (row_id, gid, situation, style)
+                for row_id, gid, situation, style in (await session.exec(stmt)).all()
+                if row_id is not None
+            ]
+
+    async def load_expression_vectors(
+        self, group_id: int, model: str
+    ) -> dict[int, list[float]]:
+        """某群与当前模型一致的全部表达向量：{expression_id: 向量}。"""
+        stmt = (
+            select(
+                ExpressionEmbeddingRow.expression_id,
+                ExpressionEmbeddingRow.vector,
+                ExpressionEmbeddingRow.dim,
+            )
+            .join(
+                ExpressionRow,
+                ExpressionRow.id == ExpressionEmbeddingRow.expression_id,
+            )
+            .where(
+                ExpressionRow.group_id == group_id,
+                ExpressionEmbeddingRow.model == model,
+            )
+        )
+        async with self._sessions() as session:
+            return {
+                expression_id: unpack_vector(blob, dim)
+                for expression_id, blob, dim in (await session.exec(stmt)).all()
+            }
 
     async def load_jargons(self, group_id: int) -> list[JargonEntry]:
         async with self._sessions() as session:

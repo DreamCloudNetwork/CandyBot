@@ -253,6 +253,11 @@ class ModelSettings:
     # learning 为可选的第四角色：群印象总结、表达/黑话学习等后台学习任务
     # 用它；未配置时继承 judge（便宜快速）的配置（见 AIClient）。
     learning: ModelConfig | None = None
+    # embedding 为可选的第五角色：表达选择的向量检索模式用它把聊天语境与
+    # 表达条目向量化（AIClient.embed，OpenAI 兼容 /embeddings）。不配置即
+    # 为 null；learning.expression_selection_mode="vector" 而未配置时启动
+    # 即报错（见 load_settings 的交叉校验），不做静默降级。
+    embedding: ModelConfig | None = None
 
 
 # 临时随机回复风格的内置默认示例（generation.multiple_reply_style）：
@@ -357,6 +362,14 @@ class RateLimitSettings:
     global_daily_limit: int | None
 
 
+# 表达条目单次回复的选取方式（learning.expression_selection_mode）：
+# weighted_random 为引入语义检索之前的现状（默认）；vector 按当前聊天语境
+# 做 embedding 语义召回（需配置 models.embedding，load_settings 启动即校验）。
+EXPRESSION_SELECTION_MODES = ("weighted_random", "vector")
+EXPRESSION_SELECTION_WEIGHTED_RANDOM = "weighted_random"
+EXPRESSION_SELECTION_VECTOR = "vector"
+
+
 @dataclass(frozen=True)
 class LearningSettings:
     """记忆与学习机制（每日群印象、表达学习、黑话学习）的配置。
@@ -368,8 +381,13 @@ class LearningSettings:
     impression_days：注入 L2 的最近印象天数（天内字节级稳定）；
     impression_max_chars：单日印象的字数上限（提示词与入库裁剪同用它）；
     expression_batch_size：同群被热缓存淘汰的消息攒够这么多条触发一次学习；
-    expression_max_inject：单次回复最多注入的表达条数（L4，加权随机）；
+    expression_max_inject：单次回复最多注入的表达条数（L4，两种选取模式共用）；
     expression_self_review：是否让 AI 自审过滤低质量表达条目；
+    expression_selection_mode：表达选取方式（weighted_random 现状默认 /
+    vector 按当前语境做 embedding 语义召回，需配置 models.embedding）；
+    expression_vector_top_k：vector 模式语义召回的候选数；
+    expression_min_similarity：vector 模式的相似度下限，低于它视为语境无关
+    （一个都不过则本次不注入——宁缺毋滥）；
     jargon_max_entries：每群黑话条目上限，超限淘汰最久未命中的；
     jargon_max_inject：单次回复最多注入的命中黑话条数（L4，机械匹配）。
     """
@@ -382,6 +400,10 @@ class LearningSettings:
     expression_batch_size: int = 10
     expression_max_inject: int = 3
     expression_self_review: bool = True
+    # ---- 表达选取方式（weighted_random = 引入语义检索前的现状，默认）----
+    expression_selection_mode: str = "weighted_random"
+    expression_vector_top_k: int = 10
+    expression_min_similarity: float = 0.30
     jargon_enabled: bool = True
     jargon_max_entries: int = 50
     jargon_max_inject: int = 5
@@ -742,6 +764,13 @@ def load_settings(cfg: Any) -> Settings:
             if models_cfg.get("learning") is not None
             else None
         ),
+        embedding=(
+            _parse_model_config(
+                models_cfg["embedding"], "models.embedding", ai_settings
+            )
+            if models_cfg.get("embedding") is not None
+            else None
+        ),
     )
 
     gen_cfg = _require_section(cfg, "generation")
@@ -1041,6 +1070,37 @@ def load_settings(cfg: Any) -> Settings:
             )
         return value
 
+    expression_selection_mode = (
+        _parse_str(
+            learn_cfg, "expression_selection_mode", EXPRESSION_SELECTION_WEIGHTED_RANDOM
+        )
+        .strip()
+        .lower()
+    )
+    if expression_selection_mode not in EXPRESSION_SELECTION_MODES:
+        raise ValueError(
+            f"配置项 `learning.expression_selection_mode` 应为 "
+            f"{' / '.join(EXPRESSION_SELECTION_MODES)} 之一，"
+            f"实际是 {expression_selection_mode!r}"
+        )
+    expression_min_similarity = _parse_float(learn_cfg, "expression_min_similarity", 0.30)
+    if not 0 <= expression_min_similarity <= 1:
+        raise ValueError(
+            f"配置项 `learning.expression_min_similarity` 应在 0~1 之间，"
+            f"实际是 {expression_min_similarity!r}"
+        )
+    # 交叉校验：语义检索必须有 embedding 模型可用。配置错误启动即报、
+    # 不做静默降级（运行期 embed 调用失败另有 learning.py 的容错路径）。
+    if (
+        expression_selection_mode == EXPRESSION_SELECTION_VECTOR
+        and model_settings.embedding is None
+    ):
+        raise ValueError(
+            'learning.expression_selection_mode 设为 "vector"（表达按当前聊天语境'
+            "做语义检索）时，必须配置 models.embedding（embedding 模型角色，写法与 "
+            'judge/reply 一致）：请补上该角色，或把模式改回 "weighted_random"'
+        )
+
     learning_settings = LearningSettings(
         enabled=_parse_bool(learn_cfg.get("enabled", True), "learning.enabled"),
         impression_enabled=_parse_bool(
@@ -1057,6 +1117,9 @@ def load_settings(cfg: Any) -> Settings:
             learn_cfg.get("expression_self_review", True),
             "learning.expression_self_review",
         ),
+        expression_selection_mode=expression_selection_mode,
+        expression_vector_top_k=_parse_positive_int("expression_vector_top_k", 10),
+        expression_min_similarity=expression_min_similarity,
         jargon_enabled=_parse_bool(
             learn_cfg.get("jargon_enabled", True), "learning.jargon_enabled"
         ),

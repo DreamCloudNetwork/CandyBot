@@ -1,10 +1,13 @@
 """OpenAI 兼容 API 的调用角色：judge（打分）、reply（回复）、vision（转述）、
-learning（群印象/表达/黑话等后台学习任务，未配置时继承 judge 的模型）。
+learning（群印象/表达/黑话等后台学习任务，未配置时继承 judge 的模型）、
+embedding（表达语义检索的文本向量化，可选角色，只走 /embeddings 接口）。
 
 每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
 上下文窗口与输出上限（见 models.ModelConfig）。learning 角色一律走一次性
 纯文本调用（按提示词契约输出 JSON、从正文解析），不携带 tools、也不参与
-judge/reply 的分层前缀缓存。
+judge/reply 的分层前缀缓存。embedding 角色只在配置了 models.embedding 时
+可用（AIClient.embed）；未配置即抛错，调用方（learning.py）按失败记
+WARNING 并降级，绝不静默掩盖。
 
 判定、回复与图片入库评估默认通过强制工具调用（tool_choice 指定函数）获得
 结构化结果；models.<role>.forced_tool_choice=false 的角色改用 tool_choice=
@@ -356,6 +359,8 @@ class AIClient:
         self._vision = models.vision
         # learning 角色未配置时继承 judge（便宜快速）：学习任务与判定共用模型
         self._learning = models.learning or models.judge
+        # embedding 为可选角色（不继承任何模型）：只用于表达语义检索的向量化
+        self._embedding = models.embedding
         self._generation = generation
         # 只有 direct 模式才允许任何图片（历史层或当前消息）进入请求
         self._multimodal_mode = multimodal_mode
@@ -447,6 +452,31 @@ class AIClient:
             return self._generation.max_context_chars
         reserved = (cfg.max_output_tokens or 0) + prompt_chars + _CONTEXT_OVERHEAD_TOKENS
         return max(0, min(self._generation.max_context_chars, cfg.context_window - reserved))
+
+    # ---------------------------------------------------------------- embedding
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """embedding 角色（OpenAI 兼容 /embeddings）批量向量化。
+
+        返回与入参顺序对齐的向量列表：兼容端点未必按请求顺序返回 data，
+        统一按其 index 排序。未配置 models.embedding、端点报错或返回条数
+        与请求不符都如实上抛——启动配置校验保证 vector 模式有该角色，
+        运行期失败由调用方（learning.py）记 WARNING 并降级处理。
+        """
+        if self._embedding is None:
+            raise RuntimeError("models.embedding 未配置，无法计算文本向量")
+        response = await self._client_for(self._embedding).embeddings.create(
+            model=self._embedding.model,
+            input=list(texts),
+            timeout=self._generation.timeout_seconds,
+        )
+        items = sorted(response.data, key=lambda d: getattr(d, "index", 0) or 0)
+        vectors = [list(item.embedding) for item in items]
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"embedding 返回 {len(vectors)} 条向量，与本次请求的 {len(texts)} 条文本不符"
+            )
+        return vectors
 
     # ---------------------------------------------------------------- judge
 

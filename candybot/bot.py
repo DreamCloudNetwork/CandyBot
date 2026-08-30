@@ -427,6 +427,10 @@ class CandyBot:
 
         learning 段与 models.learning 随快照/AI 客户端重建即时生效；已缓存
         的 L2 印象快照当天不刷新（天内字节级不变），次日自然按新配置重建。
+        models.embedding 与表达选取方式（learning.expression_selection_mode
+        等）同样即时生效：embedding 模型变更后旧的表达向量缓存整体作废，
+        由学习入库/下一次启动的后台补算按新模型重算（见 learning.py）；
+        改成 vector 却没配 embedding 的新配置会在解析阶段就报错、被沿用旧配置。
         """
         if self._settings_loader is None:
             logger.warning("未携带 settings_loader 的 CandyBot 实例，配置热重载不可用")
@@ -773,13 +777,21 @@ class CandyBot:
             return False
 
     async def _learning_hints(
-        self, group_id: int, recent: list[ChatRecord]
+        self,
+        group_id: int,
+        recent: list[ChatRecord],
+        *,
+        trigger: ChatRecord | None = None,
     ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         """回复前的 L4 注入准备：抽表达 + 匹配黑话（都只进指令层）。
 
         由 _decide_and_reply 每轮调用一次，结果喂给该轮全部 _compose_reply
         生成（含新鲜度重生成）：抽中会刷新表达条目的最近使用时间，同一轮
         内重复调用等于重复采样，必须避免。
+
+        recent/trigger 只在表达 vector 检索模式下参与语境构造（weighted_random
+        模式忽略，行为与引入前一致）：trigger 为触发本轮决策的消息，其 id
+        同时是查询向量缓存的键；黑话匹配沿用 recent 的纯文本拼接。
 
         辅助能力：任何失败只记日志、退化为不注入，绝不阻断回复本身。
         """
@@ -791,7 +803,7 @@ class CandyBot:
         try:
             if ls.expression_enabled:
                 expression_hints = await self._learning.pick_expressions(
-                    group_id, ls.expression_max_inject
+                    group_id, ls.expression_max_inject, recent, trigger=trigger
                 )
             if ls.jargon_enabled:
                 context = "\n".join(
@@ -846,6 +858,7 @@ class CandyBot:
                 profile.context_size,
                 include_commands=self._settings.plugins.include_commands_in_history,
             ),
+            trigger=msg.record,  # 表达 vector 检索的语境与缓存键（加权随机模式忽略）
         )
         # 一轮连发最多几次「被打断后重想」（generation.max_reconsider_per_burst）：
         # 每次重想是一回额外的 reply 模型调用，预算用尽后剩下的腹稿按原计划
