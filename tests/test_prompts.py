@@ -58,6 +58,18 @@ def test_runtime_commands_note_toggle():
     assert "【命令功能】" in on
     # 除注入的一段外，L2 其余行逐行不变
     assert [ln for ln in on.splitlines() if not ln.startswith("【命令功能】")] == off.splitlines()
+    # include_commands_in_history=true（缺省）时须知与引入该配置前字节级一致
+    assert on == runtime_system_prompt(
+        42, "2026-08-27", ["甲"], commands_enabled=True, commands_in_history=True
+    )
+    # 排除模式下须知换为「不会出现在聊天记录里」的措辞，其余行仍逐行不变
+    excluded = runtime_system_prompt(
+        42, "2026-08-27", ["甲"], commands_enabled=True, commands_in_history=False
+    )
+    assert "【命令功能】" in excluded
+    assert "都不会出现在你的聊天记录里" in excluded
+    assert excluded != on
+    assert [ln for ln in excluded.splitlines() if not ln.startswith("【命令功能】")] == off.splitlines()
 
 
 def test_history_only_append_truncates_from_head():

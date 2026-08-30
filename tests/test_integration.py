@@ -116,6 +116,8 @@ class FakeAI:
             "static_system": static_system,
             "runtime_system": runtime_system,
             "recent_len": len(recent),
+            # 模型实际收到的历史（含末条当前消息），供历史过滤类断言
+            "recent_texts": [r.text for r in recent],
             "current": f"{current_message.nickname}：{current_message.text}",
             "forced": forced,
             "engaged": engaged,

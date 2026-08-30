@@ -196,6 +196,12 @@
         "enabled": true,                  // 总开关（关掉后 / 消息完全走大模型，热重载即时生效）
         "dir": "plugins",                 // 插件目录（相对工作目录，逐个导入其中的 .py）
         "timeout_seconds": 30,            // 异步 handler 执行超时（秒），超时回「执行超时」
+        "include_commands_in_history": true,
+                                          // 插件产生的消息（被判定为命令的用户消息 + 机器人对命令
+                                          // 的回复）是否送入模型的历史上下文；false 时两者仍照常
+                                          // 入库（审计与印象统计可用），只是不出现在 judge/reply 的
+                                          // 历史里、不占 context_size 名额（现读，改完即时生效，
+                                          // 对已入库的历史命令消息同样生效）
     },
 
     "snowluma": {

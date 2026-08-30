@@ -728,6 +728,7 @@ def test_plugins_defaults_when_section_absent():
     assert s.plugins.enabled is True
     assert s.plugins.dir == "plugins"
     assert s.plugins.timeout_seconds == 30.0
+    assert s.plugins.include_commands_in_history is True
 
 
 def test_plugins_custom_values():
@@ -736,12 +737,14 @@ def test_plugins_custom_values():
             "enabled": False,
             "dir": "my_plugins",
             "timeout_seconds": 5,
+            "include_commands_in_history": False,
         }
     )
     s = load_settings(DictCfg(cfg))
     assert s.plugins.enabled is False
     assert s.plugins.dir == "my_plugins"
     assert s.plugins.timeout_seconds == 5.0
+    assert s.plugins.include_commands_in_history is False
 
 
 def test_plugins_validation_errors():
@@ -751,6 +754,10 @@ def test_plugins_validation_errors():
         ({"plugins": {"dir": "   "}}, "plugins.dir"),
         ({"plugins": {"timeout_seconds": 0.5}}, "plugins.timeout_seconds"),
         ({"plugins": {"timeout_seconds": "fast"}}, "timeout_seconds"),
+        (
+            {"plugins": {"include_commands_in_history": "yes"}},
+            "plugins.include_commands_in_history",
+        ),
     ]
     for over, frag in cases:
         with pytest.raises(ValueError, match=frag):

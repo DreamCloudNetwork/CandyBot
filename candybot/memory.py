@@ -111,6 +111,23 @@ class GroupMemory:
             return []
         return list(self._records)[-n:]
 
+    def model_tail(
+        self, n: int, *, include_commands: bool = True
+    ) -> list[ChatRecord]:
+        """送入模型历史层的最近 n 条快照（时间正序）。
+
+        include_commands=False（plugins.include_commands_in_history 关）时
+        跳过命令插件产生的消息（ChatRecord.is_command：用户的命令消息与
+        机器人的命令回复）——它们照常入库，供审计与印象统计，只是不进
+        模型上下文。过滤先于截取：排除的命令不占用 context_size 名额。
+        """
+        if n <= 0:
+            return []
+        records = list(self._records)
+        if not include_commands:
+            records = [r for r in records if not r.is_command]
+        return records[-n:]
+
     def tail_excluding_last(self, n: int) -> list[ChatRecord]:
         """返回除最后一条外的最近 n 条；用于构造提示词历史（当前消息单独走指令层）。"""
         if len(self._records) <= 1 or n <= 0:

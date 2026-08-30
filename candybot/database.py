@@ -1,7 +1,9 @@
 """SQLite 持久层：SQLModel 表定义与异步数据操作（data 目录下的 candy.db）。
 
-七个表：
-- chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留。
+八个表：
+- chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留；
+                   is_command 标记命令插件产生的消息（补列与存量回填见
+                   migrations.py 的启动迁移）。
 - chat_image       消息内每个图片槽位（展示状态、总结、指向原图的指纹）；
                    随消息永久保留，回收图片时只摘除数据引用、降级展示状态。
 - image_blob       以内容指纹（SHA-256）为主键的原图 base64；同一张图全库
@@ -15,6 +17,8 @@
 - sticker          表情包收藏（最小版）：同群按 (群, 内容指纹) 去重，
                    全局数量超上限时替换最久未使用的条目——本表只删记录，
                    图片文件的写入与删除由 stickers.StickerStore 负责。
+- schema_migration 已执行的迁移名单（见 migrations.py）：每个迁移按名字
+                   只跑一次，启动建表后自动补跑未执行的迁移。
 
 展示状态与总结属于历史语义内容，回收后仍然保留（占位/总结随历史照常
 送入模型），只有 base64 数据消失；恢复后的记录里对应槽位 images 为空串。
@@ -67,6 +71,9 @@ class ChatHistoryRow(SQLModel, table=True):
     text: str = Field(default="", nullable=False)
     ts: float = Field(nullable=False, index=True)
     is_self: bool = Field(default=False, nullable=False)
+    # 命令插件产生的消息（命令消息与命令回复）标记；旧库无此列、存量
+    # 记录的回填标记由 migrations.py 的启动迁移完成
+    is_command: bool = Field(default=False, nullable=False)
 
 
 class ChatImageRow(SQLModel, table=True):
@@ -246,7 +253,22 @@ class CandyDatabase:
             self._engine, class_=SQLModelAsyncSession, expire_on_commit=False
         )
 
+    @property
+    def engine(self):
+        """只读暴露给独立迁移模块（candybot/migrations.py）使用。"""
+        return self._engine
+
+    @property
+    def sessions(self):
+        """同 engine：迁移模块补列与回填标记需要直接操作会话。"""
+        return self._sessions
+
     async def create_tables(self) -> None:
+        """建出全部缺失的表（含 schema_migration，幂等）。
+
+        注意 create_all 只建新表、不会 ALTER 已有表——给旧表补列与存量
+        数据回填由 candybot/migrations.py 在启动建表后统一执行。
+        """
         async with self._engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
 
@@ -310,6 +332,7 @@ class CandyDatabase:
                 text=record.text,
                 ts=record.ts,
                 is_self=record.is_self,
+                is_command=record.is_command,
             )
             session.add(row)
             try:
@@ -898,6 +921,7 @@ class CandyDatabase:
             text=row.text,
             ts=row.ts,
             is_self=row.is_self,
+            is_command=bool(row.is_command),
             images=tuple(images),
             image_states=tuple(states),
             image_summaries=summaries or None,

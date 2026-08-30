@@ -49,6 +49,10 @@ class ChatRecord:
     image_states 缺省视为全部 show。
     槽位语义：images 中的空串表示该图原图已按保留期回收，此时状态必为
     summarized/placeholder（加载层保证不会以 show 出现），总结仍保留。
+    is_command 标记命令插件产生的消息（用户发送的被判定为命令的消息、
+    机器人以自语身份发出的命令回复），照常入库（审计与印象统计可用），
+    plugins.include_commands_in_history=false 时据此把两者过滤出模型的
+    历史上下文。
     """
 
     message_id: int
@@ -58,6 +62,7 @@ class ChatRecord:
     text: str
     ts: float
     is_self: bool = False
+    is_command: bool = False
     images: tuple[str, ...] = field(default=(), repr=False)
     image_states: tuple[str, ...] = field(default=(), repr=False)
     image_summaries: dict[int, str] | None = field(default=None, repr=False)
@@ -471,12 +476,20 @@ class PluginSettings:
       引入命令功能之前完全一致（现取现读，热重载即时生效）；
     dir：插件目录（相对工作目录），启动时逐个导入其中的 .py 文件；
     timeout_seconds：异步 handler 的执行超时，超时按失败回复。
+    include_commands_in_history：插件产生的消息（用户发送的被判定为命令
+      的消息、机器人以自语身份发出的命令回复）是否送入模型的历史上下文。
+      true（默认）与引入该配置前一致；false 时两者照常入库并打上
+      ChatRecord.is_command 标记（审计、每日印象统计仍然可见），只是
+      judge/reply/重想的上下文组装时过滤掉、不再占用 context_size 名额。
+      现取现读，改完对之后的每次模型请求生效；存量记录的标记由
+      migrations.py 的手动迁移按当前注册表回填（见该模块 docstring）。
     注册表在构建期装载：新增/修改插件文件需重启机器人生效。
     """
 
     enabled: bool = True
     dir: str = "plugins"
     timeout_seconds: float = 30.0
+    include_commands_in_history: bool = True
 
 
 @dataclass(frozen=True)
@@ -1088,6 +1101,10 @@ def load_settings(cfg: Any) -> Settings:
         raise ValueError("配置项 `plugins.dir` 不能为空")
     plugin_settings = PluginSettings(
         enabled=_parse_bool(plugin_cfg.get("enabled", True), "plugins.enabled"),
+        include_commands_in_history=_parse_bool(
+            plugin_cfg.get("include_commands_in_history", True),
+            "plugins.include_commands_in_history",
+        ),
         dir=plugin_dir.strip(),
         timeout_seconds=plugin_timeout,
     )

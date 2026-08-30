@@ -40,6 +40,7 @@ from .commandline import CommandUsageError, detect_command_name, parse_invocatio
 from .dedup import MessageDedup
 from .events_server import EventsServer
 from .memory import GroupMemory, MemoryManager
+from .migrations import pending_migrations
 from .models import (
     ChatRecord,
     Decision,
@@ -149,7 +150,11 @@ def _already_replied_to(records: list[ChatRecord], target: ChatRecord) -> bool:
 
 
 def _directed_new_messages(
-    memory: GroupMemory, runtime: GroupRuntime, seen_ids: set[int]
+    memory: GroupMemory,
+    runtime: GroupRuntime,
+    seen_ids: set[int],
+    *,
+    include_commands: bool = True,
 ) -> list[ChatRecord]:
     """找出决策基线之后新入记忆、且明确指向 bot（@我/回复我）的他人消息。
 
@@ -157,6 +162,8 @@ def _directed_new_messages(
     与目标消息比时间戳：决策前已在上下文里的消息模型本来就看得见，不该
     触发重生成。「指向 bot」取自 GroupRuntime 登记的近期 mentioned_me 消息
     id（ChatRecord 不携带该信息，_on_event 在 memory.append 的同时登记）。
+    include_commands=False 时跳过命令插件产生的消息——它们没进模型上下文
+    （见 GroupMemory.model_tail），不该触发新鲜度重生成。
     """
     mentions = set(runtime.recent_mentions)
     if not mentions:
@@ -167,6 +174,7 @@ def _directed_new_messages(
         if not record.is_self
         and record.message_id not in seen_ids
         and record.message_id in mentions
+        and (include_commands or not record.is_command)
     ]
 
 
@@ -332,6 +340,15 @@ class CandyBot:
     async def start(self) -> None:
         await self._memory.start()  # 建表 + 每日图片回收循环
         ps = self._settings.plugins
+        # 迁移不在启动时自动执行（见 migrations.py）：库结构落后（旧库缺
+        # is_command 列，消息入库会直接报错）就拒绝启动，提示手动迁移。
+        gaps = await pending_migrations(self._memory.db)
+        if gaps:
+            raise SystemExit(
+                f"数据库结构落后于当前版本（缺：{'、'.join(gaps)}）。"
+                "请先停止机器人，运行 python -m candybot.migrations 完成迁移，"
+                "再重新启动。"
+            )
         logger.info(
             "命令插件%s，注册命令：%s",
             "已启用" if ps.enabled else "已禁用（/ 消息照常走大模型）",
@@ -495,7 +512,13 @@ class CandyBot:
             logger.debug("群 %d 不在白名单，忽略", group_id)
             return
 
+        invocation = self._detect_command(normalized)
         memory = await self._memory.get(group_id)
+        if invocation is not None:
+            # 插件产生的命令消息照常入库（审计与印象统计可用），只打
+            # is_command 标记：plugins.include_commands_in_history=false 时
+            # 由 model_tail 把它与命令回复一起过滤出模型的历史上下文。
+            normalized.record.is_command = True
         await memory.append(normalized.record)
         if normalized.mentioned_me:
             # 新鲜度检查的记账：ChatRecord 不带 mentioned_me，这里登记
@@ -510,7 +533,6 @@ class CandyBot:
                 )
             except Exception:
                 logger.warning("群 %d 表情包收集失败", group_id, exc_info=True)
-        invocation = self._detect_command(normalized)
         if invocation is not None:
             # 命中注册表的 / 命令：取消大模型自主回复，直接交给插件执行
             # （仍走本群串行队列，与正常回复保持到达顺序）
@@ -617,6 +639,8 @@ class CandyBot:
         原文，不拆条、不打字延迟、不注入错别字。失败（用法错误、超时、
         handler 崩溃）回一句中文提示——机器人对一条 /命令 完全沉默会被
         当成死机；handler 返回 None 或空串才真正不发。
+        plugins.include_commands_in_history=false 时命令消息与这条回复
+        仍照常写回记忆（带 is_command 标记），只是不再送入模型历史上下文。
         """
         spec = invocation.spec
         memory = await self._memory.get(group_id)
@@ -654,7 +678,9 @@ class CandyBot:
             logger.error("群 %d 命令回复发送失败：%s", group_id, exc)
             return
         await memory.append(
-            self._self_record(group_id, _command_memory_text(result))
+            self._self_record(
+                group_id, _command_memory_text(result), is_command=True
+            )
         )
 
     async def _invoke_handler(
@@ -810,7 +836,11 @@ class CandyBot:
         # 新鲜度重生成共享同一组 hints；失败容错在 _learning_hints 内部，
         # 退化为不注入
         expression_hints, jargon_hints = await self._learning_hints(
-            group_id, memory.tail(profile.context_size)
+            group_id,
+            memory.model_tail(
+                profile.context_size,
+                include_commands=self._settings.plugins.include_commands_in_history,
+            ),
         )
         # 一轮连发最多几次「被打断后重想」（generation.max_reconsider_per_burst）：
         # 每次重想是一回额外的 reply 模型调用，预算用尽后剩下的腹稿按原计划
@@ -830,7 +860,10 @@ class CandyBot:
                 logger.debug("群 %d 本轮连发的重想预算用尽，按原计划继续", group_id)
                 return None
             reconsider_left -= 1
-            recent = memory.tail(profile.context_size)
+            recent = memory.model_tail(
+                profile.context_size,
+                include_commands=self._settings.plugins.include_commands_in_history,
+            )
             static_system = runtime.static_system(
                 "reply", profile.persona, via_tool=self._ai.reply_tool_use
             )
@@ -841,6 +874,7 @@ class CandyBot:
                 nicknames,
                 impressions=await self._impressions_for(group_id, runtime),
                 commands_enabled=self._settings.plugins.enabled,
+                commands_in_history=self._settings.plugins.include_commands_in_history,
             )
             draft = await self._generate_with_retry(
                 self._ai.reconsider_reply,
@@ -885,7 +919,12 @@ class CandyBot:
         # 上下文重生成一次（走现有生成与重试路径，每条回复至多一次，
         # 防止循环）；普通新话题不触发——宁可稍旧也不要无限拖延。
         if self._settings.generation.freshness_check_enabled:
-            directed = _directed_new_messages(memory, runtime, seen_ids)
+            directed = _directed_new_messages(
+                memory,
+                runtime,
+                seen_ids,
+                include_commands=self._settings.plugins.include_commands_in_history,
+            )
             if directed:
                 logger.info(
                     "群 %d 生成期间来了 %d 条明确指向自己的新消息（%s），并入最新上下文重生成一次",
@@ -1037,7 +1076,10 @@ class CandyBot:
                 msg.record.message_id,
             )
         for attempt in range(2):
-            recent = memory.tail(profile.context_size)
+            recent = memory.model_tail(
+                profile.context_size,
+                include_commands=self._settings.plugins.include_commands_in_history,
+            )
             # 跟随 reply 角色实时的工具调用状态：降级后 L1 守则换回纯文本措辞
             static_system = runtime.static_system(
                 "reply", profile.persona, via_tool=self._ai.reply_tool_use
@@ -1051,6 +1093,7 @@ class CandyBot:
                 nicknames,
                 impressions=await self._impressions_for(group_id, runtime),
                 commands_enabled=self._settings.plugins.enabled,
+                commands_in_history=self._settings.plugins.include_commands_in_history,
             )
             draft = await self._generate_with_retry(
                 self._ai.generate_reply,
@@ -1135,7 +1178,10 @@ class CandyBot:
         # 每条普通消息都过一遍 judge：除了打分，还要识别「这条消息是否在对
         # 我说」——正和我聊天的场景里，任何时间窗口都不应该把对话掐断。
         memory = await self._memory.get(group_id)
-        recent = memory.tail(profile.context_size)
+        recent = memory.model_tail(
+            profile.context_size,
+            include_commands=self._settings.plugins.include_commands_in_history,
+        )
         static_system = runtime.static_system("judge", profile.persona)
         nicknames = nickname_list_from_history([record_to_turn(r) for r in recent[:-1]])
         runtime_system = runtime_system_prompt(
@@ -1524,8 +1570,12 @@ class CandyBot:
                 delay *= 2
         return None  # pragma: no cover —— 最后一次失败必抛
 
-    def _self_record(self, group_id: int, text: str) -> ChatRecord:
-        """自己发出的一条消息对应的记忆记录（发送成功后逐条写回）。"""
+    def _self_record(
+        self, group_id: int, text: str, *, is_command: bool = False
+    ) -> ChatRecord:
+        """自己发出的一条消息对应的记忆记录（发送成功后逐条写回）。
+
+        is_command=True 仅命令回复使用（见 _run_command）。"""
         return ChatRecord(
             message_id=self._next_self_message_id(),
             group_id=group_id,
@@ -1534,6 +1584,7 @@ class CandyBot:
             text=text,
             ts=time.time(),
             is_self=True,
+            is_command=is_command,
         )
 
     def _next_self_message_id(self) -> int:

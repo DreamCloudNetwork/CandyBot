@@ -394,3 +394,50 @@ async def test_recall_recycled_image_is_noop(tmp_path):
     assert rec.state_of(0) == "placeholder"
     await mgr2.close()
     await mgr.close()
+
+
+# ---------------------------------------------------------------- 命令消息与模型上下文
+
+
+async def test_is_command_persisted_and_replayed(tmp_path):
+    """is_command 标记随记录入库，重启回放后仍在（排除模式可继续过滤）。"""
+    mgr = MemoryManager(tmp_path)
+    mem = await mgr.get(42)
+    await mem.append(make_record(1, "/hi", is_command=True))
+    await mem.append(make_record(2, "你好！", is_self=True, is_command=True))
+    await mem.append(make_record(3, "随便聊聊"))
+    rows = await mgr.db.load_recent(42, 10)
+    assert [(r.text, r.is_command) for r in rows] == [
+        ("/hi", True),
+        ("你好！", True),
+        ("随便聊聊", False),
+    ]
+    found = await mgr.db.find_record(42, 2)
+    assert found is not None and found.is_command and found.is_self
+    await mgr.close()
+
+    mgr2 = MemoryManager(tmp_path)
+    mem2 = await mgr2.get(42)
+    assert [r.is_command for r in mem2.tail(5)] == [True, True, False]
+    await mgr2.close()
+
+
+async def test_model_tail_filters_commands(mgr):
+    """model_tail：include_commands=False 时命令消息与回复不进模型历史层。"""
+    mem = await mgr.get(42)
+    await mem.append(make_record(1, "/hi", is_command=True))
+    await mem.append(make_record(2, "你好！", is_self=True, is_command=True))
+    await mem.append(make_record(3, "你们在聊啥"))
+    assert [r.text for r in mem.model_tail(10)] == ["/hi", "你好！", "你们在聊啥"]
+    assert [r.text for r in mem.model_tail(10, include_commands=False)] == [
+        "你们在聊啥"
+    ]
+    # 过滤先于截取：命令再多也不挤占 context_size 名额
+    for i in range(4, 8):
+        await mem.append(make_record(i, f"/ping {i}", is_command=True))
+    assert [r.text for r in mem.model_tail(2, include_commands=False)] == [
+        "你们在聊啥"
+    ]
+    assert mem.model_tail(0) == []
+    # 缺省 include_commands=True：与 tail 一致，命令照常进历史层
+    assert [r.text for r in mem.model_tail(2)] == ["/ping 6", "/ping 7"]

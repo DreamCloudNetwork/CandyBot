@@ -79,11 +79,75 @@ async def test_command_bypasses_llm_and_replies(tmp_path):
         # ctx 携带调用者身份
         assert seen[0].group_id == 42 and seen[0].user_id == 1000
         assert seen[0].nickname == "用户1000" and seen[0].text == "/hi"
-        # 命令消息与插件回复都进了记忆
+        # 命令消息与插件回复都进了记忆（缺省配置：照常送入模型上下文），
+        # 且都带 is_command 标记
         memory = await bot._memory.get(42)
         records = memory.tail(5)
         assert records[0].text == "/hi" and not records[0].is_self
+        assert records[0].is_command
         assert records[-1].text == "你好！" and records[-1].is_self
+        assert records[-1].is_command
+    finally:
+        await bot.stop()
+
+
+async def test_commands_excluded_from_model_context_when_disabled(tmp_path):
+    """include_commands_in_history=false：命令消息与回复照常入库（带
+    is_command 标记），但不进模型的历史上下文、不占 context_size 名额。"""
+    bot, reg = await build(
+        tmp_path,
+        plugins_over={"include_commands_in_history": False},
+        score=9,
+    )
+    try:
+        @reg.command("hi", help="打招呼")
+        def hi(ctx):
+            return "你好！"
+
+        await bot._on_event(group_event(1, "/hi"))
+        await wait_until(lambda: bot._snowluma.sent)
+        assert bot._snowluma.sent == [(42, "你好！")]
+        # 照常写入记忆，且两者都带 is_command 标记
+        memory = await bot._memory.get(42)
+        records = memory.tail(5)
+        assert [(r.text, r.is_self, r.is_command) for r in records] == [
+            ("/hi", False, True),
+            ("你好！", True, True),
+        ]
+        # 持久层同样保留标记（重启回放后仍可按配置过滤）
+        rows = await bot._memory.db.load_recent(42, 10)
+        assert [r.is_command for r in rows] == [True, True]
+        # 之后的普通消息：命令消息不出现在模型历史里（recent_len 只算
+        # 「你们在聊啥」这一条），L2 须知换成排除措辞
+        await bot._on_event(group_event(2, "你们在聊啥"))
+        await wait_until(lambda: len(bot._snowluma.sent) > 1)
+        assert bot._ai.reply_calls[0]["recent_len"] == 1
+        assert bot._ai.reply_calls[0]["recent_texts"] == ["你们在聊啥"]
+        runtime_system = bot._ai.reply_calls[0]["runtime_system"]
+        assert "【命令功能】" in runtime_system
+        assert "都不会出现在你的聊天记录里" in runtime_system
+    finally:
+        await bot.stop()
+
+
+async def test_unknown_command_not_marked_when_excluded(tmp_path):
+    """未知 /命令 不算插件产生的消息：照常走大模型、不带 is_command 标记。"""
+    bot, _reg = await build(
+        tmp_path,
+        plugins_over={"include_commands_in_history": False},
+        score=9,
+    )
+    try:
+        await bot._on_event(group_event(3, "/这命令不存在 说点什么"))
+        await wait_until(lambda: bot._snowluma.sent)
+        assert bot._ai.reply_calls[0]["recent_texts"] == [
+            "/这命令不存在 说点什么"
+        ]
+        memory = await bot._memory.get(42)
+        records = memory.tail(5)
+        assert records[0].text == "/这命令不存在 说点什么" and not records[0].is_self
+        assert not records[0].is_command
+        assert records[-1].is_self and not records[-1].is_command
     finally:
         await bot.stop()
 
