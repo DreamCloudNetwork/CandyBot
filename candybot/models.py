@@ -605,9 +605,9 @@ class ProactiveSettings:
       参与心跳（死群不冒泡）；
     max_per_group_per_day：每群每天主动发言上限（只计实际至少发出 1 条正文
       的轮次；仍同时受 rate_limit.global_daily_limit 全局日配额约束）；
-    respond_reset_minutes：主动发言后 N 分钟内群里有任何他人消息＝「有人
-      接/场子热了」，退避倍数重置为 1；观察窗到点仍没人接，下轮空闲窗口
-      ×2，封顶 ×8；
+    respond_reset_minutes：主动发言后 N 分钟内的观察窗——窗内有人**@机器人
+      或回复机器人**（明确对它说话）才算「有人接话」、退避倍数重置为 1；
+      普通闲聊不算回应，观察窗到点仍没人接，下轮空闲窗口 ×2，封顶 ×8；
     context_messages：醒来看多少条上下文，-1=沿用该群 context_size。
     """
 

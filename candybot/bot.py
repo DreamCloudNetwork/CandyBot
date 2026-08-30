@@ -580,8 +580,9 @@ class CandyBot:
             normalized.record.is_command = True
         await memory.append(normalized.record)
         # 心跳记账（任务 4）：他人消息入库处更新空闲计时与竞态计数
-        # （normalize 已过滤自己的消息，走到这里的一定是「他人消息」）
-        self._heartbeat.note_inbound(group_id)
+        # （normalize 已过滤自己的消息，走到这里的一定是「他人消息」）；
+        # mentioned_me（@我/回复我）才算「有人接话」，普通闲聊不重置退避
+        self._heartbeat.note_inbound(group_id, directed=normalized.mentioned_me)
         if normalized.mentioned_me:
             # 新鲜度检查的记账：ChatRecord 不带 mentioned_me，这里登记
             # 「明确指向自己」的消息 id，供发送前比对生成期间的新消息
@@ -982,64 +983,8 @@ class CandyBot:
         # 人物画像（任务 3）同为每轮一次：选取即刷新命中记录（被使用=被
         # 强化），重生成再选一遍就是二次强化；同为辅助能力，失败退化为不注入
         person_hints = await self._person_profile_hints(group_id, msg, recent)
-        # 一轮连发最多几次「被打断后重想」（generation.max_reconsider_per_burst）：
-        # 每次重想是一回额外的 reply 模型调用，预算用尽后剩下的腹稿按原计划
-        # 发完，防止病态刷屏把发送环节变成无限往返。
-        reconsider_left = max(
-            int(self._settings.generation.max_reconsider_per_burst), 0
-        )
-
-        async def reconsider(sent: list[str], pending: list[str]) -> ProcessedReply | None:
-            """被打断后的重想调用。
-
-            返回新发送计划；返回 None 表示没法重想（预算用尽或调用失败，
-            调用方按原计划继续）；返回空计划表示模型决定放弃剩余消息。
-            """
-            nonlocal reconsider_left
-            if reconsider_left <= 0:
-                logger.debug("群 %d 本轮连发的重想预算用尽，按原计划继续", group_id)
-                return None
-            reconsider_left -= 1
-            recent = memory.model_tail(
-                profile.context_size,
-                include_commands=self._settings.plugins.include_commands_in_history,
-            )
-            static_system = runtime.static_system(
-                "reply", profile.persona, via_tool=self._ai.reply_tool_use
-            )
-            nicknames = nickname_list_from_history([record_to_turn(r) for r in recent])
-            runtime_system = runtime_system_prompt(
-                group_id,
-                date.today().isoformat(),
-                nicknames,
-                impressions=await self._impressions_for(group_id, runtime),
-                commands_enabled=self._settings.plugins.enabled,
-                commands_in_history=self._settings.plugins.include_commands_in_history,
-            )
-            draft = await self._generate_with_retry(
-                self._ai.reconsider_reply,
-                static_system,
-                runtime_system,
-                recent,
-                fmt_now_text(),
-                sent_segments=tuple(sent),
-                pending_segments=tuple(pending),
-            )
-            if draft is None:
-                logger.warning("群 %d 被打断后重想调用失败，按原计划继续", group_id)
-                return None
-            if draft.ops:
-                await self._apply_image_ops(group_id, memory, list(draft.ops))
-            if not draft.text:
-                return ProcessedReply([], [])  # 空计划＝放弃剩余
-            if _verbatim_match(draft.text, pending):
-                # 一字不改地要继续：沿用原计划本身（连同已经掷好的错别字
-                # 与更正），别让「重想」把该发的话再重新加工一遍
-                logger.debug("群 %d 重想后决定照原样继续", group_id)
-                return None
-            return process_reply(
-                draft.text, self._settings.response_post_process, rng=self._pp_rng
-            )
+        # 被打断后的重想回调：被动与主动发言连发同源（见 _make_reconsider）
+        reconsider = self._make_reconsider(group_id, memory, profile, runtime)
 
         reply_text = await self._compose_reply(
             group_id,
@@ -1225,6 +1170,79 @@ class CandyBot:
             )
         except Exception:
             logger.warning("群 %d 表情包跟发失败", group_id, exc_info=True)
+
+    def _make_reconsider(
+        self,
+        group_id: int,
+        memory: GroupMemory,
+        profile: GroupProfile,
+        runtime: GroupRuntime,
+    ):
+        """构造本轮连发的「被打断后重想」回调（被动回复与主动发言同源）。
+
+        一轮连发最多几次「被打断后重想」（generation.max_reconsider_per_burst）：
+        每次重想是一回额外的 reply 模型调用，预算用尽后剩下的腹稿按原计划
+        发完，防止病态刷屏把发送环节变成无限往返。闭包不依赖触发消息——
+        只用最新上下文与已发出/未发出的腹稿，故被动连发与主动发言连发
+        （任务 4 补强）共用这一个构造。
+        """
+        reconsider_left = max(
+            int(self._settings.generation.max_reconsider_per_burst), 0
+        )
+
+        async def reconsider(sent: list[str], pending: list[str]) -> ProcessedReply | None:
+            """被打断后的重想调用。
+
+            返回新发送计划；返回 None 表示没法重想（预算用尽或调用失败，
+            调用方按原计划继续）；返回空计划表示模型决定放弃剩余消息。
+            """
+            nonlocal reconsider_left
+            if reconsider_left <= 0:
+                logger.debug("群 %d 本轮连发的重想预算用尽，按原计划继续", group_id)
+                return None
+            reconsider_left -= 1
+            recent = memory.model_tail(
+                profile.context_size,
+                include_commands=self._settings.plugins.include_commands_in_history,
+            )
+            static_system = runtime.static_system(
+                "reply", profile.persona, via_tool=self._ai.reply_tool_use
+            )
+            nicknames = nickname_list_from_history([record_to_turn(r) for r in recent])
+            runtime_system = runtime_system_prompt(
+                group_id,
+                date.today().isoformat(),
+                nicknames,
+                impressions=await self._impressions_for(group_id, runtime),
+                commands_enabled=self._settings.plugins.enabled,
+                commands_in_history=self._settings.plugins.include_commands_in_history,
+            )
+            draft = await self._generate_with_retry(
+                self._ai.reconsider_reply,
+                static_system,
+                runtime_system,
+                recent,
+                fmt_now_text(),
+                sent_segments=tuple(sent),
+                pending_segments=tuple(pending),
+            )
+            if draft is None:
+                logger.warning("群 %d 被打断后重想调用失败，按原计划继续", group_id)
+                return None
+            if draft.ops:
+                await self._apply_image_ops(group_id, memory, list(draft.ops))
+            if not draft.text:
+                return ProcessedReply([], [])  # 空计划＝放弃剩余
+            if _verbatim_match(draft.text, pending):
+                # 一字不改地要继续：沿用原计划本身（连同已经掷好的错别字
+                # 与更正），别让「重想」把该发的话再重新加工一遍
+                logger.debug("群 %d 重想后决定照原样继续", group_id)
+                return None
+            return process_reply(
+                draft.text, self._settings.response_post_process, rng=self._pp_rng
+            )
+
+        return reconsider
 
     async def _compose_reply(
         self,
@@ -1707,6 +1725,9 @@ class CandyBot:
             # 学习注入与被动回复同源（表达/黑话按语境取；自发言没有明确目标
             # 人物，不注入画像）；辅助能力，失败退化为不注入
             expression_hints, jargon_hints = await self._learning_hints(group_id, recent)
+            # 与被动同口径：以**决策时刻**（生成开始前）的消息集为基线，
+            # 生成/连发期间进来的他人消息都算插话（见 _make_reconsider）
+            seen_ids = {r.message_id for r in memory.tail(len(memory))}
             draft = await self._generate_with_retry(
                 self._ai.generate_reply,
                 runtime.static_system(
@@ -1741,7 +1762,14 @@ class CandyBot:
             )
             try:
                 sent_count = await self._send_reply_segments(
-                    group_id, processed, seen_ids=set(), reconsider=None
+                    group_id,
+                    processed,
+                    seen_ids=seen_ids,
+                    reconsider=(
+                        self._make_reconsider(group_id, memory, profile, runtime)
+                        if self._settings.response_post_process.enabled
+                        else None
+                    ),
                 )
             except Exception:
                 # 与被动链路同口径：预期外异常不记账也不退配额，保守放过

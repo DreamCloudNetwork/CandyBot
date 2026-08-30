@@ -185,16 +185,34 @@ async def test_backoff_doubles_and_caps_at_8():
 
 
 async def test_response_within_watch_resets_backoff():
-    """发言后观察窗内有人接话：退避当场重置为 ×1。"""
+    """发言后观察窗内有人接话（@/回复，directed）：退避当场重置为 ×1。"""
     sched, clock, items = make_sched(respond_reset_minutes=10)
     sched.note_inbound(42)
     await sched.tick()
     await fire_and_complete(sched, clock, items, spoke=True)
     assert sched._states[42].watch_since is not None
     clock.advance(60)  # 观察窗内（<10 分钟）
-    sched.note_inbound(42)  # 有人接话了
+    sched.note_inbound(42, directed=True)  # 有人接话了（@机器人）
     assert sched._states[42].multiplier == 1
     assert sched._states[42].watch_since is None
+
+
+async def test_undirected_chat_does_not_reset_backoff():
+    """群友互聊不算接话：观察窗不重置、到点照常翻倍退避；只有 @/回复才重置。"""
+    sched, clock, items = make_sched(respond_reset_minutes=10)
+    for expect in (2, 4):
+        sched.note_inbound(42)
+        await sched.tick()  # 排程
+        await fire_and_complete(sched, clock, items, spoke=True)
+        clock.advance(60)
+        sched.note_inbound(42)  # 观察窗内的普通闲聊：watch 与倍数都不动
+        assert sched._states[42].watch_since is not None
+        assert sched._states[42].multiplier == expect // 2
+        # 观察窗到点仍没人「接话」：照常退避翻倍
+        clock.advance(10 * 60)
+        await sched.tick()
+        assert sched._states[42].multiplier == expect
+        assert sched._states[42].watch_since is None
 
 
 # ------------------------------------------------------------ bot 层基建
@@ -330,6 +348,86 @@ async def test_idle_with_postprocess_split(tmp_path):
         memory = await bot._memory.get(42)
         self_texts = [r.text for r in memory.tail(10) if r.is_self]
         assert self_texts == texts  # 逐条写回与发出对齐
+    finally:
+        await bot.stop()
+
+
+async def test_idle_burst_reconsiders_on_interrupt(tmp_path, monkeypatch):
+    """主动连发中途被插话：与被动同源触发重想，空正文＝放弃剩余腹稿。
+
+    以决策时刻（生成前）为基线，第一条正文发出后插进来的他人消息算插话：
+    下一条发出前问模型——放弃则剩余不发且不进记忆，已发出的 ≥1 条照常
+    记账（当日上限/冷却），与被动链路的行为完全一致。
+    """
+    bot = await build(
+        tmp_path,
+        post_process={
+            "enabled": True,
+            "typing_speed": 0.0,
+            "max_split": 3,
+            "typo_error_rate": 0.0,
+            "typo_word_replace_rate": 0.0,
+        },
+    )
+    try:
+        await chat(bot, (1, "聊聊周末"))
+
+        class IdleReconsiderAI(ProAI):
+            async def reconsider_reply(self, static_system, runtime_system, recent,
+                                       now_text, *, sent_segments, pending_segments):
+                self.reconsider_calls.append({
+                    "sent": tuple(sent_segments),
+                    "pending": tuple(pending_segments),
+                })
+                return ReplyDraft("")  # 空正文＝剩余腹稿不再发
+
+        ai = IdleReconsiderAI(
+            [ProactiveVerdict(True, "接话头")], ["先说一句。再来一句。最后补一句。"]
+        )
+        bot._ai = ai
+        chained = bot._snowluma.send_group_msg
+
+        async def send_then_interrupt(group_id, message):
+            result = await chained(group_id, message)
+            if len(bot._snowluma.sent) == 1:
+                # 第一条正文刚发出：群友插一句普通消息（judge 低分不会回）
+                await bot._on_event(group_event(7, "我先插一句", uid=1001))
+            return result
+
+        monkeypatch.setattr(bot._snowluma, "send_group_msg", send_then_interrupt)
+        await bot._run_idle_evaluation(42, idle_item(bot))
+
+        assert ai.reconsider_calls, "主动连发被插话应触发重想"
+        assert len(ai.reconsider_calls[0]["pending"]) == 2  # 剩余两条腹稿
+        # 放弃生效：只发出第一条，剩余从未发出、也从未写回记忆
+        assert [msg for _, msg in bot._snowluma.sent] == list(
+            ai.reconsider_calls[0]["sent"]
+        )
+        memory = await bot._memory.get(42)
+        self_texts = [r.text for r in memory.tail(10) if r.is_self]
+        assert self_texts == list(ai.reconsider_calls[0]["sent"])
+        # 至少发出了 1 条正文：当日上限与冷却照常记账
+        assert bot._heartbeat.spoken_today(42) == 1
+        assert bot._runtimes[42].last_proactive_ts > 0
+    finally:
+        await bot.stop()
+
+
+async def test_directed_message_through_event_resets_backoff(tmp_path):
+    """_on_event 接线：@我/回复我的消息以 directed=True 记进心跳；普通消息不算接话。"""
+    bot = await build(tmp_path)
+    try:
+        await chat(bot, (1, "随便聊聊"))
+        bot._ai = ProAI([])  # at_me 会走 @必答生成，换假 AI 避免真实端点调用
+        hb = bot._heartbeat
+        hb.note_spoken(42)  # 模拟刚发出一次主动发言：观察窗开启
+        hb._states[42].multiplier = 2
+        await bot._on_event(group_event(9, "闲聊", uid=1001))
+        assert hb._states[42].multiplier == 2  # 普通闲聊不重置退避
+        assert hb._states[42].watch_since is not None
+        await bot._on_event(group_event(10, "你说的对", uid=1001, at_me=True))
+        assert hb._states[42].multiplier == 1  # @它＝有人接话，当场重置
+        assert hb._states[42].watch_since is None
     finally:
         await bot.stop()
 

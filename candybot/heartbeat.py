@@ -8,9 +8,11 @@ CandyBot 本是纯消息驱动的——没有新消息就永远不会说话。�
 说 → reply 管线生成 → 现有发送链路），本模块只负责「什么时候醒来看一眼」
 与行为节制：
 
-- 退避：实际发出过主动发言后进入 respond_reset_minutes 的观察窗——窗内群里
-  有任何他人消息＝「有人接/场子热了」，退避倍数重置为 1；观察窗到点仍没人
-  接，下轮空闲窗口 ×2，封顶 ×8（越没人理越安静）。
+- 退避：实际发出过主动发言后进入 respond_reset_minutes 的观察窗——窗内有人
+  **@机器人或回复机器人**（note_inbound 的 directed 标记）＝「有人接话」，
+  退避倍数重置为 1；普通闲聊不算回应（没人接自己的话却因别人互聊而重置，
+  会把该安静的时候说得更勤），观察窗到点仍没人接，下轮空闲窗口 ×2，
+  封顶 ×8（越没人理越安静）。
 - 活跃门槛：only_active_today 时，仅当天有过 ≥min_today_messages 条他人
   消息的群参与心跳（死群不冒泡）。
 - 每群每日发言上限由 bot 层在调 LLM 前检查（本模块只记账 spoken_today）。
@@ -128,18 +130,24 @@ class HeartbeatScheduler:
     def _today(self) -> date:
         return datetime.fromtimestamp(self._clock()).date()
 
-    def note_inbound(self, group_id: int) -> None:
+    def note_inbound(self, group_id: int, *, directed: bool = False) -> None:
         """一条他人消息入库（在 bot 的归一化入库处调用）：空闲计时重新起算。
 
-        同步 O(1) 纯内存操作；观察窗内进来＝「有人接话」，退避倍数当场重置。
+        同步 O(1) 纯内存操作。退避重置从严：只有**明确对自己说话**的消息
+        （@机器人或回复机器人，directed=True）在观察窗内才算「有人接话」、
+        当场把退避倍数恢复 ×1；普通闲聊不算回应——没人接自己的话却因别人
+        互聊而重置，会把该安静的时候说得更勤。无关消息照常终结本轮空闲
+        （seq++、重新计窗），观察窗保持未结算、到点照常翻倍退避。
         """
         state = self._state(group_id)
         now = self._clock()
         state.add_inbound(self._today, now)
+        if not directed:
+            return
         reset = self._settings().proactive.respond_reset_minutes * 60.0
         if state.watch_since is not None and now <= state.watch_since + reset:
             logger.debug(
-                "群 %d 主动发言后有人接话，退避重置（倍数恢复 ×1）", group_id
+                "群 %d 主动发言后有人接话（@/回复），退避重置（倍数恢复 ×1）", group_id
             )
             state.multiplier = 1
             state.watch_since = None
