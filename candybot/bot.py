@@ -8,6 +8,14 @@
 会先让 reply 模型对剩余腹稿重想一次：可以放弃、改写或照原样继续，防止
 别人已经插话、AI 却把打好的字一条条硬发完。
 
+另有主动发言心跳（proactive 段，**默认关闭**，见 heartbeat.py）：某群静默满
+一个随机空闲窗口后，把「空闲评估」作为特殊条目投进该群现有串行队列——与
+真实消息同队列排队，天然避免「群里恰好来了新消息」的竞态。judge 角色二元
+决定说不说（默认沉默），说则走现有 reply 生成、AI 味拦截、后处理与发送
+记账链路，与被动回复在群里无法区分来源；cooldown / min_gap_messages /
+每日上限 / 全局日配额全部复用既有记账代码。enabled=false 时调度器不创建
+任何任务，程序行为与引入前零差异。
+
 决策层另有三项增强（配置都在 generation 段，关闭时行为与引入前一致）：
 
 - 发送前新鲜度检查（freshness_check_enabled）：回复生成期间群里若进了
@@ -39,6 +47,7 @@ from .ai import AIClient, ImageOp, ReplyDraft, split_image_ops
 from .commandline import CommandUsageError, detect_command_name, parse_invocation
 from .dedup import MessageDedup
 from .events_server import EventsServer
+from .heartbeat import HeartbeatScheduler, IdleEvaluation
 from .memory import GroupMemory, MemoryManager
 from .migrations import pending_migrations
 from .models import (
@@ -315,14 +324,29 @@ class CandyBot:
             stickers_dir=sticker_root,
         )
         self._runtimes: dict[int, GroupRuntime] = defaultdict(GroupRuntime)
-        # 队列元素为 (消息, 是否观望重评, 命令调用)：观望到点后把原消息
-        # 重新入队，以 observe=True 复用同一串行队列与判定路径，绝不并发
-        # 生成；命中命令注册表的消息带 invocation 走 _run_command，同样
-        # 经串行队列与正常回复保持同群时序
+        # 队列载荷为 消息 / 空闲评估（任务 4）；元素为 (载荷, 是否观望重评,
+        # 命令调用)：观望到点后把原消息重新入队，以 observe=True 复用同一
+        # 串行队列与判定路径，绝不并发生成；命中命令注册表的消息带 invocation
+        # 走 _run_command，同样经串行队列与正常回复保持同群时序；空闲评估
+        # 条目（IdleEvaluation）由心跳调度器投递，与真实消息同队列排队
         self._group_queues: dict[
-            int, asyncio.Queue[tuple[NormalizedMessage, bool, CommandInvocation | None]]
+            int,
+            asyncio.Queue[
+                tuple[
+                    NormalizedMessage | IdleEvaluation,
+                    bool,
+                    CommandInvocation | None,
+                ]
+            ],
         ] = {}
         self._queue_workers: dict[int, asyncio.Task[None]] = {}
+        # 主动发言心跳（任务 4）：调度器对象始终存在（note_inbound 随消息
+        # 入库顺带记账，纯内存 O(1)），enabled=false 时不创建任何 asyncio
+        # 任务——关闭/缺段时与引入前零差异。配置与入队都走回调，热重载后
+        # 取到新快照、照常复用该群串行队列。
+        self._heartbeat = HeartbeatScheduler(
+            lambda: self._settings, self._enqueue_idle
+        )
         # 观望的记账：(group_id, message_id) → 未决任务（停机时取消）；
         # 已观望过的消息 id 集合（每条至多观望一次，防循环），按 FIFO 封顶
         self._observe_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -361,6 +385,9 @@ class CandyBot:
             "、".join(f"/{n}" for n in self._commands.names()) or "（无）",
         )
         await self._learning.start()  # 每日群印象循环（启动时先补昨天的）
+        # 主动发言心跳（任务 4）：enabled=false（默认）时 sync 什么都不做，
+        # 不创建任何任务——与引入前零差异
+        self._heartbeat.sync()
         pp = self._settings.response_post_process
         if pp.enabled and (pp.typo_error_rate > 0 or pp.typo_word_replace_rate > 0):
             # 拼音反查表构建一次约 0.6 秒：在后台线程预热，避免首条带错字
@@ -383,6 +410,10 @@ class CandyBot:
 
     async def stop(self) -> None:
         self._stopping = True
+        # 心跳先停（任务 4）：取消调度循环任务、清空全部待触发窗口；队列中
+        # 未执行的空闲评估条目随 worker 取消作废（即便已出队也会被停机检查
+        # 就地放弃）
+        await self._heartbeat.stop()
         # 未决的观望任务先取消：_observe_task 的取消语义是静默退出，
         # 取消后不会再向队列投递二次判定
         observe_tasks = list(self._observe_tasks.values())
@@ -422,7 +453,8 @@ class CandyBot:
         （白名单、人设与 bot.self_nickname、护栏阈值、模型与生成参数、
         多模态、输出后处理、限速、图片保留天数、表情包识别启发式与跟发图片
         引用方式 stickers.send_mode / http_base_url——供图路由在事件服务上
-        常驻挂载，切到 http 即刻可发外链）即时生效。
+        常驻挂载，切到 http 即刻可发外链）、proactive 整段（enabled 拉起或
+        停掉心跳循环任务，其余参数现读）即时生效。
 
         解析失败（典型场景：配置写坏）完整记日志但不拖垮服务：沿用旧配置，
         下一次保存自动重试。返回是否实际完成了替换。
@@ -451,6 +483,10 @@ class CandyBot:
             generation=new_settings.generation,
             multimodal_mode=new_settings.multimodal.mode,
         )
+        # 主动发言心跳（任务 4）：enabled 现读——改 true 拉起调度循环任务，
+        # 改 false 立即取消任务并清空全部待触发心跳（已入队的评估条目出队
+        # 时按开关作废）；窗口/门槛/上限/退避等参数全程现读即时生效
+        self._heartbeat.sync()
         # 每日回收循环每轮现读该属性，替换后即生效
         self._memory.image_retention_days = new_settings.storage.image_retention_days
         # 与 __init__ 里容量推导同式的口径：新配置要求更长的上下文时热缓存
@@ -543,6 +579,9 @@ class CandyBot:
             # 由 model_tail 把它与命令回复一起过滤出模型的历史上下文。
             normalized.record.is_command = True
         await memory.append(normalized.record)
+        # 心跳记账（任务 4）：他人消息入库处更新空闲计时与竞态计数
+        # （normalize 已过滤自己的消息，走到这里的一定是「他人消息」）
+        self._heartbeat.note_inbound(group_id)
         if normalized.mentioned_me:
             # 新鲜度检查的记账：ChatRecord 不带 mentioned_me，这里登记
             # 「明确指向自己」的消息 id，供发送前比对生成期间的新消息
@@ -617,7 +656,7 @@ class CandyBot:
     async def _enqueue(
         self,
         group_id: int,
-        msg: NormalizedMessage,
+        msg: NormalizedMessage | IdleEvaluation,
         *,
         observe: bool = False,
         invocation: CommandInvocation | None = None,
@@ -625,7 +664,11 @@ class CandyBot:
         queue = self._group_queues.get(group_id)
         if queue is None:
             queue: asyncio.Queue[
-                tuple[NormalizedMessage, bool, CommandInvocation | None]
+                tuple[
+                    NormalizedMessage | IdleEvaluation,
+                    bool,
+                    CommandInvocation | None,
+                ]
             ] = asyncio.Queue()
             self._group_queues[group_id] = queue
             self._queue_workers[group_id] = asyncio.create_task(
@@ -633,11 +676,21 @@ class CandyBot:
             )
         await queue.put((msg, observe, invocation))
 
+    async def _enqueue_idle(
+        self, group_id: int, item: IdleEvaluation
+    ) -> None:
+        """心跳调度器的入队回调：空闲评估投进该群现有串行队列（任务 4）。"""
+        await self._enqueue(group_id, item)
+
     async def _group_worker(
         self,
         group_id: int,
         queue: asyncio.Queue[
-            tuple[NormalizedMessage, bool, CommandInvocation | None]
+            tuple[
+                NormalizedMessage | IdleEvaluation,
+                bool,
+                CommandInvocation | None,
+            ]
         ],
     ) -> None:
         while not self._stopping:
@@ -646,14 +699,19 @@ class CandyBot:
             except asyncio.CancelledError:
                 return
             try:
-                if invocation is not None:
+                if isinstance(msg, IdleEvaluation):
+                    await self._run_idle_evaluation(group_id, msg)
+                elif invocation is not None:
                     await self._run_command(group_id, msg, invocation)
                 else:
                     await self._decide_and_reply(group_id, msg, observe=observe)
             except Exception:
-                logger.exception(
-                    "处理群 %d 消息 %d 时出错", group_id, msg.record.message_id
-                )
+                if isinstance(msg, IdleEvaluation):
+                    logger.exception("处理群 %d 空闲评估时出错", group_id)
+                else:
+                    logger.exception(
+                        "处理群 %d 消息 %d 时出错", group_id, msg.record.message_id
+                    )
 
     # ------------------------------------------------------------ 命令插件
 
@@ -1530,6 +1588,180 @@ class CandyBot:
         except asyncio.CancelledError:
             # 停机或消息已被处理：观望静默作废，不报错也不二次判定
             logger.debug("群 %d 消息 %d 的观望任务已取消", group_id, message_id)
+
+    # ------------------------------------------------------------ 主动发言心跳（任务 4）
+
+    def _daily_quota_reached(self) -> bool:
+        """全局日配额是否已用尽（只 peek 不计数）：主动发言在调 LLM 前先查
+        这道，护栏不过就不花钱。跨天重置与 _consume_daily_quota 同式。"""
+        today = date.today()
+        if today != self._daily_date:
+            self._daily_date = today
+            self._daily_replies = 0
+        limit = self._settings.rate_limit.global_daily_limit
+        return limit is not None and self._daily_replies >= limit
+
+    def _idle_guard_reason(
+        self, group_id: int, profile: GroupProfile, runtime: GroupRuntime
+    ) -> str | None:
+        """LLM 说 speak 之后的结构性护栏（双保险）：热闹时本不会空闲，空闲
+        到点也可能恰好撞上刚发过言/刚有人接话。跳过原因文本非 None 即不发；
+        判定口径与 _make_decision 里的冷却/间隔/热闹三道护栏完全一致。"""
+        now = time.time()
+        elapsed = now - runtime.last_proactive_ts
+        if runtime.last_proactive_ts > 0 and elapsed < profile.cooldown_seconds:
+            return f"冷却中（剩 {profile.cooldown_seconds - elapsed:.0f}s）"
+        if (
+            profile.min_gap_messages > 0
+            and runtime.msgs_since_reply <= profile.min_gap_messages
+        ):
+            return (
+                f"距上次发言仅 {runtime.msgs_since_reply} 条他人消息"
+                f"（要求超过 {profile.min_gap_messages} 条）"
+            )
+        window = runtime.recent_msg_times
+        while window and window[0] < now - 60.0:
+            window.popleft()
+        if profile.busy_rate_per_min > 0 and len(window) >= profile.busy_rate_per_min:
+            return f"近 60 秒已有 {len(window)} 条消息（≥{profile.busy_rate_per_min}）"
+        return None
+
+    async def _run_idle_evaluation(
+        self, group_id: int, item: IdleEvaluation
+    ) -> None:
+        """在串行队列里执行一次空闲评估：竞态检查 → 护栏 → 模型评估 → 生成
+        → 发送 → 记账（任务 4）。绝不并发、绝不重试轰炸；任何提前返回都只
+        静默本轮，finally 里重新排程。
+
+        与被动回复共用同一套记账原语（_consume_daily_quota /
+        _send_reply_segments / runtime 护栏字段），在群里无法区分来源；
+        只有实际至少发出 1 条正文才计每群当日上限并开启「有人接话」观察窗，
+        与「一条都没发出退还配额」的既有规则对齐。
+        """
+        hb = self._heartbeat
+        try:
+            ps = self._settings.proactive
+            if not ps.enabled or self._stopping:
+                logger.debug("群 %d 空闲评估作废（开关已关闭或正在停机）", group_id)
+                return
+            # 入队之后又有他人消息入库＝空闲已终结：放弃本轮、不拿旧上下文说话
+            if hb.seq_of(group_id) != item.seq:
+                logger.debug("群 %d 空闲评估入队后来了新消息，放弃本轮", group_id)
+                return
+            profile = self._settings.profile_for(group_id)
+            if profile is None:
+                logger.debug("群 %d 已不在白名单，空闲评估作废", group_id)
+                return
+            # 先查每群当日上限与全局日配额，不过就不调 LLM（省钱）
+            if hb.spoken_today(group_id) >= ps.max_per_group_per_day:
+                logger.debug(
+                    "群 %d 今日主动发言已达上限 %d 次，空闲评估不调模型",
+                    group_id,
+                    ps.max_per_group_per_day,
+                )
+                return
+            if self._daily_quota_reached():
+                logger.debug("全局日配额已满，群 %d 空闲评估不调模型", group_id)
+                return
+            memory = await self._memory.get(group_id)
+            ctx_n = profile.context_size if ps.context_messages < 0 else ps.context_messages
+            recent = memory.model_tail(
+                ctx_n,
+                include_commands=self._settings.plugins.include_commands_in_history,
+            )
+            runtime = self._runtimes[group_id]
+            nicknames = nickname_list_from_history([record_to_turn(r) for r in recent])
+            impressions = await self._impressions_for(group_id, runtime)
+            try:
+                verdict = await self._ai.evaluate_proactive(
+                    runtime.static_system("judge", profile.persona),
+                    runtime_system_prompt(
+                        group_id,
+                        date.today().isoformat(),
+                        nicknames,
+                        impressions=impressions,
+                        commands_enabled=self._settings.plugins.enabled,
+                    ),
+                    recent,
+                    fmt_now_text(),
+                )
+            except Exception as exc:
+                # LLM 失败本轮作罢：绝不重试轰炸，也绝不阻塞队列
+                logger.warning("群 %d 空闲评估调用失败，本轮作罢：%s", group_id, exc)
+                return
+            if not verdict.speak:
+                logger.debug("群 %d 空闲评估选择保持沉默", group_id)
+                return
+            logger.info(
+                "群 %d 空闲评估想主动发言：%s", group_id, verdict.intent or "（无描述）"
+            )
+            guard = self._idle_guard_reason(group_id, profile, runtime)
+            if guard is not None:
+                logger.info("群 %d 主动发言被护栏拦下：%s", group_id, guard)
+                return
+            if hb.seq_of(group_id) != item.seq:
+                # 评估 LLM 往返可达数秒：期间有人说话就交回常规链路去接，
+                # 不再拿旧上下文生成自发言（出队竞态检查的时间维度补强）
+                logger.debug("群 %d 评估期间来了新消息，本轮主动发言作废", group_id)
+                return
+            # 学习注入与被动回复同源（表达/黑话按语境取；自发言没有明确目标
+            # 人物，不注入画像）；辅助能力，失败退化为不注入
+            expression_hints, jargon_hints = await self._learning_hints(group_id, recent)
+            draft = await self._generate_with_retry(
+                self._ai.generate_reply,
+                runtime.static_system(
+                    "reply", profile.persona, via_tool=self._ai.reply_tool_use
+                ),
+                runtime_system_prompt(
+                    group_id,
+                    date.today().isoformat(),
+                    nicknames,
+                    impressions=impressions,
+                    commands_enabled=self._settings.plugins.enabled,
+                    commands_in_history=self._settings.plugins.include_commands_in_history,
+                ),
+                recent,
+                None,  # 自发言没有「需要回应的消息」
+                fmt_now_text(),
+                forced=False,
+                proactive_intent=verdict.intent,
+                expression_hints=expression_hints,
+                jargon_hints=jargon_hints,
+            )
+            if draft is None or not draft.text:
+                logger.info("群 %d 主动发言生成为空，放弃发送", group_id)
+                return
+            await self._apply_image_ops(group_id, memory, list(draft.ops))
+            # 配额与被动主动回复同账：先扣、没发出去再退
+            if not self._consume_daily_quota():
+                logger.info("达到 global_daily_limit，群 %d 本次主动发言被拦截", group_id)
+                return
+            processed = process_reply(
+                draft.text, self._settings.response_post_process, rng=self._pp_rng
+            )
+            try:
+                sent_count = await self._send_reply_segments(
+                    group_id, processed, seen_ids=set(), reconsider=None
+                )
+            except Exception:
+                # 与被动链路同口径：预期外异常不记账也不退配额，保守放过
+                logger.exception("群 %d 主动发言发送环节异常", group_id)
+                return
+            if not sent_count:
+                self._refund_daily_quota()
+                logger.info("群 %d 主动发言一条也没发出去，退还配额、不记账", group_id)
+                return
+            runtime.last_proactive_ts = time.time()
+            runtime.msgs_since_reply = 0
+            hb.note_spoken(group_id)
+            logger.info(
+                "群 %d 主动发言完成（%d 条）：%r",
+                group_id,
+                sent_count,
+                draft.text[:80],
+            )
+        finally:
+            hb.finish(group_id)
 
     # ------------------------------------------------------------ 重试包装
 

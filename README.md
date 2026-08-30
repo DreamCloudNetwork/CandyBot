@@ -4,7 +4,7 @@
 
 - **收消息**：SnowLuma 通过 OneBot v11 HTTP POST 把事件上报到 CandyBot 内置的 aiohttp 服务；
 - **发消息**：直接调用 SnowLuma 的 OneBot v11 兼容 HTTP API（`POST {endpoint}/send_group_msg` 等，请求体为 JSON 参数、响应为标准 OneBot 信封；accessToken 以 `Authorization: Bearer` 头携带）；
-- **大脑**：OpenAI 兼容 API。`judge` 模型逐条评估「是否值得回复这条消息」打 0-10 分，超过阈值才插话，并同时识别「这条消息是否在和我说话」（对话中的追问不受冷却限制）；@机器人/回复机器人必答，由 `reply` 模型生成回复；可选 `vision` 模型把图片转成文字描述；`learning` 模型（默认继承 `judge`）在后台总结每日群印象、学习群友的表达与黑话、抽取关于群友的稳定事实（人物长期记忆）。
+- **大脑**：OpenAI 兼容 API。`judge` 模型逐条评估「是否值得回复这条消息」打 0-10 分，超过阈值才插话，并同时识别「这条消息是否在和我说话」（对话中的追问不受冷却限制）；@机器人/回复机器人必答，由 `reply` 模型生成回复；可选 `vision` 模型把图片转成文字描述；`learning` 模型（默认继承 `judge`）在后台总结每日群印象、学习群友的表达与黑话、抽取关于群友的稳定事实（人物长期记忆）；`judge` 还兼任主动发言心跳的空闲评估——群静默满窗后二元决定要不要自己冒个泡（`proactive` 段，默认关闭）。
 - **命令插件**：以 `/` 开头且命令名命中注册表的消息不走大模型，按 unix 终端命令风格解析参数后调用插件（`plugins/` 目录放一个 .py 即自动加载），插件返回的消息原样发到群里；未知 `/命令` 照常交给大模型。详见下文「命令插件系统」。
 
 ## 快速开始
@@ -94,6 +94,12 @@ uv run main.py                   # 启动
 |                       | dir                                                                | 插件目录（默认 `plugins`，相对工作目录）：启动时逐个导入其中的 .py，下划线开头的文件跳过；新增/修改插件需重启                                                                                                                                     |
 |                       | timeout_seconds                                                    | 异步 handler 的执行超时（默认 30 秒，最小 1）：超时按失败回一句提示，防止坏插件卡死该群队列；现读，改完即时生效                                                                                                                                       |
 |                       | include_commands_in_history                                        | 插件产生的消息（被判定为命令的用户消息与机器人对命令的回复）是否送入模型历史上下文（默认 true）：false 时两者仍照常入库（带 `is_command` 标记，审计与每日印象统计可用），只是不出现在 judge/reply 的历史层里、不占 `context_size` 名额；现读，改完即时生效（对已入库的历史命令消息同样生效）                                                                 |
+| proactive             | enabled                                                            | 主动发言心跳总开关（**默认 false**）：主动说话是行为风险最高的功能，必须显式开启；关闭/整段省略时调度器不创建任何任务、与现状零差异。详见下文「主动发言（心跳）」                                                                                                                                                                                                        |
+|                       | idle_min_seconds / idle_max_seconds                                | 该群静默后，在 [min, max]（默认 600~1800 秒）均匀随机取一个时刻醒来看一眼；再乘退避倍数（见 respond_reset_minutes）                                                                                                                                                                                                                                                        |
+|                       | only_active_today / min_today_messages                             | 仅当天有过 ≥N 条（默认 5）他人消息的群参与心跳（默认开；死群不冒泡）                                                                                                                                                                                                                                                                                                     |
+|                       | max_per_group_per_day                                              | 每群每天主动发言上限（默认 2）：只计实际至少发出 1 条正文的轮次；仍同时受 `rate_limit.global_daily_limit` 全局日配额约束                                                                                                                                                                                                                                                  |
+|                       | respond_reset_minutes                                              | 主动发言后的「有人接」观察窗（分钟，默认 10）：窗内群里有 ANY 他人消息＝有人接/场子热了，退避倍数重置 ×1；窗内没人接，下轮空闲窗口 ×2，封顶 ×8（越没人理越安静）                                                                                                                                                                                                        |
+|                       | context_messages                                                   | 醒来看多少条上下文（默认 -1=沿用该群 `context_size`；正数显式指定）                                                                                                                                                                                                                                                                                                      |
 | rate_limit            | global_daily_limit                                                 | 全局每日主动发言上限，null 不限（@必答不受限）。一条正文都没实际发出（重想全部放弃或首条即发送失败）时不计数，会退还配额                                                                                                                                                                                   |
 | response_post_process | enabled                                                            | 输出层拟人化后处理总开关（默认 true）。`false` 时回复整条单发、无任何延迟、不触发连发被打断后的重想，行为与未引入后处理前完全一致；整段配置可省略                                                                                                                                                          |
 |                       | typing_speed                                                       | 打字延迟全局倍率（默认 1.0，0 关闭延迟；须为非负有限数）：第 2 条起按下一条文本的估算打字时长 sleep 后再发送，单条封顶 60 秒                                                                                                                                                                               |
@@ -114,7 +120,7 @@ uv run main.py                   # 启动
 
 程序监听 `config.json5` 所在目录（而非文件本身，编辑器原子保存会替换 inode、单文件 watch 会静默失效），保存后自动重新解析并替换运行时配置，日志出现「配置文件被修改，正在重载」即成功；配置写坏时完整记录解析错误并沿用旧配置继续运行，修好再保存自动恢复（替换动作在事件循环线程上执行，与消息处理串行）。
 
-- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置；含 `models.embedding`——embedding 模型变更后表达向量缓存整体作废、由学习入库/下次启动的后台补算按新模型重算）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning` 与表达语义检索三参数 `expression_selection_mode` / `expression_vector_top_k` / `expression_min_similarity`——改成 `vector` 却没配 `models.embedding` 的新配置会在解析阶段报错、自动沿用旧配置；已缓存的 L2 印象快照当天不刷新，次日按新配置重建；含人物记忆全部参数 `person_enabled` / `person_fact_scope` / `person_fact_max_inject_per_person` / `person_fact_half_life_days` / `person_fact_min_weight` / `person_self_review`——均现读、改完即时生效：`person_fact_scope` 只改变读取与后续写入用的键，存量行不迁移）、`stickers`（含识别启发式参数、跟发的图片引用方式 `send_mode` / `http_base_url`——表情包供图路由在事件服务上常驻挂载，切到 `http` 即刻可发外链——以及收藏审核开关 `moderation_enabled` 与选图方式 `select_mode` / `smart_max_candidates`，均现读、改完即时对之后的收图与跟发生效）、`plugins.enabled` / `plugins.timeout_seconds` / `plugins.include_commands_in_history`、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
+- **改完即时生效**：`groups` 白名单（增删群、启停）、persona 与各群覆盖参数、护栏阈值、`context_size`、`models`（端点/密钥/限额，会重建 AI 客户端，工具协议降级状态随之重置；含 `models.embedding`——embedding 模型变更后表达向量缓存整体作废、由学习入库/下次启动的后台补算按新模型重算）、`generation`（含各角色温度、生成/重发重试与重想预算）、`multimodal` 的下载参数、`response_post_process`（含打字耗时模型）、`rate_limit`、`storage.image_retention_days`、`learning`（含 `models.learning` 与表达语义检索三参数 `expression_selection_mode` / `expression_vector_top_k` / `expression_min_similarity`——改成 `vector` 却没配 `models.embedding` 的新配置会在解析阶段报错、自动沿用旧配置；已缓存的 L2 印象快照当天不刷新，次日按新配置重建；含人物记忆全部参数 `person_enabled` / `person_fact_scope` / `person_fact_max_inject_per_person` / `person_fact_half_life_days` / `person_fact_min_weight` / `person_self_review`——均现读、改完即时生效：`person_fact_scope` 只改变读取与后续写入用的键，存量行不迁移）、`stickers`（含识别启发式参数、跟发的图片引用方式 `send_mode` / `http_base_url`——表情包供图路由在事件服务上常驻挂载，切到 `http` 即刻可发外链——以及收藏审核开关 `moderation_enabled` 与选图方式 `select_mode` / `smart_max_candidates`，均现读、改完即时对之后的收图与跟发生效）、`plugins.enabled` / `plugins.timeout_seconds` / `plugins.include_commands_in_history`、`proactive`（整段现读：`enabled` 改 true 拉起心跳循环任务、改 false 立即取消任务并停止全部待触发心跳，已在队列排队的空闲评估条目出队时按开关作废；窗口/门槛/上限/退避/上下文规模全部即时生效）、`snowluma.send_max_attempts` / `send_retry_delay_seconds`、`bot.self_qq`、`bot.self_nickname`、`bot.log_level`。
 - **仍需重启**：`bot.listen_host` / `bot.listen_port` / `bot.event_secret` / `bot.max_event_body_bytes`（aiohttp 监听与签名校验、请求体上限在启动时已绑定）、`bot.data_dir`、`plugins.dir` 与插件文件本身（命令注册表在构建期装载，新增/修改/删除 `plugins/` 下的插件需重启机器人生效）、`snowluma` 的连接类字段（`endpoint` / `api_key` / `timeout_ms` / `allow_private_endpoint`，HTTP 客户端会话在启动时建好）。另外热缓存容量按启动时的全局最大 `context_size` 定死，把它改大超过该上限时历史会偏短并有警告日志，完全生效需重启。
 
 ## 行为逻辑
@@ -177,6 +183,7 @@ flowchart TD
 - AI 味拦截（`generation.ai_flavor_rules` / `ai_flavor_retries`）：回复生成并经过现有清洗（`_strip_noise`、emoji 处理）后，再过一轮可配置的正则规则检测（默认含「作为AI/人工智能/语言模型」「很高兴/乐意/荣幸为您/帮您」、「以下是」开头、markdown 加粗/标题/行首列表残留）。命中时把「你上一次的回复『…』因为太像 AI 被拦截（原因：…），请用更口语、更随意的说法重写」附进 L4 重新生成一次（至多 `ai_flavor_retries` 次，默认 1）；重试后仍命中则放行并记 warning——宁可留着稍假的一句话，也绝不死循环卡住决策队列。这是内容级重试，与 reply 失败的网络重试（`_generate_with_retry`）相互独立；连发重想不走此环节。
 - 表情包（`stickers` 段，见下文「表情包」）：收到的表情包类图片过 vision 审核后自动收藏进 `data/stickers/`（附「描述 + 情绪」meta），每条文字回复成功发出后按小概率跟发一张——smart 模式下由模型按语境选图、可以不发。
 - 命令插件（`plugins` 段，见下文「命令插件系统」）：以 `/` 开头且命令名命中注册表的消息完全绕开大模型——judge、生成、冷却、日配额、后处理都不参与，按 unix 命令风格解析参数后调用插件 handler，返回的消息原样发群。命令消息与插件回复照常进入群记忆（`plugins.include_commands_in_history: false` 可让两者只入库、不进模型上下文）。
+- 主动发言心跳（`proactive` 段，**默认关闭**，见下文「主动发言（心跳）」）：没有新消息就永远不说话是纯消息驱动的缺口；开启后某群静默满一个随机空闲窗口，会把「空闲评估」投进该群现有串行队列，judge 模型二元决定要不要主动开口（默认沉默），说则走与被动回复完全同一条生成、AI 味拦截、后处理与记账链路。**风险提示**：主动发言可能在不合适的时机说话，故默认关闭且参数保守（仅活跃群参与、每群每日 ≤2、没人接话退避 ×2 封顶 ×8）。
 - 重启后每群记忆自动从 `data/candy.db` 恢复最近上下文（热缓存容量仍按 context 配置有界）。
 
 ## 图片记忆管理
@@ -228,6 +235,20 @@ flowchart TD
 - **写回**：表情包实际发送成功后，向记忆追加一条 is_self 的 ChatRecord，正文为占位「[表情包]」——模型在历史里知道自己发过图，但文件路径与 base64 都不进入历史；发送失败不写占位。
 
 DEBUG 日志可见：收集（「群 %d 收藏表情包」含审核给出的描述与情绪、「已替换最久未使用」）、收藏审核（「表情包审核未通过，不收藏」带理由、「审核调用失败」「未产出结论」的退回说明）、跟发（「群 %d 跟发表情包」含使用计数、发送前「群 %d 跟发表情包前预计挑图打字 %.1f 秒」延迟预估、smart 无 meta 候选时「退回随机抽选」）、smart 模型选择不发（INFO「本次不跟发表情包」带理由）；临时风格注入（「[reply] 注入临时风格」）、AI 味拦截与重试（「AI 味拦截」「仍命中…放行」）。
+
+## 主动发言（心跳）
+
+配置 `proactive` 段（整段可省略=关闭；见上文配置表）。补上决策层的最后一块：真人会潜水之后忽然接一句、对聊过的事回头关心——纯消息驱动的 CandyBot 不会。参照 MaiBot「心流」空闲循环的轻量版实现，核心原则是**复用现成护栏与队列，不另起一套发言通道**：主动发言与被动回复在群里无法区分来源。
+
+- **调度**（`heartbeat.py`）：每群在消息归一化入库处记一个 `last_inbound`（他人消息，一行记账）；**单个** asyncio 循环任务（每秒 tick 一次）服务所有群，为静默满窗的群排下一次到期时刻——窗口在 `[idle_min_seconds, idle_max_seconds]` 均匀随机，避免所有群同一秒齐声。到点把「空闲评估」作为特殊条目投进该群**现有的串行队列**：与真实消息同队列排队，天然消解「恰好同时来了新消息」的竞态，队列顺序保证不叠发。
+- **竞态检查**：出队执行时若该条目入队之后群里又有他人消息入库（空闲已终结），直接放弃本轮、从当下重新排程（DEBUG 日志），绝不拿旧上下文说话；judge 评估的 LLM 往返期间来了新消息同样作废本轮。评估失败记 WARNING 本轮作罢，**绝不重试轰炸**。
+- **护栏顺序（先省钱再花钱）**：每群当日上限 `max_per_group_per_day` 与全局日配额 `rate_limit.global_daily_limit` 在**调模型之前**检查，不过直接静默重排程；judge 说 speak 之后再过冷却 / 发言间隔 / 热闹三道结构性护栏（双保险——热闹时本不会空闲）。
+- **评估**（`ai.evaluate_proactive`，judge 角色，工具/文本双协议）：不照搬 0-10 分（那是另一个决策问题），输出二元 `{speak, intent}`：intent 一句话说明想表达什么，供生成用；解析歧义只认显式 `true`，一律宁可不说话。专用指令「现在是潜水时刻，没有人问你话……**默认保持沉默**，只有在明显自然、值得说的情况下才开口；绝不硬找话题、绝不开场白式自我介绍」。
+- **生成与发送**：复用现有 `generate_reply` 管线，只把 L4 指令层换成自发言变体（「【主动发言】没人问你话，你只是想主动说点什么：{intent}。用完全口语、≤2 句的说法，不要引用消息、不要@任何人……」，既有回复文本一字未动）；表达/黑话注入照常、按 `context_messages`（默认沿用该群 `context_size`）取上下文。生成的文本仍过 AI 味拦截与 `postprocess`（拆条/打字延迟/错别字全保留）逐条发送；成功后写回记忆（is_self）、刷新冷却/间隔/日配额——与被动回复共用同一段记账代码。**只有实际至少发出 1 条正文**才计每群当日上限并开启观察窗，一条都没发出退还配额、什么都不记，与既有规则对齐。
+- **退避**：实际发出后进入 `respond_reset_minutes` 的「有人接」观察窗——窗内有任何他人消息＝有人接/场子热了，退避倍数重置 ×1；窗内没人接，下轮空闲窗口 ×2，封顶 ×8：越没人理越安静。
+- **风险提示**：主动发言是行为风险最高的功能——它可能在不合适的时机说话。因此**默认关闭**、参数保守（仅当天活跃过的群、每群每日 ≤2、默认沉默、没人接话指数退避），且开关可热重载：`enabled` 改 false 保存立即停止全部待触发心跳。
+
+DEBUG 日志可见排程与决策（「群 %d 空闲评估排在 %.0f 秒后」「入队后来了新消息，放弃本轮」「空闲评估想主动发言：<intent>」「被护栏拦下」「主动发言完成（N 条）」）、观察窗与退避（「主动发言后有人接话，退避重置」「主动发言没人接，下轮空闲窗口退避为 ×N」）；INFO 可见心跳启停（「主动发言心跳已启动/已停止」）。
 
 ## 命令插件系统
 
@@ -309,6 +330,8 @@ async def hello(ctx):
 
 20. **人物记忆**：让某个群友在闲聊里自然透露稳定信息（「我大三了，在准备考研」「我超爱喝蜜雪冰城」），该群热缓存淘汰攒够一批后 DEBUG 出现「群 %d 人物事实学习候选」与「人物事实学习：处理 N 条」，`candy.db` 的 `person_fact` 表出现**非隐私、非玩笑**的自包含事实（挂在该 user_id 下）；此后 @ 他或引用他说话时的回复请求，DEBUG 的 L4 里出现「【人物画像-内部参考】关于 …：- …」与「群 %d L4 注入人物画像」行，隔几天再聊相关话题它能自然接住（如问候考得怎么样），但从不把画像原文逐字复读出来。跑几天后做歧义验证：故意让同群两个人用同一个昵称各说一句自我透露，DEBUG 应出现「人物事实昵称重名歧义，丢弃」且 `person_fact` 表不挂到任一人。想让遗忘可见：把 `person_fact_half_life_days` 改小（现读即生效），久未再提的事从 L4 里消失但表里的行仍在。把 `person_enabled` 改 false 保存 → 学习不再产出人物事实、L4 人物画像块整体消失，prompt 与开启本功能前逐字节一致。
 
+21. **主动发言（心跳）**：保持默认 `proactive.enabled: false` 启动 → 日志无「主动发言心跳已启动」行，行为与引入前完全一致。显式开启并把窗口调短实测：`{ enabled: true, idle_min_seconds: 60, idle_max_seconds: 120 }` 保存热重载 → INFO 出现「主动发言心跳已启动」；在群里聊几句让当天消息数过 `min_today_messages`，然后彻底安静 → 约 1~2 分钟后冒出一句贴合之前话题的短话（DEBUG 可见 `[proactive]` 评估请求带「【潜水时刻】」与 `submit_proactive`、生成请求 L4 带「【主动发言】没人问你话…≤2 句」；绝不应出现「大家好我是…」式开场白），日志「群 %d 主动发言完成」。没人理它 → DEBUG 出现「主动发言没人接，下轮空闲窗口退避为 ×2」（下次冒泡间隔明显变长，×2 递增封顶 ×8）；有人接话 → DEBUG「主动发言后有人接话，退避重置」。当天第 3 次到点 → DEBUG「今日主动发言已达上限，空闲评估不调模型」（DEBUG 无 `[proactive]` 请求）。把 `enabled` 改 false 保存 → INFO「主动发言心跳已停止（enabled=false，待触发窗口全部清空）」，立刻不再冒泡。
+
 ## 开发
 
 ```bash
@@ -331,4 +354,4 @@ uv run pytest -k names  # 单测命名过滤
 
 配置错误（非法级别名）会在启动时直接报错，便于及时发现。
 
-模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `migrations.py`(独立数据库迁移：补列+存量 is_command 回填；仅手动 `python -m candybot.migrations` 执行，启动只做兼容检查) · `events_server.py`(aiohttp 接收) · `snowluma.py`(HTTP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类/选图 prompt) · `ai.py`(LLM 角色：judge/reply/vision/learning + 表情包审核与 smart 选图 + 可选 embedding 向量化) · `learning.py`(后台学习：每日群印象/表达/黑话/人物长期记忆；表达选取支持加权随机与 embedding 语义检索两种模式；人物事实带衰减遗忘、语义近重合并与 L4 画像注入) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包：识别启发式+收藏审核/描述 meta+上限替换+随机/smart 跟发，图片引用方式 base64/http/file) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。
+模块速览：`models.py`(领域模型+配置校验+SSRF 校验) · `normalize.py`(OneBot→内部消息) · `memory.py`(群记忆：热缓存+生命周期+淘汰回调) · `heartbeat.py`(主动发言心跳调度：空闲窗口排程、评估条目入串行队列、退避观察窗) · `database.py`(SQLModel 表定义+candy.db 异步读写) · `migrations.py`(独立数据库迁移：补列+存量 is_command 回填；仅手动 `python -m candybot.migrations` 执行，启动只做兼容检查) · `events_server.py`(aiohttp 接收) · `snowluma.py`(HTTP 客户端) · `prompts.py`(KV Cache 分层提示词+学习类/选图 prompt) · `ai.py`(LLM 角色：judge/reply/vision/learning + 表情包审核与 smart 选图 + 可选 embedding 向量化) · `learning.py`(后台学习：每日群印象/表达/黑话/人物长期记忆；表达选取支持加权随机与 embedding 语义检索两种模式；人物事实带衰减遗忘、语义近重合并与 L4 画像注入) · `postprocess.py`(输出层拟人化：拆条/打字延迟/错别字/敷衍兜底) · `aiflavor.py`(AI 味正则检测) · `stickers.py`(表情包：识别启发式+收藏审核/描述 meta+上限替换+随机/smart 跟发，图片引用方式 base64/http/file) · `plugin_api.py`(命令插件 SDK：注册表/参数声明/插件目录加载) · `commandline.py`(unix 命令行风格解析：shlex 切词+argparse 校验+GNU 混排置换) · `builtin_plugins/`(内置命令插件：/help) · `plugins/`(用户插件目录，启动时扫描) · `bot.py`(编排)。

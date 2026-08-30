@@ -237,6 +237,26 @@
                                           // 对已入库的历史命令消息同样生效）
     },
 
+    // 主动发言心跳：某群静默满一个随机空闲窗口后「看一眼」，judge 模型二元
+    // 决定要不要主动说点什么（接住没人回的话头、回头关心聊过的事、分享被勾起
+    // 的联想），说则走与被动回复同一条生成/发送/记账链路，群里无法区分来源。
+    // 主动开口是行为风险最高的功能（可能在不合适的时机说话）：**默认关闭**，
+    // 必须显式开启；开启后仍受每群当日上限与全局日配额双重约束、默认沉默。
+    // 整段可省略（=关闭，调度器不创建任何任务，与现状零差异）。
+    "proactive": {
+        "enabled": false,                 // 总开关（现读：改 false 立即停止全部待触发心跳）
+        "idle_min_seconds": 600,          // 静默后醒来时刻的窗口下界（在 [min,max] 均匀随机）
+        "idle_max_seconds": 1800,         // 窗口上界；再乘退避倍数（见 respond_reset_minutes）
+        "only_active_today": true,        // 仅当天够活跃的群参与心跳（死群不冒泡）
+        "min_today_messages": 5,          // 上项门槛：当天他人消息条数下限
+        "max_per_group_per_day": 2,       // 每群每天主动发言上限（只计实际至少发出 1 条正文的
+                                          // 轮次；仍同时受 rate_limit.global_daily_limit 约束）
+        "respond_reset_minutes": 10,      // 发言后的「有人接」观察窗（分钟）：窗内有任何他人
+                                          // 消息＝场子热了，退避重置 ×1；没人接则下轮窗口 ×2、
+                                          // 封顶 ×8（越没人理越安静）
+        "context_messages": -1,           // 醒来看多少条上下文；-1=沿用该群 context_size
+    },
+
     "snowluma": {
         "endpoint": "http://127.0.0.1:3000/",   // OneBot v11 兼容 HTTP API 基址
         "api_key": "<Your API Key>",            // accessToken，作 Bearer token 鉴权

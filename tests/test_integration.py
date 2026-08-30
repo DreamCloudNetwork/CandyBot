@@ -13,7 +13,7 @@ from candybot.ai import JudgeVerdict, ReplyDraft
 from tests.test_models_settings import DictCfg
 
 
-def make_settings(tmp_path, generation_overrides: dict | None = None, *, post_process: dict | None = None):
+def make_settings(tmp_path, generation_overrides: dict | None = None, *, post_process: dict | None = None, proactive: dict | None = None, rate_limit: dict | None = None):
     cfg = {
         "bot": {"self_qq": 99, "data_dir": str(tmp_path / "data")},
         "groups": {
@@ -28,7 +28,7 @@ def make_settings(tmp_path, generation_overrides: dict | None = None, *, post_pr
         "models": {"judge": "j-model", "reply": "r-model"},
         "generation": dict(generation_overrides or {}),
         "multimodal": {},
-        "rate_limit": {},
+        "rate_limit": dict(rate_limit or {}),
         "snowluma": {
             "endpoint": "http://10.0.0.5:3000/",
             "allow_private_endpoint": True,
@@ -37,6 +37,9 @@ def make_settings(tmp_path, generation_overrides: dict | None = None, *, post_pr
         # 错别字等随机加工；后处理自身的编排用例见 test_bot_postprocess.py
         "response_post_process": dict(post_process or {"enabled": False}),
     }
+    # proactive 段缺省不写入（走默认关闭），与引入心跳前逐字节一致的解析路径
+    if proactive is not None:
+        cfg["proactive"] = dict(proactive)
     return load_settings(DictCfg(cfg))
 
 

@@ -593,6 +593,35 @@ class PluginSettings:
 
 
 @dataclass(frozen=True)
+class ProactiveSettings:
+    """主动发言心跳（任务 4，见 heartbeat.py / README「主动发言」）。
+
+    **默认关闭**：主动说话是行为风险最高的功能，必须用户显式开启——整段
+    省略或 enabled=false 时调度器不创建任何任务，程序行为与现状零差异。
+
+    idle_min_seconds / idle_max_seconds：该群静默后，在 [min, max] 均匀随机
+      取一个时刻醒来看一眼（再乘退避倍数，封顶 ×8）；
+    only_active_today / min_today_messages：仅当天有过 ≥N 条他人消息的群
+      参与心跳（死群不冒泡）；
+    max_per_group_per_day：每群每天主动发言上限（只计实际至少发出 1 条正文
+      的轮次；仍同时受 rate_limit.global_daily_limit 全局日配额约束）；
+    respond_reset_minutes：主动发言后 N 分钟内群里有任何他人消息＝「有人
+      接/场子热了」，退避倍数重置为 1；观察窗到点仍没人接，下轮空闲窗口
+      ×2，封顶 ×8；
+    context_messages：醒来看多少条上下文，-1=沿用该群 context_size。
+    """
+
+    enabled: bool = False
+    idle_min_seconds: float = 600.0
+    idle_max_seconds: float = 1800.0
+    only_active_today: bool = True
+    min_today_messages: int = 5
+    max_per_group_per_day: int = 2
+    respond_reset_minutes: float = 10.0
+    context_messages: int = -1
+
+
+@dataclass(frozen=True)
 class SnowlumaSettings:
     """SnowLuma OneBot HTTP API 连接参数（见 snowluma.py）。"""
 
@@ -625,6 +654,8 @@ class Settings:
     stickers: StickerSettings = StickerSettings()
     # plugins 段同样可整体省略（缺省即启用命令插件，目录为 plugins/）
     plugins: PluginSettings = PluginSettings()
+    # proactive 段同样可整体省略（缺省即关闭主动发言心跳，零行为差异）
+    proactive: ProactiveSettings = ProactiveSettings()
 
     def profile_for(self, group_id: int) -> GroupProfile | None:
         """严格白名单语义。
@@ -1320,6 +1351,64 @@ def load_settings(cfg: Any) -> Settings:
         timeout_seconds=plugin_timeout,
     )
 
+    # proactive 段可整体省略（缺省即关闭主动发言心跳，零行为差异）
+    proactive_cfg = _optional_section(cfg, "proactive")
+
+    def _parse_proactive_seconds(key: str, default: float) -> float:
+        value = _parse_float(proactive_cfg, key, default)
+        # 空闲窗口直接进排程加法与 rng.uniform：inf/nan/非正数都必须拒收
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"配置项 `proactive.{key}` 应为正有限数字，实际是 {value!r}"
+            )
+        return value
+
+    idle_min_seconds = _parse_proactive_seconds("idle_min_seconds", 600.0)
+    idle_max_seconds = _parse_proactive_seconds("idle_max_seconds", 1800.0)
+    if idle_min_seconds > idle_max_seconds:
+        raise ValueError(
+            f"配置项 `proactive.idle_min_seconds`（{idle_min_seconds}）不能大于 "
+            f"`proactive.idle_max_seconds`（{idle_max_seconds}）"
+        )
+    respond_reset_minutes = _parse_float(proactive_cfg, "respond_reset_minutes", 10.0)
+    # 观察窗喂给退避结算比较：inf/nan/负数会让观察窗永不结算或立刻结算
+    if not math.isfinite(respond_reset_minutes) or respond_reset_minutes < 0:
+        raise ValueError(
+            f"配置项 `proactive.respond_reset_minutes` 应为非负有限数字，"
+            f"实际是 {respond_reset_minutes!r}"
+        )
+    min_today_messages = _parse_int(proactive_cfg, "min_today_messages", 5)
+    if min_today_messages < 1:
+        raise ValueError(
+            f"配置项 `proactive.min_today_messages` 不能小于 1，"
+            f"实际是 {min_today_messages!r}"
+        )
+    max_per_group_per_day = _parse_int(proactive_cfg, "max_per_group_per_day", 2)
+    if max_per_group_per_day < 1:
+        raise ValueError(
+            f"配置项 `proactive.max_per_group_per_day` 不能小于 1"
+            f"（想彻底不主动冒泡请关 proactive.enabled），实际是 {max_per_group_per_day!r}"
+        )
+    context_messages = _parse_int(proactive_cfg, "context_messages", -1)
+    if context_messages != -1 and context_messages < 1:
+        raise ValueError(
+            "配置项 `proactive.context_messages` 只能为 -1（沿用该群 "
+            f"context_size）或正整数，实际是 {context_messages!r}"
+        )
+    proactive_settings = ProactiveSettings(
+        enabled=_parse_bool(proactive_cfg.get("enabled", False), "proactive.enabled"),
+        idle_min_seconds=idle_min_seconds,
+        idle_max_seconds=idle_max_seconds,
+        only_active_today=_parse_bool(
+            proactive_cfg.get("only_active_today", True),
+            "proactive.only_active_today",
+        ),
+        min_today_messages=min_today_messages,
+        max_per_group_per_day=max_per_group_per_day,
+        respond_reset_minutes=respond_reset_minutes,
+        context_messages=context_messages,
+    )
+
     return Settings(
         bot=BotSettings(
             self_qq=self_qq,
@@ -1344,6 +1433,7 @@ def load_settings(cfg: Any) -> Settings:
         learning=learning_settings,
         stickers=sticker_settings,
         plugins=plugin_settings,
+        proactive=proactive_settings,
     )
 
 

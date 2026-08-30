@@ -2,6 +2,9 @@
 learning（群印象/表达/黑话/人物事实等后台学习任务，未配置时继承 judge 的模型）、
 embedding（表达语义检索的文本向量化，可选角色，只走 /embeddings 接口）。
 
+judge 角色另兼任主动发言的空闲评估（evaluate_proactive，任务 4）：同一端点
+能力、同一工具协议降级开关，输出是二元 speak + intent 而非评分。
+
 每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
 上下文窗口与输出上限（见 models.ModelConfig）。learning 角色的后台学习任务
 一律走一次性纯文本调用（按提示词契约输出 JSON、从正文解析），不携带 tools、
@@ -45,6 +48,8 @@ from .prompts import (
     expression_learning_prompt,
     final_user_prompt_judge,
     final_user_prompt_judge_recheck,
+    final_user_prompt_proactive_judge,
+    final_user_prompt_proactive_reply,
     final_user_prompt_reconsider,
     final_user_prompt_reply,
     history_to_turns,
@@ -87,6 +92,18 @@ class JudgeVerdict:
     score: int
     reason: str
     to_me: bool = False  # 这条消息是否在对我说、延续与我相关的对话
+
+
+@dataclass(frozen=True)
+class ProactiveVerdict:
+    """空闲评估（任务 4）的输出：要不要主动说话、想表达什么。
+
+    这是与逐条打分不同的另一个决策问题，故不照搬 0-10 分：二元 + 一句话
+    理由（intent 供生成层使用）。speak 只认显式布尔 true，解析歧义一律
+    静默（宁可不说话）。"""
+
+    speak: bool
+    intent: str = ""
 
 
 @dataclass(frozen=True)
@@ -156,6 +173,29 @@ _JUDGE_TOOL = {
                 "reason": {"type": "string", "description": "一句话理由"},
             },
             "required": ["score", "to_me", "reason"],
+        },
+    },
+}
+
+# 主动发言空闲评估（任务 4）的工具：二元 speak + 一句话 intent，不照搬评分。
+_PROACTIVE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_proactive",
+        "description": "提交你在潜水时刻是否主动发言的决定。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "speak": {
+                    "type": "boolean",
+                    "description": "是否要主动发言；不确定或没有明显值得说的就填 false",
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "一句话说明你想主动表达什么；不说话时留空",
+                },
+            },
+            "required": ["speak", "intent"],
         },
     },
 }
@@ -683,6 +723,86 @@ class AIClient:
         raw = (response.choices[0].message.content or "").strip()
         return self._parse_verdict(raw)
 
+    async def evaluate_proactive(
+        self,
+        static_system: str,
+        runtime_system: str,
+        recent_records: list[ChatRecord],
+        now_text: str,
+    ) -> ProactiveVerdict:
+        """主动发言空闲评估（任务 4）：潜水时刻看一眼，要不要自己开口。
+
+        与逐条打分的 judge 是两个不同的决策问题，不复用 0-10 分：输出
+        二元 speak + 一句话 intent（供生成层照着说）。走 judge 角色的工具/
+        文本双协议与自动降级（同一端点能力，共用 `_tools_on["judge"]`）。
+        调用异常原样上抛（bot 层记 WARNING 本轮作罢、绝不重试轰炸）；输出
+        解析不出或 speak 非显式布尔 true 一律返回静默（宁可不说话）。
+        """
+        use_tools = self._tools_on["judge"]
+
+        def build_messages(via_tool: bool) -> list[Message]:
+            final_user = final_user_prompt_proactive_judge(now_text, via_tool=via_tool)
+            prompt_chars = len(static_system) + len(runtime_system) + len(final_user)
+            turns, _ = history_to_turns(
+                recent_records, self._history_chars(self._judge, prompt_chars)
+            )
+            return [
+                {"role": "system", "content": static_system},
+                {"role": "system", "content": runtime_system},
+                *[{"role": t.role, "content": t.content} for t in turns],
+                {"role": "user", "content": final_user},
+            ]
+
+        chat = build_messages(use_tools)
+        logger.debug(
+            "[proactive] model=%s 消息数=%d\n%s",
+            self._judge.model,
+            len(chat),
+            format_messages_for_log(chat),
+        )
+        request: dict = dict(
+            model=self._judge.model,
+            messages=chat,
+            temperature=self._generation.judge_temperature,
+            max_tokens=self._judge.max_output_tokens or _JUDGE_MAX_TOKENS,
+            timeout=self._generation.timeout_seconds,
+        )
+        if use_tools:
+            request.update(
+                _tool_request_kwargs(
+                    _PROACTIVE_TOOL, force=self._judge.forced_tool_choice
+                )
+            )
+        response, via_tools = await self._create_chat(
+            "judge", request, lambda: build_messages(False)
+        )
+        if via_tools:
+            if not _returned_tool_call(response):
+                self._disable_tools("judge", "响应中无工具调用")
+            else:
+                args = _tool_arguments(response, _PROACTIVE_TOOL["function"]["name"])
+                if args is not None:
+                    return self._proactive_from_args(args)
+        # 回退/纯文本协议：按契约从正文解析 JSON
+        raw = (response.choices[0].message.content or "").strip()
+        return self._parse_proactive(raw)
+
+    @staticmethod
+    def _proactive_from_args(args: dict) -> ProactiveVerdict:
+        # speak 只认布尔 true：脏数据、缺失一律静默（绝不误冒泡）
+        speak = args.get("speak") is True
+        intent = str(args.get("intent") or "").strip()[:100]
+        return ProactiveVerdict(speak=speak, intent=intent)
+
+    @staticmethod
+    def _parse_proactive(raw: str) -> ProactiveVerdict:
+        visible = _strip_think(raw)
+        obj = _extract_json(visible)
+        if isinstance(obj, dict):
+            return AIClient._proactive_from_args(obj)
+        logger.warning("主动发言评估输出无法解析，按静默处理：%r", raw[:200])
+        return ProactiveVerdict(speak=False)
+
     @staticmethod
     def _verdict_from_args(args: dict) -> JudgeVerdict:
         try:
@@ -721,7 +841,7 @@ class AIClient:
         static_system: str,
         runtime_system: str,
         recent_records: list[ChatRecord],
-        current_message: ChatRecord,
+        current_message: ChatRecord | None,
         now_text: str,
         *,
         forced: bool,
@@ -732,8 +852,15 @@ class AIClient:
         jargon_hints: Sequence[tuple[str, str]] = (),
         repetition_warning: bool = False,
         person_hints: Sequence[tuple[str, Sequence[str]]] = (),
+        proactive_intent: str | None = None,
     ) -> ReplyDraft | None:
         """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。
+
+        proactive_intent（任务 4 自发言）非 None 时走自发言变体：L4 换成
+        final_user_prompt_proactive_reply（没人问话、按 intent 主动开口），
+        历史层为传入的全部 recent_records（没有「当前消息」可剥离），
+        current_message 忽略。AI 味拦截、临时风格与 emoji 清洗照常。None
+        （常规回复）时输出与引入本参数之前逐字节一致。
 
         工具调用模式下经 send_reply 的强制调用拿到（正文, 图片操作）；纯文本
         协议下按旧约定解析正文（标记写在末尾）。返回 None 表示无话可说。
@@ -759,29 +886,43 @@ class AIClient:
         """
         temporary_style = self._pick_temporary_style()
         retry_notes: list[str] = []
+        # 自发言没有「当前消息」可剥离：整段 recent 都是历史层
+        history_records = recent_records if proactive_intent is not None else recent_records[:-1]
+        current_for_call = None if proactive_intent is not None else current_message
 
         def build_text_part(via_tool: bool) -> str:
-            text = final_user_prompt_reply(
-                now_text,
-                current_message,
-                forced=forced,
-                engaged=engaged,
-                score=score,
-                reason=reason,
-                via_tool=via_tool,
-                expression_hints=expression_hints,
-                jargon_hints=jargon_hints,
-                repetition_warning=repetition_warning,
-                temporary_style=temporary_style,
-                person_hints=person_hints,
-            )
+            if proactive_intent is not None:
+                text = final_user_prompt_proactive_reply(
+                    now_text,
+                    proactive_intent,
+                    via_tool=via_tool,
+                    expression_hints=expression_hints,
+                    jargon_hints=jargon_hints,
+                    temporary_style=temporary_style,
+                    person_hints=person_hints,
+                )
+            else:
+                text = final_user_prompt_reply(
+                    now_text,
+                    current_message,
+                    forced=forced,
+                    engaged=engaged,
+                    score=score,
+                    reason=reason,
+                    via_tool=via_tool,
+                    expression_hints=expression_hints,
+                    jargon_hints=jargon_hints,
+                    repetition_warning=repetition_warning,
+                    temporary_style=temporary_style,
+                    person_hints=person_hints,
+                )
             return "\n\n".join([text, *retry_notes]) if retry_notes else text
 
         draft = await self._reply_call(
             static_system,
             runtime_system,
-            recent_records[:-1],
-            current_message,
+            history_records,
+            current_for_call,
             build_text_part,
         )
         gen = self._generation
@@ -801,8 +942,8 @@ class AIClient:
                 draft = await self._reply_call(
                     static_system,
                     runtime_system,
-                    recent_records[:-1],
-                    current_message,
+                    history_records,
+                    current_for_call,
                     build_text_part,
                 )
                 violation = (

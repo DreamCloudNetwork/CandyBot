@@ -579,6 +579,80 @@ def final_user_prompt_reconsider(
     return "\n".join([*lines, tail])
 
 
+# ------------------------------------------------ 主动发言心跳（任务 4）的 L4
+
+def final_user_prompt_proactive_judge(
+    now_text: str, *, via_tool: bool = True
+) -> str:
+    """L4(judge·空闲评估)：潜水时刻要不要主动说点什么（二元判定 + 意图）。
+
+    与逐条打分的 judge 是两个不同的决策问题，故不复用评分体系：只问
+    speak/no，intent 一句话供生成层使用。「默认保持沉默」写进指令，配合
+    每日上限/冷却等代码侧护栏双保险。历史层照常由调用方传入。
+    """
+    lines = [
+        f"【当前时间】{now_text}",
+        "【潜水时刻】现在是潜水时刻，没有人问你话。基于最近聊天记录，"
+        "你想主动说点什么吗？可以：接住之前没人回的话头、对聊过的事回头关心、"
+        "分享被勾起的联想。\n"
+        "**默认保持沉默**，只有在明显自然、值得说的情况下才开口；"
+        "绝不硬找话题、绝不开场白式自我介绍。",
+    ]
+    if via_tool:
+        lines.append(
+            "评估完成后，调用 submit_proactive 工具提交结论，不要用普通文本作答："
+            "speak 表示是否要主动发言（不确定时填 false），intent 用一句话说明"
+            "想表达什么（不说话时留空）。"
+        )
+    else:
+        lines.append(
+            '只输出一个 JSON 对象，格式为 {"speak": true或false,'
+            ' "intent": "一句话说明想表达什么，不说话时留空"}，不要输出其他任何内容。'
+        )
+    return "\n".join(lines)
+
+
+def final_user_prompt_proactive_reply(
+    now_text: str,
+    intent: str,
+    *,
+    via_tool: bool = True,
+    expression_hints: Sequence[tuple[str, str]] = (),
+    jargon_hints: Sequence[tuple[str, str]] = (),
+    person_hints: Sequence[tuple[str, Sequence[str]]] = (),
+    temporary_style: str | None = None,
+) -> str:
+    """L4(reply·自发言)：没人问话、按 judge 给出的 intent 主动开口的指令层。
+
+    与 final_user_prompt_reply 并列的自发言变体（既有回复文本一字不动、
+    保持字节稳定）：不带「需要回应的消息」、不报评分，要求 ≤2 句、不引用
+    消息、不 @ 任何人。表达/黑话/画像/临时风格等注入与常规回复同款，
+    全部只进 L4。
+    """
+    parts = [
+        f"【当前时间】{now_text}\n"
+        f"【主动发言】没人问你话，你只是想主动说点什么：{intent.strip() or '（自由发挥，宁短勿长）'}。\n"
+        "用完全口语、≤2 句的说法，不要引用消息、不要@任何人，像想起什么一样自然开口。"
+    ]
+    if expression_hints:
+        parts.append(expression_hint_block(expression_hints))
+    if jargon_hints:
+        parts.append(jargon_hint_block(jargon_hints))
+    if person_hints:
+        parts.append(person_profile_block(person_hints))
+    style = (temporary_style or "").strip()
+    if style:
+        parts.append(temporary_style_block(style))
+    if via_tool:
+        parts.append(
+            "现在以你的身份自然开口说一句：调用 send_reply 工具提交，text 为"
+            "要发送到群里的正文（不要任何额外内容），drop_img / recall_img 参数省略。"
+        )
+    else:
+        parts.append("现在以你的身份自然开口说一句。只输出群聊正文，不要任何额外内容。")
+    return "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------- 组装
 
 def build_messages(
