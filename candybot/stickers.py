@@ -11,14 +11,17 @@ sticker_flags（与 record.images 下标对齐）把命中的图片存到
 
 发送：成功发出一段文字回复之后（bot._maybe_send_sticker），每条按
 stickers.send_probability（默认 0.05）掷点，命中且该群收藏非空时随机挑
-一张，以 OneBot v11 image 消息段（file:// 绝对路径 URI）跟发；不做模型
-选择（模型参与留作后续迭代）。发送成功后写回一条 is_self 的 ChatRecord
-占位「[表情包]」，让模型在历史里知道自己发过图——路径与 base64 都不进
-历史。
+一张，以 OneBot v11 image 消息段跟发；不做模型选择（模型参与留作后续
+迭代）。发送成功后写回一条 is_self 的 ChatRecord 占位「[表情包]」，让
+模型在历史里知道自己发过图——路径与 base64 都不进历史。
 
-限制：发送依赖 OneBot 服务端能读到本机表情包文件（SnowLuma 与 CandyBot
-同机或共享磁盘）；端点不支持时 image 段发送失败只记错误日志，收集与
-文字回复不受影响。
+图片怎么交给 OneBot 端由 stickers.send_mode 决定（见 image_segment）：
+base64（默认）把图片字节内嵌进请求，SnowLuma 与 CandyBot 不同机也能发；
+http 发 events_server 上注册的只读外链（`GET /stickers/<群号>/<指纹>`，
+文件名即内容指纹、无从枚举），基址 stickers.http_base_url 需对 SnowLuma
+可达；file 仍是本机绝对路径 URI，只在端点能读到本机磁盘（同机或共享
+磁盘）时可用。端点不支持时 image 段发送失败只记错误日志，收集与文字
+回复不受影响。
 """
 
 from __future__ import annotations
@@ -31,9 +34,15 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from urllib.parse import quote
 
 from .database import CandyDatabase, StickerEntry, image_fingerprint
-from .models import STICKER_SUMMARY_KEYWORDS_DEFAULT, ChatRecord, Settings
+from .models import (
+    STICKER_SUMMARY_KEYWORDS_DEFAULT,
+    ChatRecord,
+    Settings,
+    StickerSettings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +83,41 @@ _MIME_SUFFIXES = {
     "image/webp": ".webp",
     "image/bmp": ".bmp",
 }
+
+# 表情包文件的 HTTP 路由前缀，以及收藏命名规则的严格校验（群号纯数字 +
+# 内容指纹 64 位小写十六进制 + 已知图片后缀）：发送侧拼 URL 与事件服务
+# 供图侧共用同一套规则，指纹即访问凭证（无从枚举，也不接受任何越界路径）。
+STICKER_URL_PREFIX = "/stickers"
+_STICKER_GROUP_RE = re.compile(r"^\d{1,20}$")
+_STICKER_FILE_RE = re.compile(r"^[0-9a-f]{64}\.(?:png|jpg|gif|webp|bmp)$")
+# 反向映射供图用；剔除 image/jpg 别名（注册 MIME 只有 image/jpeg），
+# 否则同一个 .jpg 后缀会被别名覆盖成非标准的 MIME。
+_STICKER_CONTENT_TYPES = {
+    suffix: mime
+    for mime, suffix in _MIME_SUFFIXES.items()
+    if mime != "image/jpg"
+}
+
+
+def sticker_url(base_url: str, rel_path: str) -> str:
+    """HTTP 模式下表情包的外链：{基址}/stickers/{群号}/{指纹}.{ext}。"""
+    return f"{base_url.rstrip('/')}{STICKER_URL_PREFIX}/{quote(rel_path)}"
+
+
+def sticker_content_type(rel_path: str) -> str | None:
+    """按表情包文件后缀给 Content-Type；后缀不认识返回 None。"""
+    return _STICKER_CONTENT_TYPES.get(Path(rel_path).suffix.lower())
+
+
+def resolve_sticker_file(root: Path, group_part: str, name_part: str) -> Path | None:
+    """事件服务供图的路径解析：群号与文件名不合收藏命名规则返回 None。
+
+    只做命名校验（顺带排除 `..` 等越界写法），不检查文件是否存在。
+    """
+    if not _STICKER_GROUP_RE.match(group_part) or not _STICKER_FILE_RE.match(name_part):
+        return None
+    path = (root / group_part / name_part).resolve()
+    return path if path.is_relative_to(root.resolve()) else None
 
 
 def parse_data_url(data_url: str) -> tuple[str, bytes] | None:
@@ -268,9 +312,35 @@ class StickerStore:
         return rng.choice(entries)
 
     def image_segment(self, entry: StickerEntry) -> dict:
-        """OneBot v11 image 消息段：file 取表情包文件的 file:// 绝对 URI。"""
-        file_uri = self.absolute_path(entry).resolve().as_uri()
-        return {"type": "image", "data": {"file": file_uri}}
+        """OneBot v11 image 消息段：按 stickers.send_mode 引用图片。
+
+        - base64（默认）：`base64://<内嵌数据>`，图片字节随发送请求交给
+          SnowLuma，跨机也能发，代价是每次多传一份文件（表情包本身很小）；
+        - http：`{http_base_url}/stickers/<群号>/<指纹>.<ext>`，由本进程事件
+          服务的只读路由供图（见 events_server.EventsServer），基址需对
+          SnowLuma 可达；
+        - file：`file://` 绝对路径 URI，要求端点能读到本机磁盘（同机或共享
+          磁盘）。
+
+        读取失败（文件被外部删除等）原样上抛，由发送链路按辅助能力处理。
+        """
+        st = self._settings().stickers
+        return {"type": "image", "data": {"file": self.image_reference(entry, st)}}
+
+    def image_reference(self, entry: StickerEntry, st: StickerSettings) -> str:
+        """按 send_mode 生成 image 段的 file 字段值（见 image_segment）。"""
+        if st.send_mode == "http":
+            if not st.http_base_url:
+                # 配置校验会拦住这种组合；热重载窗口期按更稳的 base64 兜底
+                logger.warning(
+                    "stickers.send_mode=http 但未配 http_base_url，本次退回 base64"
+                )
+            else:
+                return sticker_url(st.http_base_url, entry.path)
+        if st.send_mode == "file":
+            return self.absolute_path(entry).resolve().as_uri()
+        data = self.absolute_path(entry).read_bytes()
+        return "base64://" + base64.b64encode(data).decode("ascii")
 
     async def mark_used(self, entry: StickerEntry) -> None:
         """发送成功后记账：使用数 +1、刷新最近使用时间（LRU 依据）。"""

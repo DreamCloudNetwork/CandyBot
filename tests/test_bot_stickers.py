@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import replace as dc_replace
 
 from candybot import bot as bot_module
@@ -23,7 +24,7 @@ from tests.test_integration import (
     make_settings,
     wait_until,
 )
-from tests.test_stickers import _record_with, png_url
+from tests.test_stickers import _record_with, png_bytes, png_url
 
 # wait_until 依赖真实 sleep 让出事件循环；打桩 sleep 之后必须仍交还控制权
 _REAL_SLEEP = asyncio.sleep
@@ -37,7 +38,7 @@ def _business_events(events: list) -> list:
 
 
 class FailingOnSegments(FakeSnowluma):
-    """模拟端点不支持本机 file:// 图片：段数组一律拒绝发送。"""
+    """模拟端点不支持 image 消息段：段数组一律拒绝发送。"""
 
     async def send_group_msg(self, group_id: int, message):
         if isinstance(message, list):
@@ -97,12 +98,12 @@ async def test_followup_send_and_placeholder_writeback(tmp_path, monkeypatch):
         gid, segments = bot._snowluma.sent[1]
         assert gid == 42
         assert segments[0]["type"] == "image"
-        file_uri = segments[0]["data"]["file"]
-        assert file_uri.startswith("file://")
-        # file:// URI 指向刚收藏的那个表情包文件（内容指纹命名）
-        entries = await bot._memory.db.load_stickers(42)
-        assert entries and entries[0].sha256 in file_uri
+        # 默认 base64 模式：图片字节内嵌在发送请求里，端点无需读本机文件
+        file_ref = segments[0]["data"]["file"]
+        assert file_ref.startswith("base64://")
+        assert base64.b64decode(file_ref[len("base64://") :]) == png_bytes(64, 64)
 
+        await _REAL_SLEEP(0.15)  # 占位写回在 image 段发出之后，让出事件循环等收尾
         # 写回：模型历史里留下 is_self 的占位，不含路径与 base64
         memory = await bot._memory.get(42)
         tail = memory.tail(10)
@@ -111,6 +112,30 @@ async def test_followup_send_and_placeholder_writeback(tmp_path, monkeypatch):
         # 使用统计记了一笔
         entries = await bot._memory.db.load_stickers(42)
         assert len(entries) == 1 and entries[0].use_count == 1
+    finally:
+        await bot.stop()
+
+
+async def test_followup_send_http_mode(tmp_path, monkeypatch):
+    """send_mode=http：image 段填事件服务的只读外链，跨机部署无需共享磁盘。"""
+    bot, _ = await _build(
+        tmp_path,
+        monkeypatch,
+        StickerSettings(
+            send_probability=1.0,
+            send_mode="http",
+            http_base_url="http://192.168.1.20:5700",
+        ),
+    )
+    try:
+        await _collect_one(bot)
+        await bot._on_event(group_event(1, "糖糖你好", at_me=True))
+        await wait_until(lambda: len(bot._snowluma.sent) == 2, timeout=3)
+        entries = await bot._memory.db.load_stickers(42)
+        assert (
+            bot._snowluma.sent[1][1][0]["data"]["file"]
+            == f"http://192.168.1.20:5700/stickers/42/{entries[0].sha256}.png"
+        )
     finally:
         await bot.stop()
 

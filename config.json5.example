@@ -174,8 +174,6 @@
 
     // 表情包（最小版）：识别收到的表情包类图片存入 data/stickers/，
     // 成功发送文字回复后按概率随机跟发一张。整段可省略（全部走默认值）。
-    // 注意：跟发用 OneBot v11 image 消息段（file:// 绝对路径），要求
-    // SnowLuma 与 CandyBot 同机或共享磁盘；端点不支持时仅记错误日志。
     "stickers": {
         "enabled": true,                  // 总开关（关掉既不收集也不跟发）
         "send_probability": 0.05,         // 每条文字回复后跟发一张的概率（0 关闭跟发）
@@ -184,6 +182,18 @@
         "summary_keywords": ["表情包", "梗图", "斗图", "动图", "meme"],
                                           // describe 模式总结文本的命中关键词（忽略大小写）；
                                           // 显式 [] 表示该启发式永不命中
+        "send_mode": "base64",            // 跟发时 image 段的图片引用方式：
+                                          //   base64 图片字节内嵌进发送请求（默认，跨机可发）
+                                          //   http   发本机事件服务的只读外链（需配 http_base_url）
+                                          //   file   file:// 本机绝对路径，要求 SnowLuma 与
+                                          //          CandyBot 同机或共享磁盘（引入 http/base64
+                                          //          之前的行为）
+                                          // 现读：改完热重载即对之后的跟发生效
+        "http_base_url": "",              // 仅 send_mode=http 用到：CandyBot 事件服务对
+                                          // SnowLuma 可达的基址，如 http://192.168.1.20:5700
+                                          // （可带反向代理路径前缀，但不能带查询串）。
+                                          // 只允许 http/https；内网地址放行——本进程从不请求
+                                          // 这个 URL，是 SnowLuma 侧来取图
     },
 
     // 命令插件：群里 / 开头且命令名命中注册表的消息不走大模型，按 unix

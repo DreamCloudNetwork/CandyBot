@@ -294,8 +294,9 @@ class CandyBot:
         self._snowluma = SnowlumaClient(settings.snowluma)
         # 表情包（任务 C 最小版）：收图时在 _on_event 收集，文字回复发送
         # 成功后按小概率跟发；配置经回调现取，热重载即时生效。
+        sticker_root = Path(settings.bot.data_dir) / "stickers"
         self._stickers = StickerStore(
-            Path(settings.bot.data_dir) / "stickers",
+            sticker_root,
             self._memory.db,
             lambda: self._settings,
         )
@@ -307,6 +308,9 @@ class CandyBot:
             port=settings.bot.listen_port,
             secret=settings.bot.event_secret,
             max_body_bytes=settings.bot.max_event_body_bytes,
+            # 表情包 HTTP 模式的供图路由（send_mode=base64/file 时用不到，
+            # 但挂载着不影响任何东西，热重载切到 http 即刻可发外链）
+            stickers_dir=sticker_root,
         )
         self._runtimes: dict[int, GroupRuntime] = defaultdict(GroupRuntime)
         # 队列元素为 (消息, 是否观望重评, 命令调用)：观望到点后把原消息
@@ -414,8 +418,9 @@ class CandyBot:
         即时生效）；热缓存容量也在
         启动时按全局最大 context_size 定死（新配置超出时记警告）。其余
         （白名单、人设与 bot.self_nickname、护栏阈值、模型与生成参数、
-        多模态、输出后处理、限速、图片保留天数、表情包识别启发式）
-        即时生效。
+        多模态、输出后处理、限速、图片保留天数、表情包识别启发式与跟发图片
+        引用方式 stickers.send_mode / http_base_url——供图路由在事件服务上
+        常驻挂载，切到 http 即刻可发外链）即时生效。
 
         解析失败（典型场景：配置写坏）完整记日志但不拖垮服务：沿用旧配置，
         下一次保存自动重试。返回是否实际完成了替换。
@@ -994,8 +999,8 @@ class CandyBot:
 
     async def _maybe_send_sticker(self, group_id: int, memory: GroupMemory) -> None:
         """表情包跟发（任务 C 最小版）：每条文字回复后独立掷点，命中且该群
-        收藏非空时随机抽一张，以 OneBot v11 image 消息段（file:// 绝对路径）
-        跟发；不做模型选择。
+        收藏非空时随机抽一张，以 OneBot v11 image 消息段跟发（图片引用方式
+        由 stickers.send_mode 决定，见 stickers.image_segment）；不做模型选择。
 
         发送成功后写回一条 is_self 的「[表情包]」占位记录，让模型在历史里
         知道自己发过图（路径与 base64 都不进历史）。任何失败（含 image 段

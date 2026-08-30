@@ -106,3 +106,98 @@ def test_handler_exception_still_204():
         await client.close()
 
     run(flow())
+
+
+# ------------------------------------------------- 表情包只读供图路由（http 模式）
+
+_SHA = "a" * 64
+
+
+def _make_sticker_client(tmp_path):
+    """挂上表情包目录的事件服务测试客户端；返回 (client, 根目录)。"""
+    root = tmp_path / "stickers"
+    (root / "42").mkdir(parents=True)
+    (root / "42" / f"{_SHA}.png").write_bytes(b"\x89PNG fake")
+
+    async def handler(event):  # pragma: no cover
+        raise AssertionError("供图不应触发事件回调")
+
+    server = EventsServer(
+        handler, host="127.0.0.1", port=0, stickers_dir=root
+    )
+    return TestClient(TestServer(server._make_app())), root
+
+
+def test_sticker_route_serves_file(tmp_path):
+    async def flow():
+        client, _ = _make_sticker_client(tmp_path)
+        await client.__aenter__()
+        resp = await client.get(f"/stickers/42/{_SHA}.png")
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "image/png"
+        # 文件名即内容指纹：允许长期缓存，外链被反复取图也不重传
+        assert "immutable" in resp.headers["Cache-Control"]
+        assert await resp.read() == b"\x89PNG fake"
+        await client.close()
+
+    run(flow())
+
+
+def test_sticker_route_rejects_non_fingerprint_names(tmp_path):
+    """只认收藏命名规则（纯数字群号 + 64 位小写十六进制指纹 + 已知图片后缀）。"""
+
+    async def flow():
+        client, _ = _make_sticker_client(tmp_path)
+        await client.__aenter__()
+        for bad in (
+            f"/stickers/42/{_SHA.upper()}.png",  # 大写十六进制
+            f"/stickers/42/{'b' * 63}.png",  # 指纹长度不足
+            f"/stickers/42/{_SHA}.exe",  # 后缀不认识
+            "/stickers/4a/" + _SHA + ".png",  # 群号非纯数字
+            f"/stickers/99/{_SHA}.png",  # 合法命名但该图不存在
+        ):
+            resp = await client.get(bad)
+            assert resp.status == 404, bad
+        await client.close()
+
+    run(flow())
+
+
+def test_sticker_route_not_registered_without_dir(tmp_path):
+    """没配表情包目录时压根没有这条路由（POST /onebot/event 不受影响）。"""
+
+    async def handler(event):
+        pass
+
+    async def flow():
+        client = await _make_app_client(handler).__aenter__()
+        resp = await client.get(f"/stickers/42/{_SHA}.png")
+        assert resp.status == 404
+        ok = await _post_event(client, {"post_type": "message"})
+        assert ok.status == 204
+        await client.close()
+
+    run(flow())
+
+
+def test_sticker_route_blocks_traversal(tmp_path):
+    """越界写法拿不到表情包目录之外的文件。"""
+
+    async def flow():
+        client, root = _make_sticker_client(tmp_path)
+        await client.__aenter__()
+        (tmp_path / "secret.txt").write_text("secret")
+        # 裸 `../` 会被 URL 规范化成路由之外的路径；编码后的 `%2F` 才会进到
+        # 路由里，由命名校验拦下
+        for bad in (
+            "/stickers/42/../../secret.txt",
+            "/stickers/42/..%2F..%2Fsecret.txt",
+            "/stickers/42/%2e%2e%2fsecret.txt",
+            "/stickers/42/secret.txt",
+        ):
+            resp = await client.get(bad)
+            assert resp.status == 404, bad
+        assert (root / "42" / f"{_SHA}.png").exists()
+        await client.close()
+
+    run(flow())

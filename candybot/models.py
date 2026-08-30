@@ -403,6 +403,12 @@ LAZY_REPLIES_DEFAULT = ("呃呃", "不晓得", "懒得说", "不知道", "emm")
 # 视觉模型总结里出现任一词（忽略大小写）即视为表情包类。
 STICKER_SUMMARY_KEYWORDS_DEFAULT = ("表情包", "梗图", "斗图", "动图", "meme")
 
+# 表情包跟发时 image 消息段的图片引用方式（stickers.send_mode，见 stickers.py）：
+# base64 内嵌图片字节（跨机可用，默认）、http 指回 CandyBot 事件服务的只读
+# URL、file 本机绝对路径 file:// URI（要求端点能读到本机磁盘）。
+STICKER_SEND_MODES = ("base64", "http", "file")
+STICKER_SEND_MODE_DEFAULT = "base64"
+
 # 多音字（如「银行」的行）的错字策略：word_reading 取词典词内读音照常替换；
 # skip 则多音字整体跳过、只替换单一读音的字。两种策略下读音无法确定的
 # 多音字（单独成词等）都绝不替换，避免产出读音对不上的「假同音」错字。
@@ -455,12 +461,22 @@ class StickerSettings:
     enabled：总开关（关掉既不收集也不跟发）；
     send_probability：成功发送一条文字回复后跟发一张表情包的概率；
     max_count：全局收藏上限（跨群合计），超限替换最久未使用的条目
-      （删除记录并删除图片文件）。
+      （删除记录并删除图片文件）；
+    send_mode：image 消息段里图片的引用方式（取值见 STICKER_SEND_MODES）
+      —— base64（默认）把图片字节内嵌进发送请求，SnowLuma 与 CandyBot 跨机
+      也能发；http 发 CandyBot 事件服务暴露的只读 URL（需配 http_base_url，
+      且该地址对 SnowLuma 可达）；file 走本机绝对路径 file:// URI，要求
+      SnowLuma 能读到 CandyBot 的磁盘（同机或共享磁盘）；
+    http_base_url：send_mode=http 时 CandyBot 事件服务对 SnowLuma 可达的基址
+      （如 http://192.168.1.10:5700，即 bot.listen_port），仅 send_mode=http
+      时被使用。
     """
 
     enabled: bool = True
     send_probability: float = 0.05
     max_count: int = 64
+    send_mode: str = STICKER_SEND_MODE_DEFAULT
+    http_base_url: str = ""
     # 识别启发式参数（原写死在 stickers.py，默认值=原字面量）：
     # placeholder 模式「尺寸小」启发式的边长上限（像素），较长边不超过才收集；
     max_side_px: int = 512
@@ -1081,12 +1097,25 @@ def load_settings(cfg: Any) -> Settings:
             "配置项 `stickers.summary_keywords` 应为非空字符串的列表"
             "（显式 [] 表示 describe 模式的关键词识别永不命中）"
         )
+    send_mode = _parse_str(
+        sticker_cfg, "send_mode", STICKER_SEND_MODE_DEFAULT
+    ).strip().lower()
+    if send_mode not in STICKER_SEND_MODES:
+        raise ValueError(
+            f"配置项 `stickers.send_mode` 应为 {' / '.join(STICKER_SEND_MODES)} "
+            f"之一，实际是 {send_mode!r}"
+        )
+    http_base_url = _parse_str(sticker_cfg, "http_base_url", "").strip()
+    if send_mode == "http":
+        validate_sticker_base_url(http_base_url)
     sticker_settings = StickerSettings(
         enabled=_parse_bool(sticker_cfg.get("enabled", True), "stickers.enabled"),
         send_probability=send_probability,
         max_count=sticker_max_count,
         max_side_px=max_side_px,
         summary_keywords=tuple(str(item).strip() for item in keywords_raw),
+        send_mode=send_mode,
+        http_base_url=http_base_url,
     )
 
     # plugins 段可整体省略（全部走默认值）
@@ -1292,4 +1321,29 @@ def validate_endpoint_url(url: str, *, allow_private: bool) -> None:
         raise ValueError(
             f"snowluma.endpoint 指向本地/私有地址 {hostname}；"
             "如确需连接内网实例，请把 snowluma.allow_private_endpoint 设为 true"
+        )
+
+
+def validate_sticker_base_url(url: str) -> None:
+    """校验 stickers.http_base_url（表情包 HTTP 模式的服务基址）。
+
+    只允许 http/https 且必须带 host。这里刻意不按 validate_request_url
+    拒绝内网地址：该 URL 由 CandyBot 拼进 image 消息段、由 SnowLuma 侧去
+    取图，CandyBot 自己从不请求它，而跨机部署下它通常就是局域网地址。
+    若将来要对本机可达性做探测（CandyBot 主动发请求），必须按
+    validate_request_url 那套规则重新校验后再发。
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"配置项 `stickers.http_base_url` 仅允许 http/https，"
+            f"实际 scheme 是 {parsed.scheme!r}"
+        )
+    if not parsed.hostname:
+        raise ValueError(
+            f"配置项 `stickers.http_base_url` 缺少 host：{url!r}"
+        )
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            f"配置项 `stickers.http_base_url` 不能带查询串或锚点，实际是 {url!r}"
         )

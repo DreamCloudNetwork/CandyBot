@@ -548,6 +548,9 @@ def test_style_flavor_sticker_defaults():
     assert st.enabled is True
     assert st.send_probability == 0.05
     assert st.max_count == 64
+    # 图片默认内嵌 base64：SnowLuma 与 CandyBot 不同机也能发表情包
+    assert st.send_mode == "base64"
+    assert st.http_base_url == ""
 
 
 def test_style_flavor_sticker_custom_values():
@@ -558,7 +561,13 @@ def test_style_flavor_sticker_custom_values():
             "ai_flavor_rules": ["哈哈"],
             "ai_flavor_retries": 0,
         },
-        stickers={"enabled": False, "send_probability": 0.5, "max_count": 10},
+        stickers={
+            "enabled": False,
+            "send_probability": 0.5,
+            "max_count": 10,
+            "send_mode": " http ",  # 自动 strip + 小写
+            "http_base_url": "http://192.168.1.20:5700",
+        },
     )
     s = load_settings(DictCfg(cfg))
     assert s.generation.multiple_reply_style == ("只回一个字", "用反问接话")  # 自动 strip
@@ -568,6 +577,8 @@ def test_style_flavor_sticker_custom_values():
     assert s.stickers.enabled is False
     assert s.stickers.send_probability == 0.5
     assert s.stickers.max_count == 10
+    assert s.stickers.send_mode == "http"
+    assert s.stickers.http_base_url == "http://192.168.1.20:5700"
 
     # 空列表是合法显式值：分别关闭风格注入与 AI 味检测
     cfg2 = base_cfg(generation={"multiple_reply_style": [], "ai_flavor_rules": []})
@@ -593,9 +604,36 @@ def test_style_flavor_sticker_validation_errors():
         ({"max_count": 0}, "max_count"),
         ({"max_count": -5}, "max_count"),
         ({"enabled": "yes"}, "stickers.enabled"),
+        ({"send_mode": "cq"}, "send_mode"),
+        ({"send_mode": 42}, "send_mode"),
+        # http 模式必须给出对 SnowLuma 可达的基址，且只能是 http/https
+        ({"send_mode": "http"}, "http_base_url"),
+        ({"send_mode": "http", "http_base_url": "  "}, "http_base_url"),
+        ({"send_mode": "http", "http_base_url": "ftp://h:21"}, "http/https"),
+        ({"send_mode": "http", "http_base_url": "http://"}, "缺少 host"),
+        ({"send_mode": "http", "http_base_url": "//h:5700"}, "http/https"),
+        (
+            {"send_mode": "http", "http_base_url": "http://h:5700/?token=x"},
+            "不能带查询串",
+        ),
+        # file / base64 模式不看 http_base_url，写了垃圾值也不拦（用不上）
     ]:
         with pytest.raises(ValueError, match=frag):
             load_settings(DictCfg(base_cfg(stickers=bad_st)))
+
+
+def test_sticker_send_mode_allows_private_base_url():
+    """跨机部署的局域网基址合法：本进程从不请求这个 URL，是 SnowLuma 侧取图。"""
+    for url in (
+        "http://192.168.1.20:5700",
+        "http://10.0.0.5:5700/",
+        "http://localhost:5700",
+        "https://bot.internal/candy",
+    ):
+        s = load_settings(
+            DictCfg(base_cfg(stickers={"send_mode": "http", "http_base_url": url}))
+        )
+        assert s.stickers.http_base_url == url
 
 
 # ------------------------------------------------------ 提取自硬编码值的可配置参数

@@ -1,4 +1,5 @@
-"""任务 C（表情包最小版）：识别启发式、StickerStore 收集与上限替换、normalize 判定。
+"""任务 C（表情包最小版）：识别启发式、StickerStore 收集与上限替换、图片引用
+方式（send_mode 三种取值与供图路由的命名校验）、normalize 判定。
 
 不发真实网络请求：下载环节直接 monkeypatch 掉，数据库用 tmp_path 真库。
 """
@@ -18,6 +19,9 @@ from candybot.stickers import (
     is_small_image,
     is_sticker_by_summary,
     parse_data_url,
+    resolve_sticker_file,
+    sticker_content_type,
+    sticker_url,
 )
 import candybot.normalize as norm_mod
 from tests.deterministic_rng import SeededRng
@@ -319,11 +323,70 @@ async def test_pick_and_image_segment(tmp_path):
     assert entry is not None
     segment = store.image_segment(entry)
     assert segment["type"] == "image"
+    # 默认 base64 模式：图片字节内嵌，端点无需能读到本机文件
     file_value = segment["data"]["file"]
-    assert file_value.startswith("file://")
-    assert entry.sha256 in file_value  # 内容指纹命名的绝对路径
+    assert file_value.startswith("base64://")
+    assert base64.b64decode(file_value[len("base64://") :]) == png_bytes(64, 64)
     assert await store.pick_for_send(999, rng) is None  # 别群收藏不共享
     await _db.close()
+
+
+async def test_image_segment_send_modes(tmp_path):
+    """send_mode 三种取值各自的 file 字段：跨机（base64/http）与同机（file）。"""
+    store, db = await _make_store(tmp_path)
+    await store.collect(_record_with(png_url(64), ts=100.0), (True,))
+    (entry,) = await db.load_stickers(42)
+
+    ref = store.image_reference(entry, StickerSettings(send_mode="file"))
+    assert ref.startswith("file://") and entry.sha256 in ref
+
+    http_mode = StickerSettings(send_mode="http", http_base_url="http://10.0.0.5:5700/")
+    assert (
+        store.image_reference(entry, http_mode)
+        == f"http://10.0.0.5:5700/stickers/42/{entry.sha256}.png"
+    )
+    # 基址带反向代理路径前缀也能对上
+    proxy = StickerSettings(send_mode="http", http_base_url="http://bot.example/candy")
+    assert (
+        store.image_reference(entry, proxy)
+        == f"http://bot.example/candy/stickers/42/{entry.sha256}.png"
+    )
+
+    # http 模式漏配基址：退回 base64（配置校验会拦住这种组合，这里是兜底）
+    broken = StickerSettings(send_mode="http", http_base_url="")
+    assert store.image_reference(entry, broken).startswith("base64://")
+
+    # 默认模式随配置而变：image_segment 每次都现取 settings
+    store._settings = lambda: SimpleNamespace(  # type: ignore[assignment]
+        stickers=StickerSettings(send_mode="file")
+    )
+    assert store.image_segment(entry)["data"]["file"].startswith("file://")
+    await db.close()
+
+
+async def test_sticker_url_and_path_validation(tmp_path):
+    """外链拼接与供图路由共用的命名校验：越界写法一律拒绝。"""
+    assert sticker_url("http://h:5700", "42/" + "a" * 64 + ".png") == (
+        "http://h:5700/stickers/42/" + "a" * 64 + ".png"
+    )
+    assert sticker_content_type("42/x.png") == "image/png"
+    assert sticker_content_type("42/x.jpg") == "image/jpeg"
+    assert sticker_content_type("42/x.txt") is None
+
+    root = tmp_path / "stickers"
+    good = root / "42" / ("a" * 64 + ".png")
+    good.parent.mkdir(parents=True)
+    good.write_bytes(b"x")
+    assert resolve_sticker_file(root, "42", "a" * 64 + ".png") == good.resolve()
+    # 非纯数字群号、非指纹命名、任何越界写法：全部拒绝
+    assert resolve_sticker_file(root, "4a", "a" * 64 + ".png") is None
+    assert resolve_sticker_file(root, "42", "..%2f..%2fetc.png") is None
+    assert resolve_sticker_file(root, "42", "A" * 64 + ".png") is None  # 大写不算指纹
+    assert resolve_sticker_file(root, "42", "a" * 63 + ".png") is None
+    assert resolve_sticker_file(root, "42", "a" * 64 + ".exe") is None
+    assert resolve_sticker_file(root, "../../etc", "passwd") is None
+    # 校验只认命名，文件不存在也返回路径（由调用方判 404）
+    assert resolve_sticker_file(root, "7", "b" * 64 + ".gif") is not None
 
 
 async def test_mark_used_counts(tmp_path):
