@@ -3,14 +3,15 @@ learning（群印象/表达/黑话等后台学习任务，未配置时继承 jud
 embedding（表达语义检索的文本向量化，可选角色，只走 /embeddings 接口）。
 
 每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
-上下文窗口与输出上限（见 models.ModelConfig）。learning 角色一律走一次性
-纯文本调用（按提示词契约输出 JSON、从正文解析），不携带 tools、也不参与
-judge/reply 的分层前缀缓存。embedding 角色只在配置了 models.embedding 时
-可用（AIClient.embed）；未配置即抛错，调用方（learning.py）按失败记
-WARNING 并降级，绝不静默掩盖。
+上下文窗口与输出上限（见 models.ModelConfig）。learning 角色的后台学习任务
+一律走一次性纯文本调用（按提示词契约输出 JSON、从正文解析），不携带 tools、
+也不参与 judge/reply 的分层前缀缓存；唯一例外是 smart 跟发选图（pick_sticker），
+它同步等待在决策链路里，按「强制工具调用 + 自动降级纯文本」的通用模式走。
+embedding 角色只在配置了 models.embedding 时可用（AIClient.embed）；未配置
+即抛错，调用方（learning.py）按失败记 WARNING 并降级，绝不静默掩盖。
 
-判定、回复与图片入库评估默认通过强制工具调用（tool_choice 指定函数）获得
-结构化结果；models.<role>.forced_tool_choice=false 的角色改用 tool_choice=
+判定、回复、图片入库评估与表情包审核/选图默认通过强制工具调用（tool_choice
+指定函数）获得结构化结果；models.<role>.forced_tool_choice=false 的角色改用 tool_choice=
 "auto"（思考模式不支持 required 强制指定的模型，如 qwen3 系列），仍走工具
 协议。models.<role>.tool_use=false 的角色改走纯文本协议——提示词
 要求在正文输出 JSON / 末尾标记，请求不携带 tools 参数。运行中若端点报
@@ -22,6 +23,7 @@ WARNING 并降级，绝不静默掩盖。
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -52,6 +54,7 @@ from .prompts import (
     jargon_inference_alone_prompt,
     jargon_inference_with_context_prompt,
     reply_history_turns,
+    sticker_pick_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,13 +88,31 @@ class JudgeVerdict:
 
 
 @dataclass(frozen=True)
+class StickerAssessment:
+    """表情包收藏的 vision 审核输出（任务 2）：是否适合收藏 + 描述 + 情绪标签。
+
+    acceptable=false 时 description 由提示词约定为拒绝理由（DEBUG 日志带出），
+    emotion 可能为空串。描述与情绪供 sticker_meta 表入库、smart 模式选图。"""
+
+    acceptable: bool
+    description: str
+    emotion: str
+
+
+@dataclass(frozen=True)
 class ImageAssessment:
     """收图入库时视觉模型的判定：总结文本 + 是否继续向模型展示原图 +
-    是否为表情包类（供 stickers 收集，见 normalize / stickers）。"""
+    是否为表情包类（供 stickers 收集，见 normalize / stickers）。
+
+    sticker_assessment 为表情包收藏审核结论（描述 + 情绪 + 是否可收藏），
+    只在 assess_image 被要求合并产出（want_sticker_meta=True，即
+    stickers.moderation_enabled 开启的 direct 模式收图）且模型给出了
+    可用结论时非 None；与图片记忆管理（summary/keep）各自开关独立。"""
 
     summary: str | None
     keep_raw: bool
     is_sticker: bool = False
+    sticker_assessment: StickerAssessment | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +202,91 @@ _ASSESS_TOOL = {
                 },
             },
             "required": ["summary", "keep", "sticker"],
+        },
+    },
+}
+
+# 收藏审核开启（stickers.moderation_enabled）时，direct 模式收图的入库评估
+# 与表情包审核合并为一次 vision 调用：submit_assessment 追加三个表情包字段
+# （非必填——只有判为表情包类才需要给出），避免对同一张图重复请求 vision。
+_STICKER_MODERATION_FIELDS = {
+    "acceptable": {
+        "type": "boolean",
+        "description": "该表情包是否适合收藏作斗图（审核标准见提示词）",
+    },
+    "sticker_description": {
+        "type": "string",
+        "description": "不超过40字中立具体地描述图里在干什么；acceptable=false 时写拒绝理由",
+    },
+    "emotion": {
+        "type": "string",
+        "description": "情绪标签，如 得意/无语/狂喜/阴阳怪气/卖萌",
+    },
+}
+
+
+def _assess_tool(want_sticker_meta: bool) -> dict:
+    """按是否合并表情包审核选 submit_assessment 的参数表。"""
+    if not want_sticker_meta:
+        return _ASSESS_TOOL
+    tool = copy.deepcopy(_ASSESS_TOOL)
+    tool["function"]["parameters"]["properties"].update(_STICKER_MODERATION_FIELDS)
+    return tool
+
+
+# 表情包审核标准与描述要求（assess_sticker 与合并调用的提示词共用）。
+_STICKER_MODERATION_RULES = (
+    "表情包不得含色情、暴力、政治敏感内容；不得是真人照片、游戏/网页截图、"
+    "二维码或广告图；画面文字过多（超过 5 个汉字的大段文字图）不算表情包。"
+    "描述须中立具体（如「柴犬歪头疑惑」，不要「一张可爱的图」），"
+    "不超过 40 字、说明图里在干什么；acceptable=false 时改写拒绝理由；"
+    "情绪标签如 得意/无语/狂喜/阴阳怪气/卖萌，不限于这些例子。"
+)
+
+# 独立审核调用（placeholder 等模式下 stickers.py 收集路径）用的工具。
+_STICKER_ASSESS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_sticker_assessment",
+        "description": "提交表情包收藏审核：是否适合收藏、内容描述、情绪标签。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "acceptable": {
+                    "type": "boolean",
+                    "description": "是否适合收藏作斗图（审核标准见提示词）",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "不超过40字中立具体地描述图里在干什么；acceptable=false 时写拒绝理由",
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "情绪标签，如 得意/无语/狂喜/阴阳怪气/卖萌",
+                },
+            },
+            "required": ["acceptable", "description", "emotion"],
+        },
+    },
+}
+
+# smart 跟发选图（learning 角色）用的工具：pick=0 表示模型选择不发。
+_STICKER_PICK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_sticker_pick",
+        "description": "提交表情包选图结论：候选编号（0＝不发）与一句话理由。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pick": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "选中的候选编号；0 表示本次不发表情包",
+                },
+                "reason": {"type": "string", "description": "一句话理由"},
+            },
+            "required": ["pick", "reason"],
         },
     },
 }
@@ -367,10 +473,13 @@ class AIClient:
         self._clients: dict[tuple[str, str], AsyncOpenAI] = {}
         # 每个角色当前是否走工具调用协议：初值来自模型配置，运行中遇端点
         # 不支持（报错或忽略 tools）时降级为 False，本进程内不再回升。
+        # sticker_pick 是借用 learning 模型配置（_cfg_for）的独立协议开关：
+        # smart 选图走工具调用，其余学习任务照旧纯文本，降级互不影响。
         self._tools_on: dict[str, bool] = {
             "judge": models.judge.tool_use,
             "reply": models.reply.tool_use,
             "vision": models.vision.tool_use if models.vision else False,
+            "sticker_pick": self._learning.tool_use,
         }
 
     @property
@@ -402,6 +511,8 @@ class AIClient:
             "reply": self._reply,
             "vision": self._vision,
             "learning": self._learning,
+            # smart 选图借用 learning 角色的模型配置（协议开关独立）
+            "sticker_pick": self._learning,
         }[role]
 
     def _client_for(self, cfg: ModelConfig) -> AsyncOpenAI:
@@ -880,44 +991,69 @@ class AIClient:
         desc = (response.choices[0].message.content or "").strip()
         return desc or None
 
-    async def assess_image(self, data_url: str) -> ImageAssessment:
+    async def assess_image(
+        self, data_url: str, *, want_sticker_meta: bool = False
+    ) -> ImageAssessment:
         """视觉模型一次性完成「总结 + 是否值得长期保留原图」的入库判定。
 
         未配置 vision 模型或调用/解析失败时安全侧返回保留原图：宁可
         多花些 token 也不凭空丢信息，后续仍可通过 <drop_img> 标记降级。
+
+        want_sticker_meta=True 时在同一次调用里追加表情包收藏审核输出
+        （acceptable/description/emotion，仅当判为表情包类才需要给出），
+        供 direct 模式收集免二次请求 vision；结论放在 sticker_assessment 字段。
         """
         if not self._vision:
             return ImageAssessment(summary=None, keep_raw=True)
         use_tools = self._tools_on["vision"]
+        tool = _assess_tool(want_sticker_meta)
         logger.debug(
-            "[vision·assess] model=%s 图片 %d 字符",
+            "[vision·assess] model=%s 图片 %d 字符%s",
             self._vision.model,
             len(data_url),
+            "（含表情包审核）" if want_sticker_meta else "",
         )
 
         def messages(via_tool: bool) -> list[Message]:
+            text = (
+                "这是一张群聊里发来的图片。请先用不超过40个字总结它的内容要点，"
+                "再判断后续对话是否还需要继续查看这张原图：只有当图片包含未来"
+                "可能被反复引用的具体信息（文字截图、代码、表格、关键画面细节等）"
+                "才值得保留原图；表情包、梗图之类的总结即可。最后判断它是不是"
+                "「表情包类」图片：以玩梗、表达情绪为目的的斗图表情、梗图、"
+                "搞笑动图都算；截图、照片、信息图不算。\n"
+            )
+            if want_sticker_meta:
+                text += (
+                    "若判定为表情包类（sticker=true），还要给出三个字段："
+                    "acceptable 表示该图是否适合收藏作斗图，"
+                    "sticker_description 用不超过40字中立具体地描述图里在干什么"
+                    "（acceptable=false 时改写拒绝理由），emotion 给一个情绪标签。"
+                    "审核标准与描述要求：" + _STICKER_MODERATION_RULES + "\n"
+                )
+            if via_tool:
+                text += (
+                    "完成后调用 submit_assessment 工具提交：summary 为一句话总结，"
+                    "keep 表示后续对话是否还需要查看原图，sticker 表示是否为表情包类。"
+                )
+                if want_sticker_meta:
+                    text += (
+                        "sticker=true 时另附 acceptable、sticker_description 与 emotion。"
+                    )
+            else:
+                text += '只输出一个 JSON 对象：{"summary": "一句话总结",'
+                text += ' "keep": true 或 false, "sticker": true 或 false'
+                if want_sticker_meta:
+                    text += (
+                        '，sticker 为 true 时另附 "acceptable": true 或 false,'
+                        ' "sticker_description": "…", "emotion": "…"'
+                    )
+                text += "}"
             return [
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "这是一张群聊里发来的图片。请先用不超过40个字总结它的内容要点，"
-                                "再判断后续对话是否还需要继续查看这张原图：只有当图片包含未来"
-                                "可能被反复引用的具体信息（文字截图、代码、表格、关键画面细节等）"
-                                "才值得保留原图；表情包、梗图之类的总结即可。最后判断它是不是"
-                                "「表情包类」图片：以玩梗、表达情绪为目的的斗图表情、梗图、"
-                                "搞笑动图都算；截图、照片、信息图不算。\n"
-                                + (
-                                    "完成后调用 submit_assessment 工具提交：summary 为一句话总结，"
-                                    "keep 表示后续对话是否还需要查看原图，sticker 表示是否为表情包类。"
-                                    if via_tool
-                                    else '只输出一个 JSON 对象：{"summary": "一句话总结",'
-                                    ' "keep": true 或 false, "sticker": true 或 false}'
-                                )
-                            ),
-                        },
+                        {"type": "text", "text": text},
                         {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 }
@@ -932,7 +1068,7 @@ class AIClient:
         )
         if use_tools:
             request.update(
-                _tool_request_kwargs(_ASSESS_TOOL, force=self._vision.forced_tool_choice)
+                _tool_request_kwargs(tool, force=self._vision.forced_tool_choice)
             )
         response, via_tools = await self._create_chat(
             "vision", request, lambda: messages(False)
@@ -942,27 +1078,35 @@ class AIClient:
                 # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
                 self._disable_tools("vision", "响应中无工具调用")
             else:
-                args = _tool_arguments(response, _ASSESS_TOOL["function"]["name"])
+                args = _tool_arguments(response, tool["function"]["name"])
                 if args is not None:
-                    return self._assessment_from_args(args)
+                    return self._assessment_from_args(args, want_sticker_meta)
         # 回退/纯文本协议：按旧约定从正文解析
         raw = (response.choices[0].message.content or "").strip()
-        return self._parse_assessment(raw)
+        return self._parse_assessment(raw, want_sticker_meta)
 
     @staticmethod
-    def _assessment_from_args(args: dict) -> ImageAssessment:
+    def _assessment_from_args(
+        args: dict, want_sticker_meta: bool = False
+    ) -> ImageAssessment:
         summary = args.get("summary")
         summary = str(summary).strip()[:200] if isinstance(summary, str) else None
+        is_sticker = args.get("sticker") is True
         # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图；
         # sticker 反过来只认显式 true：歧义一律不收集表情包
         return ImageAssessment(
             summary=summary or None,
             keep_raw=args.get("keep") is not False,
-            is_sticker=args.get("sticker") is True,
+            is_sticker=is_sticker,
+            sticker_assessment=(
+                _sticker_assessment_from_args(args, "sticker_description")
+                if want_sticker_meta and is_sticker
+                else None
+            ),
         )
 
     @staticmethod
-    def _parse_assessment(raw: str) -> ImageAssessment:
+    def _parse_assessment(raw: str, want_sticker_meta: bool = False) -> ImageAssessment:
         visible = _strip_think(raw)
         match = _ASSESS_RE.search(visible)
         if match:
@@ -973,15 +1117,179 @@ class AIClient:
             if isinstance(obj, dict):
                 summary = obj.get("summary")
                 summary = str(summary).strip()[:200] if isinstance(summary, str) else None
+                is_sticker = obj.get("sticker") is True
                 # keep 只认显式 false 为放弃展示：解析歧义一律保守保留原图；
                 # sticker 只认显式 true：歧义一律不收集
                 return ImageAssessment(
                     summary=summary or None,
                     keep_raw=obj.get("keep") is not False,
-                    is_sticker=obj.get("sticker") is True,
+                    is_sticker=is_sticker,
+                    sticker_assessment=(
+                        _sticker_assessment_from_args(obj, "sticker_description")
+                        if want_sticker_meta and is_sticker
+                        else None
+                    ),
                 )
         logger.warning("图片入库评估输出无法解析：%r", raw[:200])
         return ImageAssessment(summary=None, keep_raw=True)
+
+    async def assess_sticker(self, data_url: str) -> StickerAssessment | None:
+        """表情包收藏审核（任务 2）：一次 vision 调用产出「可否收藏 + 描述 + 情绪」。
+
+        用于收集路径上没有现成入库评估可合并的场合（placeholder/describe
+        模式）。未配置 vision 模型返回 None（收集侧维持现状、无 meta）；
+        网络/端点异常原样上抛，由收集链路记 WARNING 后同样退回无 meta 收藏；
+        输出无法解析时记 WARNING 返回 None。
+        """
+        if not self._vision:
+            return None
+        use_tools = self._tools_on["vision"]
+        logger.debug(
+            "[vision·sticker-assess] model=%s 图片 %d 字符",
+            self._vision.model,
+            len(data_url),
+        )
+
+        def messages(via_tool: bool) -> list[Message]:
+            text = (
+                "这是一张群聊里的表情包候选图。请审核它是否适合收藏作斗图用途，"
+                "并给出内容与情绪描述。审核标准与描述要求："
+                + _STICKER_MODERATION_RULES
+                + "\n"
+            )
+            if via_tool:
+                text += "完成后调用 submit_sticker_assessment 工具提交。"
+            else:
+                text += (
+                    '只输出一个 JSON 对象：{"acceptable": true 或 false,'
+                    ' "description": "…", "emotion": "…"}'
+                )
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ]
+
+        request: dict = dict(
+            model=self._vision.model,
+            messages=messages(use_tools),
+            temperature=self._generation.assess_temperature,
+            max_tokens=self._vision.max_output_tokens or _ASSESS_MAX_TOKENS,
+            timeout=self._generation.timeout_seconds,
+        )
+        if use_tools:
+            request.update(
+                _tool_request_kwargs(
+                    _STICKER_ASSESS_TOOL, force=self._vision.forced_tool_choice
+                )
+            )
+        response, via_tools = await self._create_chat(
+            "vision", request, lambda: messages(False)
+        )
+        if via_tools:
+            if not _returned_tool_call(response):
+                # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
+                self._disable_tools("vision", "响应中无工具调用")
+            else:
+                args = _tool_arguments(response, _STICKER_ASSESS_TOOL["function"]["name"])
+                if args is not None:
+                    assessment = _sticker_assessment_from_args(args, "description")
+                    if assessment is not None:
+                        return assessment
+                    logger.warning("表情包审核输出缺少可用结论：%r", args)
+                    return None
+        # 回退/纯文本协议：按旧约定从正文解析
+        raw = (response.choices[0].message.content or "").strip()
+        match = _ASSESS_RE.search(_strip_think(raw))
+        obj = None
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                obj = _sticker_assessment_from_args(parsed, "description")
+        if obj is None:
+            logger.warning("表情包审核输出无法解析：%r", raw[:200])
+        return obj
+
+    async def pick_sticker(
+        self, context_text: str, candidates: Sequence[tuple[str, str]]
+    ) -> tuple[int | None, str]:
+        """smart 跟发选图（learning 角色）：按当前语境从候选里挑一张，可以不发。
+
+        candidates 为 (描述, 情绪) 列表，提示词里从 1 编号；返回
+        （0 基候选下标, 一句话理由），下标 None＝模型明确选择不发。
+        调用异常、输出解析不出、编号越界一律抛 ValueError——调用方
+        （stickers.StickerStore）统一按「选图失败」退回随机抽选，必须与
+        模型显式作罢区分开，绝不能把解析歧义当成「不发」。
+        """
+        use_tools = self._tools_on["sticker_pick"]
+        cfg = self._learning
+        entries = "\n".join(
+            f"{number}. {description}【{emotion}】" if emotion else f"{number}. {description}"
+            for number, (description, emotion) in enumerate(candidates, start=1)
+        )
+        logger.debug(
+            "[sticker-pick] model=%s 候选 %d 张", cfg.model, len(candidates)
+        )
+
+        def messages(via_tool: bool) -> list[Message]:
+            return [
+                {
+                    "role": "user",
+                    "content": sticker_pick_prompt(
+                        context_text, entries, via_tool=via_tool
+                    ),
+                }
+            ]
+
+        request: dict = dict(
+            model=cfg.model,
+            messages=messages(use_tools),
+            temperature=self._generation.learning_temperature,
+            max_tokens=cfg.max_output_tokens or _REVIEW_MAX_TOKENS,
+            timeout=self._generation.timeout_seconds,
+        )
+        if use_tools:
+            request.update(_tool_request_kwargs(_STICKER_PICK_TOOL, force=cfg.forced_tool_choice))
+        response, via_tools = await self._create_chat(
+            "sticker_pick", request, lambda: messages(False)
+        )
+        if via_tools:
+            if not _returned_tool_call(response):
+                # 端点没报错但也没调用工具：多半整个忽略了 tools 参数
+                self._disable_tools("sticker_pick", "响应中无工具调用")
+            else:
+                args = _tool_arguments(response, _STICKER_PICK_TOOL["function"]["name"])
+                if args is not None:
+                    return self._parse_sticker_pick(args, len(candidates))
+        # 回退/纯文本协议：从正文解析 JSON 契约
+        raw = _strip_think((response.choices[0].message.content or "").strip())
+        parsed = _extract_json(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"选图输出无法解析：{raw[:200]!r}")
+        return self._parse_sticker_pick(parsed, len(candidates))
+
+    @staticmethod
+    def _parse_sticker_pick(args: dict, num_candidates: int) -> tuple[int | None, str]:
+        raw_pick = args.get("pick")
+        reason = str(args.get("reason") or "").strip()[:100]
+        if raw_pick is None or isinstance(raw_pick, bool):
+            raise ValueError(f"选图输出缺少合法 pick：{args!r}")
+        try:
+            pick = int(raw_pick)
+        except (TypeError, ValueError):
+            raise ValueError(f"选图输出 pick 不是编号：{raw_pick!r}") from None
+        if pick == 0:
+            return None, reason
+        if not 1 <= pick <= num_candidates:
+            raise ValueError(f"选图编号越界：{pick}（候选 {num_candidates} 张）")
+        return pick - 1, reason
 
     # -------------------------------------------------------------- learning
 
@@ -1106,6 +1414,27 @@ class AIClient:
             return parsed.get("is_similar") is True
         logger.warning("黑话双路比对输出无法解析：%r", text[:200])
         return False
+
+
+def _sticker_assessment_from_args(
+    args: dict, description_key: str
+) -> StickerAssessment | None:
+    """从审核类调用的参数对象解析 StickerAssessment；无可用结论返回 None。
+
+    acceptable 只认显式布尔；审核通过（true）却给不出非空描述时视为无结论
+    （smart 候选以描述为生命线，宁缺毋滥），退回收集端按无 meta 处理。
+    acceptable=false 的拒绝结论即使描述为空也有意义（不收藏），照常返回。
+    """
+    acceptable = args.get("acceptable")
+    if not isinstance(acceptable, bool):
+        return None
+    description = str(args.get(description_key) or "").strip()[:40]
+    emotion = str(args.get("emotion") or "").strip()[:20]
+    if acceptable and not description:
+        return None
+    return StickerAssessment(
+        acceptable=acceptable, description=description, emotion=emotion
+    )
 
 
 def _extract_json(text: str) -> Any | None:

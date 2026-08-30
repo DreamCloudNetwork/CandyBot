@@ -179,12 +179,21 @@
         "lazy_replies": ["呃呃", "不晓得", "懒得说", "不知道", "emm"],
     },
 
-    // 表情包（最小版）：识别收到的表情包类图片存入 data/stickers/，
-    // 成功发送文字回复后按概率随机跟发一张。整段可省略（全部走默认值）。
+    // 表情包：识别收到的表情包类图片存入 data/stickers/，成功发送文字回复
+    // 后按概率跟发一张（可选 vision 审核 + 模型按语境选图）。整段可省略（全部走默认值）。
     "stickers": {
         "enabled": true,                  // 总开关（关掉既不收集也不跟发）
         "send_probability": 0.05,         // 每条文字回复后跟发一张的概率（0 关闭跟发）
-        "max_count": 64,                  // 全局收藏上限，超限替换最久未使用的
+        "max_count": 64,                  // 全局收藏上限，超限替换最久未使用的（描述 meta 随之级联删除）
+        "moderation_enabled": true,       // 收藏过 vision 审核（截图/广告/违规不收）并生成
+                                          // 「描述 + 情绪」入 sticker_meta 表；vision 未配置
+                                          // 或审核失败时维持现状收藏、无 meta
+                                          // 现读：改完热重载即对之后的收图生效
+        "select_mode": "random",          // 掷点命中后的选图方式（现读）：
+                                          //   random 随机抽一张（默认，与引入模型选图前一致）
+                                          //   smart  有 meta 的候选交给 learning 模型按语境
+                                          //          选一张（可以不发），失败退回随机
+        "smart_max_candidates": 25,       // smart 模式单次送选的候选数上限（最久未使用优先轮换）
         "max_side_px": 512,               // placeholder 模式「尺寸小」启发式的边长上限（像素）
         "summary_keywords": ["表情包", "梗图", "斗图", "动图", "meme"],
                                           // describe 模式总结文本的命中关键词（忽略大小写）；

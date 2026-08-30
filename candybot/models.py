@@ -11,8 +11,11 @@ import ipaddress
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:  # 仅注解引用，避免 models←→ai 的运行时循环导入
+    from .ai import StickerAssessment
 
 MULTIMODAL_MODES = ("direct", "describe", "placeholder")
 
@@ -115,11 +118,17 @@ class NormalizedMessage:
     sticker_flags 与 record.images 下标对齐，标记每张图是否像「表情包类」
     （识别来源按 multimodal 模式而异，见 normalize.py 与 stickers.py）；
     只在收图当次事件处理里使用，不入库。
+
+    sticker_metas 与 record.images 下标对齐，携带 direct 模式合并入库评估
+    （一次 vision 调用同时产出 summary/keep/sticker 与表情包审核结论）给出的
+    StickerAssessment；仅在该图判定为表情包且审核通过时非 None，供收集侧
+    免重复调用直接入 sticker_meta 表。其余模式恒为空（审核在收集路径内做）。
     """
 
     record: ChatRecord
     mentioned_me: bool
     sticker_flags: tuple[bool, ...] = ()
+    sticker_metas: tuple["StickerAssessment | None", ...] = ()
 
 
 @dataclass(slots=True)
@@ -431,6 +440,13 @@ STICKER_SUMMARY_KEYWORDS_DEFAULT = ("表情包", "梗图", "斗图", "动图", "
 STICKER_SEND_MODES = ("base64", "http", "file")
 STICKER_SEND_MODE_DEFAULT = "base64"
 
+# 跟发选图方式（stickers.select_mode，见 stickers.py 与 ai.pick_sticker）：
+# random（默认）随机抽一张，与引入模型选图前完全一致；smart 掷点命中后把
+# 有描述 meta 的候选交给 learning 角色按语境选一张（可以不发），无候选或
+# 调用失败退回随机抽选。
+STICKER_SELECT_MODES = ("random", "smart")
+STICKER_SELECT_MODE_DEFAULT = "random"
+
 # 多音字（如「银行」的行）的错字策略：word_reading 取词典词内读音照常替换；
 # skip 则多音字整体跳过、只替换单一读音的字。两种策略下读音无法确定的
 # 多音字（单独成词等）都绝不替换，避免产出读音对不上的「假同音」错字。
@@ -478,12 +494,21 @@ class ResponsePostProcessSettings:
 
 @dataclass(frozen=True)
 class StickerSettings:
-    """表情包最小版（收集 + 小概率跟发，见 stickers.py）。
+    """表情包（收集 + 小概率跟发 + 可选的审核与模型选图，见 stickers.py）。
 
     enabled：总开关（关掉既不收集也不跟发）；
     send_probability：成功发送一条文字回复后跟发一张表情包的概率；
     max_count：全局收藏上限（跨群合计），超限替换最久未使用的条目
-      （删除记录并删除图片文件）；
+      （删除记录与图片文件，描述 meta 随之级联删除）；
+    moderation_enabled：收藏是否过一次 vision 审核并产出「描述 + 情绪」
+      入库（sticker_meta 表，见 ai.assess_sticker）；vision 未配置或审核
+      失败时维持无 meta 收藏；
+    select_mode：掷点命中后的选图方式（取值见 STICKER_SELECT_MODES）——
+      random（默认）随机抽一张，与引入模型选图前完全一致；smart 把有 meta
+      的候选交给 learning 角色按语境选一张（模型可以不发），无候选或调用
+      失败退回随机抽选；
+    smart_max_candidates：smart 模式单次送选的候选数上限（超出部分不入候选，
+      按最久未使用优先轮换）；
     send_mode：image 消息段里图片的引用方式（取值见 STICKER_SEND_MODES）
       —— base64（默认）把图片字节内嵌进发送请求，SnowLuma 与 CandyBot 跨机
       也能发；http 发 CandyBot 事件服务暴露的只读 URL（需配 http_base_url，
@@ -504,6 +529,10 @@ class StickerSettings:
     max_side_px: int = 512
     # describe 模式总结文本的命中关键词（忽略大小写，任一命中即视为表情包类）。
     summary_keywords: tuple[str, ...] = STICKER_SUMMARY_KEYWORDS_DEFAULT
+    # ---- v2：收藏审核与模型选图（现读，热重载即时生效）----
+    moderation_enabled: bool = True
+    select_mode: str = STICKER_SELECT_MODE_DEFAULT
+    smart_max_candidates: int = 25
 
 
 @dataclass(frozen=True)
@@ -1171,6 +1200,20 @@ def load_settings(cfg: Any) -> Settings:
     http_base_url = _parse_str(sticker_cfg, "http_base_url", "").strip()
     if send_mode == "http":
         validate_sticker_base_url(http_base_url)
+    select_mode = _parse_str(
+        sticker_cfg, "select_mode", STICKER_SELECT_MODE_DEFAULT
+    ).strip().lower()
+    if select_mode not in STICKER_SELECT_MODES:
+        raise ValueError(
+            f"配置项 `stickers.select_mode` 应为 {' / '.join(STICKER_SELECT_MODES)} "
+            f"之一，实际是 {select_mode!r}"
+        )
+    smart_max_candidates = _parse_int(sticker_cfg, "smart_max_candidates", 25)
+    if smart_max_candidates < 1:
+        raise ValueError(
+            f"配置项 `stickers.smart_max_candidates` 不能小于 1，"
+            f"实际是 {smart_max_candidates!r}"
+        )
     sticker_settings = StickerSettings(
         enabled=_parse_bool(sticker_cfg.get("enabled", True), "stickers.enabled"),
         send_probability=send_probability,
@@ -1179,6 +1222,12 @@ def load_settings(cfg: Any) -> Settings:
         summary_keywords=tuple(str(item).strip() for item in keywords_raw),
         send_mode=send_mode,
         http_base_url=http_base_url,
+        moderation_enabled=_parse_bool(
+            sticker_cfg.get("moderation_enabled", True),
+            "stickers.moderation_enabled",
+        ),
+        select_mode=select_mode,
+        smart_max_candidates=smart_max_candidates,
     )
 
     # plugins 段可整体省略（全部走默认值）

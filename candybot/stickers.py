@@ -1,4 +1,4 @@
-"""表情包（最小版，任务 C）：收集「表情包类图片」+ 小概率跟发。
+"""表情包（任务 C 最小版 + 任务 2 v2）：审核收藏 + 描述入库 + 小概率跟发。
 
 收集：bot._on_event 在消息入记忆后调用 collect()，按 normalize 给出的
 sticker_flags（与 record.images 下标对齐）把命中的图片存到
@@ -7,13 +7,23 @@ sticker_flags（与 record.images 下标对齐）把命中的图片存到
 （见 normalize.py）：direct 用视觉模型入库评估的 is_sticker 判定，describe
 按总结文本关键词，placeholder 按「图片尺寸小」启发式（解析文件头取宽高，
 不引入额外依赖）。全局数量超 stickers.max_count（默认 64）时替换最久未
-使用的条目——删表记录的同时删图片文件。
+使用的条目——删表记录与描述 meta（sticker_meta 级联）的同时删图片文件。
+
+收藏审核与描述（stickers.moderation_enabled，默认开）：vision 可用时对
+候选图过一次 ai.assess_sticker——不合格（截图/广告等）不收藏；通过则同
+一次调用产出的「描述 + 情绪」入 sticker_meta 表。direct 模式的合并入库
+评估已在 normalize 一次调用里给出结论（sticker_metas 传入），不再重复
+请求；vision 未配置或审核失败时维持现状收藏、无 meta（只参与随机兜底）。
 
 发送：成功发出一段文字回复之后（bot._maybe_send_sticker），每条按
-stickers.send_probability（默认 0.05）掷点，命中且该群收藏非空时随机挑
-一张，以 OneBot v11 image 消息段跟发；不做模型选择（模型参与留作后续
-迭代）。发送成功后写回一条 is_self 的 ChatRecord 占位「[表情包]」，让
-模型在历史里知道自己发过图——路径与 base64 都不进历史。
+stickers.send_probability（默认 0.05）掷点。命中后选图按
+stickers.select_mode：random（默认）从收藏随机挑一张；smart 取该群有
+meta 的条目为候选（≤smart_max_candidates、最久未使用优先轮换、乱序
+编号），连同最近聊天与刚发出的回复交给 ai.pick_sticker 按语境选一张，
+模型可以回答「不发」（本次跟发作罢），调用失败退回随机抽选。选中后以
+OneBot v11 image 消息段跟发。发送成功后写回一条 is_self 的 ChatRecord
+占位「[表情包]」，让模型在历史里知道自己发过图——路径与 base64 都不进
+历史。
 
 图片怎么交给 OneBot 端由 stickers.send_mode 决定（见 image_segment）：
 base64（默认）把图片字节内嵌进请求，SnowLuma 与 CandyBot 不同机也能发；
@@ -34,15 +44,24 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from .database import CandyDatabase, StickerEntry, image_fingerprint
+from .database import (
+    CandyDatabase,
+    StickerEntry,
+    StickerMetaEntry,
+    image_fingerprint,
+)
 from .models import (
     STICKER_SUMMARY_KEYWORDS_DEFAULT,
     ChatRecord,
     Settings,
     StickerSettings,
 )
+
+if TYPE_CHECKING:  # 仅注解与鸭子类型协议引用，静态层不依赖 LLM 层
+    from .ai import StickerAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -226,12 +245,23 @@ def is_small_image(data_url: str, max_side_px: int = _STICKER_MAX_SIDE) -> bool:
     return max(dims) <= max_side_px
 
 
+def _shuffle_in_place(items: list[Any], rng: random.Random) -> None:
+    """就地 Fisher–Yates 洗牌：只用 rng.random()，不依赖 stdlib 特有方法
+    （测试注入的确定性随机源只实现 random/choice 等少数接口）。"""
+    for i in range(len(items) - 1, 0, -1):
+        j = int(rng.random() * (i + 1))
+        items[i], items[j] = items[j], items[i]
+
+
 class StickerStore:
-    """表情包文件与 sticker 表的管理者（收集、上限替换、抽发、记账）。
+    """表情包文件与 sticker 表的管理者（收集、审核、上限替换、抽发、记账）。
 
     ai/bot 只在事件处理与发送链路里现取现用；配置经 settings_provider
     回调读取，热重载后自动取到最新值。表情包根目录在构造时定死
-    （`<data_dir>/stickers`，data_dir 本就需重启生效）。
+    （`<data_dir>/stickers`，data_dir 本就需重启生效）。ai_provider 回调
+    返回当前 AIClient（热重载会重建客户端，与 LearningService 同一注入
+    手法）；只按鸭子类型用其 assess_sticker / pick_sticker 两个方法，
+    不配置（测试等场合）则审核与 smart 选图都静默退回现状。
     """
 
     def __init__(
@@ -239,18 +269,33 @@ class StickerStore:
         root: Path,
         db: CandyDatabase,
         settings_provider: Callable[[], Settings],
+        ai_provider: Callable[[], Any] | None = None,
     ):
         self._root = root
         self._db = db
         self._settings = settings_provider
+        self._ai = ai_provider
 
     # ------------------------------------------------------------ 收集
 
-    async def collect(self, record: ChatRecord, flags: Sequence[bool]) -> int:
+    async def collect(
+        self,
+        record: ChatRecord,
+        flags: Sequence[bool],
+        metas: Sequence["StickerAssessment | None"] = (),
+    ) -> int:
         """按 sticker_flags 收藏该消息里命中表情包类的图片，返回本次入库数。
 
         flags 与 record.images 下标对齐；False、原图缺失（空串）与解析
-        失败的槽位一律跳过。任何异常原样上抛，由调用方按辅助能力处理。
+        失败的槽位一律跳过。
+
+        metas 同样与 images 下标对齐，携带 direct 模式合并入库评估已给出的
+        审核结论（免重复调用 vision）；该槽位无现成结论而
+        stickers.moderation_enabled 开着时，这里单独调 ai.assess_sticker
+        审核：不合格不收藏（DEBUG 带理由），通过则「描述 + 情绪」入
+        sticker_meta 表。vision 未配置或审核失败维持现状收藏、无 meta，
+        该条目后续只参与随机兜底。任何异常原样上抛，由调用方按辅助能力
+        处理（审核调用自身的失败在这里就地消化）。
         """
         st = self._settings().stickers
         if not st.enabled or not flags:
@@ -270,6 +315,16 @@ class StickerStore:
                     index,
                 )
                 continue
+            meta = metas[index] if index < len(metas) else None
+            if meta is None and st.moderation_enabled:
+                meta = await self._assess_sticker(record.group_id, data_url)
+            if meta is not None and not meta.acceptable:
+                logger.debug(
+                    "群 %d 表情包审核未通过，不收藏：%s",
+                    record.group_id,
+                    meta.description or "模型未给出理由",
+                )
+                continue
             mime, data = parsed
             sha = image_fingerprint(data_url)
             rel_path = f"{record.group_id}/{sha}{_MIME_SUFFIXES.get(mime, '.png')}"
@@ -277,17 +332,22 @@ class StickerStore:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             ts = record.ts if record.ts > 0 else time.time()
-            inserted = await self._db.insert_sticker(
+            sticker_id = await self._db.insert_sticker(
                 record.group_id, sha, rel_path, record.summary_of(index) or "", ts
             )
-            if not inserted:
+            if sticker_id is None:
                 continue  # 同群同图只收藏一次
             saved += 1
+            if meta is not None:
+                await self._db.insert_sticker_meta(
+                    sticker_id, meta.description, meta.emotion, ts
+                )
             logger.info(
-                "群 %d 收藏表情包：%s（总结：%s）",
+                "群 %d 收藏表情包：%s（总结：%s%s）",
                 record.group_id,
                 rel_path,
                 record.summary_of(index) or "无",
+                f"，描述：{meta.description}【{meta.emotion}】" if meta else "",
             )
         if saved:
             evicted = await self._db.evict_stickers_over(st.max_count)
@@ -302,6 +362,35 @@ class StickerStore:
                 )
         return saved
 
+    async def _assess_sticker(
+        self, group_id: int, data_url: str
+    ) -> "StickerAssessment | None":
+        """收集路径上的独立审核调用；任何「拿不到结论」都返回 None。
+
+        未注入 AI 客户端、vision 未配置或输出不可解析（assess_sticker 自行
+        记日志返回 None）记 DEBUG；网络/端点异常记 WARNING 后同样退回无
+        meta 收藏——审核是辅助能力，绝不拦住收集本身。
+        """
+        if self._ai is None:
+            return None
+        ai = self._ai()
+        assess = getattr(ai, "assess_sticker", None) if ai is not None else None
+        if assess is None:
+            return None  # 未注入或假客户端不带审核能力：按无结论处理
+        try:
+            assessment = await assess(data_url)
+        except Exception:
+            logger.warning(
+                "群 %d 表情包审核调用失败，维持收藏、无 meta", group_id, exc_info=True
+            )
+            return None
+        if assessment is None:
+            logger.debug(
+                "群 %d 表情包审核未产出结论（vision 未配置或输出不可解析），按无 meta 收藏",
+                group_id,
+            )
+        return assessment
+
     # ------------------------------------------------------------ 抽发
 
     async def pick_for_send(self, group_id: int, rng: random.Random) -> StickerEntry | None:
@@ -310,6 +399,47 @@ class StickerStore:
         if not entries:
             return None
         return rng.choice(entries)
+
+    async def pick_for_send_smart(
+        self, group_id: int, context_text: str, rng: random.Random
+    ) -> StickerEntry | None:
+        """smart 选图（任务 2）：掷点命中后把候选交给模型按语境挑，可以不发。
+
+        候选取该群有描述 meta（审核通过入库）的收藏：按「最久未使用优先」
+        截取 ≤smart_max_candidates 张再乱序编号（轮换避免总用同一批；无
+        meta 的条目不参与 smart 选择、仍可在随机兜底里被抽到）。
+
+        模型明确选择不发 → INFO 带理由并返回 None；无 meta 候选、无 AI
+        客户端、选图调用或解析失败（WARNING）都退回一次随机抽选，与现状
+        一致；随机池本身为空时返回 None（调用方按收藏为空处理）。
+        """
+        st = self._settings().stickers
+        candidates: list[StickerMetaEntry] = await self._db.load_stickers_with_meta(
+            group_id
+        )
+        ai = self._ai() if self._ai is not None else None
+        if ai is None or not candidates:
+            if not candidates:
+                logger.debug("群 %d 无带描述 meta 的收藏，退回随机抽选", group_id)
+            return await self.pick_for_send(group_id, rng)
+        candidates = candidates[: st.smart_max_candidates]
+        _shuffle_in_place(candidates, rng)
+        entries = [(item.description, item.emotion) for item in candidates]
+        try:
+            index, reason = await ai.pick_sticker(context_text, entries)
+        except Exception:
+            logger.warning(
+                "群 %d smart 选图失败，退回随机抽选", group_id, exc_info=True
+            )
+            return await self.pick_for_send(group_id, rng)
+        if index is None:
+            logger.info(
+                "群 %d 模型判断语境不合，本次不跟发表情包：%s",
+                group_id,
+                reason or "未给出理由",
+            )
+            return None
+        return candidates[index].entry
 
     def image_segment(self, entry: StickerEntry) -> dict:
         """OneBot v11 image 消息段：按 stickers.send_mode 引用图片。

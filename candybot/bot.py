@@ -292,13 +292,15 @@ class CandyBot:
             multimodal_mode=settings.multimodal.mode,
         )
         self._snowluma = SnowlumaClient(settings.snowluma)
-        # 表情包（任务 C 最小版）：收图时在 _on_event 收集，文字回复发送
-        # 成功后按小概率跟发；配置经回调现取，热重载即时生效。
+        # 表情包（任务 C + v2）：收图时在 _on_event 收集（含 vision 审核），
+        # 文字回复发送成功后按小概率跟发（smart 模式经模型选图）；配置经
+        # 回调现取，AI 客户端热重载后仍取到新实例（与 LearningService 同法）。
         sticker_root = Path(settings.bot.data_dir) / "stickers"
         self._stickers = StickerStore(
             sticker_root,
             self._memory.db,
             lambda: self._settings,
+            lambda: self._ai,
         )
         # 跟发掷点与随机抽图的随机源；测试可替换为固定种子的 random.Random。
         self._sticker_rng: random.Random = random.SystemRandom()
@@ -490,6 +492,20 @@ class CandyBot:
 
         try:
             assess = getattr(self._ai, "assess_image", None)
+            assess_cb = assess if self._settings.multimodal.mode == "direct" else None
+            if assess_cb is not None:
+                # direct 模式收图本就有入库评估：审核开关开着就让同一次
+                # vision 调用合并产出表情包审核结论（描述 + 情绪），收集侧
+                # 免重复请求；与图片记忆管理（summary/keep）开关互不牵连。
+                # 闭包在事件处理入口现取配置，热重载即时生效；端点无评估
+                # 能力时保持 None（normalize 退回尺寸启发式，与旧行为一致）
+                want_sticker_meta = (
+                    self._settings.stickers.enabled
+                    and self._settings.stickers.moderation_enabled
+                )
+                assess_cb = lambda url: assess(  # noqa: E731 与上面注释同义的现取闭包
+                    url, want_sticker_meta=want_sticker_meta
+                )
             normalized = await normalize_group_message(
                 event,
                 self_qq=self._settings.bot.self_qq,
@@ -506,9 +522,7 @@ class CandyBot:
                     if self._settings.multimodal.mode == "describe"
                     else None
                 ),
-                assess_image=(
-                    assess if self._settings.multimodal.mode == "direct" else None
-                ),
+                assess_image=assess_cb,
             )
         except Exception:
             logger.exception("归一化事件失败，已忽略：%r", event.get("message_id"))
@@ -535,10 +549,14 @@ class CandyBot:
             self._runtimes[group_id].recent_mentions.append(normalized.record.message_id)
         logger.debug("收到消息 %s : %s",group_id,normalized)
         if normalized.sticker_flags:
-            # 表情包收集（任务 C）：辅助能力，失败只记日志，不挡这条消息的决策
+            # 表情包收集（任务 C/v2）：辅助能力，失败只记日志，不挡这条
+            # 消息的决策；sticker_metas 是 direct 模式合并审核已产出的结论
+            # （其余模式为空元组，审核在收集路径内做）
             try:
                 await self._stickers.collect(
-                    normalized.record, normalized.sticker_flags
+                    normalized.record,
+                    normalized.sticker_flags,
+                    normalized.sticker_metas,
                 )
             except Exception:
                 logger.warning("群 %d 表情包收集失败", group_id, exc_info=True)
@@ -1006,14 +1024,50 @@ class CandyBot:
         if not decision.forced and not decision.engaged:
             runtime.last_proactive_ts = time.time()
         runtime.msgs_since_reply = 0
-        # 任务 C：文字回复成功发出后，按小概率跟发一张表情包（辅助能力，
+        # 任务 C/v2：文字回复成功发出后，按小概率跟发一张表情包（辅助能力，
         # 内部消化全部失败，不影响本轮记账）
-        await self._maybe_send_sticker(group_id, memory)
+        await self._maybe_send_sticker(group_id, memory, reply_text)
 
-    async def _maybe_send_sticker(self, group_id: int, memory: GroupMemory) -> None:
-        """表情包跟发（任务 C 最小版）：每条文字回复后独立掷点，命中且该群
-        收藏非空时随机抽一张，以 OneBot v11 image 消息段跟发（图片引用方式
-        由 stickers.send_mode 决定，见 stickers.image_segment）；不做模型选择。
+    # smart 选图语境的规模上限（提示词组装用，不单独配置）
+    _STICKER_CONTEXT_MESSAGES = 8
+    _STICKER_CONTEXT_CHARS = 400
+
+    def _sticker_context_text(self, memory: GroupMemory, reply_text: str) -> str:
+        """smart 选图的语境文本：该群最近 ≤8 条消息（截 ≤400 字符，丢最旧
+        保最近）+ 本次刚发出的回复文本。
+
+        连发的自发言写回记录就在热缓存尾部：先剥掉尾部连续的 is_self 条
+        （其内容即 reply_text 的拆条，另行以「【你刚发出的】」标注给出，
+        避免同一句话占两份预算），中间的旧自发言保留并标成「我」。
+        """
+        records = memory.tail(self._STICKER_CONTEXT_MESSAGES)
+        while records and records[-1].is_self:
+            records.pop()
+        lines: list[str] = []
+        for record in records:
+            text = (record.text or "").strip()
+            if not text:
+                continue
+            who = "我" if record.is_self else (record.nickname or "群友")
+            lines.append(f"{who}: {text}")
+        joined = "\n".join(lines)
+        if len(joined) > self._STICKER_CONTEXT_CHARS:
+            # 从头部丢弃超长部分，随后对齐到整行，不留半句
+            joined = joined[len(joined) - self._STICKER_CONTEXT_CHARS :]
+            joined = joined.partition("\n")[2]
+        return f"{joined}\n【你刚发出的】{reply_text.strip()}".strip()
+
+    async def _maybe_send_sticker(
+        self, group_id: int, memory: GroupMemory, reply_text: str
+    ) -> None:
+        """表情包跟发（任务 C + v2 模型选图）：每条文字回复后独立掷点。
+
+        命中后选图按 stickers.select_mode：random（默认）从该群收藏随机
+        抽一张，与引入模型选图前完全一致；smart 把有描述 meta 的候选交给
+        learning 角色按语境选一张、可以不发（本次作罢），无候选或调用失败
+        退回随机抽选（见 stickers.pick_for_send_smart）。选中后以 OneBot
+        v11 image 消息段跟发（图片引用方式由 stickers.send_mode 决定，见
+        stickers.image_segment）。
 
         发送成功后写回一条 is_self 的「[表情包]」占位记录，让模型在历史里
         知道自己发过图（路径与 base64 都不进历史）。任何失败（含 image 段
@@ -1031,10 +1085,20 @@ class CandyBot:
         try:
             if self._sticker_rng.random() >= st.send_probability:
                 return
-            picked = await self._stickers.pick_for_send(group_id, self._sticker_rng)
-            if picked is None:
-                logger.debug("群 %d 掷点命中但收藏为空，不跟发表情包", group_id)
-                return
+            if st.select_mode == "smart":
+                picked = await self._stickers.pick_for_send_smart(
+                    group_id,
+                    self._sticker_context_text(memory, reply_text),
+                    self._sticker_rng,
+                )
+                if picked is None:
+                    # 模型选择不发（store 已记 INFO 带理由）或收藏为空：作罢
+                    return
+            else:
+                picked = await self._stickers.pick_for_send(group_id, self._sticker_rng)
+                if picked is None:
+                    logger.debug("群 %d 掷点命中但收藏为空，不跟发表情包", group_id)
+                    return
             speed = self._settings.response_post_process.typing_speed
             delay = estimate_typing_time(
                 STICKER_RECORD_TEXT,

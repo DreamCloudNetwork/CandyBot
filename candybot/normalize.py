@@ -114,7 +114,9 @@ async def normalize_group_message(
     GroupMemory.find_by_message_id（库里有全量历史，早于启动的消息也可引用）；
     describe_image: 仅 describe 模式需要，Callable[[str dataurl], Awaitable[str]]；
     assess_image: 仅 direct 模式需要，Callable[[str dataurl], Awaitable[ImageAssessment]]，
-    用于入库时判定该图后续继续展示原图还是只保留总结。
+    用于入库时判定该图后续继续展示原图还是只保留总结；调用方（bot）可经
+    闭包要求合并产出表情包审核结论（ImageAssessment.sticker_assessment），
+    本函数顺带把它整理进 sticker_metas 交给收集路径，免对同一张图二次请求。
     self_nickname: 机器人昵称（@ 与回复引用的占位文本用，bot.self_nickname）；
     stickers: 表情包识别启发式参数（stickers 段），缺省全部走内置默认。
     """
@@ -195,6 +197,11 @@ async def normalize_group_message(
     image_states: tuple[str, ...] = ()
     image_summaries: dict[int, str] | None = None
     sticker_flags: tuple[bool, ...] = ()
+    # 与 images 下标对齐的表情包审核结论（direct 模式合并入库评估产出，
+    # 描述 + 情绪）：仅判定为表情包且审核通过时非 None，交给
+    # stickers.collect 直接入 sticker_meta 表；其余模式恒为空（审核在收集
+    # 路径内做）。
+    sticker_metas: list = []
     if image_urls and multimodal.download_media and http_session is not None:
         data_urls: list[str] = []
         descriptions: list[str] = []
@@ -234,15 +241,28 @@ async def normalize_group_message(
             states: list[str] = []
             summaries: dict[int, str] = {}
             flags: list[bool] = []
+            metas: list = []
             for index, data_url in enumerate(images):
                 summary: str | None = None
                 keep_raw = True
+                meta = None
                 if assess_image is not None:
                     try:
+                        # 合并调用（回调带 want_sticker_meta）时同一次 vision
+                        # 请求还会给出表情包审核结论，收集侧免重复调用
                         assessment = await assess_image(data_url)
                         summary = assessment.summary
                         keep_raw = assessment.keep_raw
                         sticker_is_sticker = assessment.is_sticker
+                        meta = assessment.sticker_assessment
+                        if meta is not None and not meta.acceptable:
+                            sticker_is_sticker = False
+                            logger.debug(
+                                "群 %d 表情包审核未通过，不收藏：%s",
+                                group_id,
+                                meta.description or "模型未给出理由",
+                            )
+                            meta = None
                     except Exception as exc:
                         logger.warning("图片入库评估失败，默认保留原图：%s", exc)
                         sticker_is_sticker = is_small_image(data_url, st.max_side_px)
@@ -257,9 +277,11 @@ async def normalize_group_message(
                     summaries[index] = summary
                 states.append(state)
                 flags.append(sticker_is_sticker)
+                metas.append(meta if sticker_is_sticker else None)
             image_states = tuple(states)
             image_summaries = summaries or None
             sticker_flags = tuple(flags)
+            sticker_metas = metas
             if not images:
                 text = text.replace("[图片]", "").strip()
                 text = (text + "\n[图片]").strip()
@@ -284,7 +306,10 @@ async def normalize_group_message(
         image_summaries=image_summaries,
     )
     return NormalizedMessage(
-        record=record, mentioned_me=mentioned_me, sticker_flags=sticker_flags
+        record=record,
+        mentioned_me=mentioned_me,
+        sticker_flags=sticker_flags,
+        sticker_metas=tuple(sticker_metas),
     )
 
 

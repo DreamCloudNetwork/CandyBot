@@ -755,3 +755,39 @@ def jargon_compare_inference_prompt(meaning_with_context: str, meaning_alone: st
 
 以 JSON 格式输出，不要输出其他任何内容：
 {{"is_similar": true或false, "reason": "判断理由"}}"""
+
+
+# ------------------------------------------------ 表情包 smart 选图提示词
+#
+# 与后台学习任务同为 learning 角色的一次性单消息调用，但它同步等待在
+# 决策链路里（文字发出之后、跟发作不做决定之前），故按通用模式支持
+# 「强制工具调用 + 自动降级纯文本」的双契约输出（见 ai.pick_sticker）。
+
+
+def sticker_pick_prompt(context_text: str, candidates_text: str, *, via_tool: bool) -> str:
+    """smart 跟发选图指令：按语境从候选里挑一张表情包，允许回答「不发」。"""
+    if via_tool:
+        tail = (
+            "完成后调用 submit_sticker_pick 工具提交：pick 为选中的候选编号"
+            "（不发表情包时填 0），reason 用一句话说明理由。"
+        )
+    else:
+        tail = (
+            "只输出一个 JSON 对象，不要输出其他任何内容："
+            '{"pick": 0或候选编号, "reason": "一句话理由"}'
+            "（不发表情包时 pick 填 0）"
+        )
+    return f"""你是个 QQ 群成员，刚在群里发完一条文字回复，可以考虑跟发一张表情包来强化或替代语气。
+
+【群里最近的聊天】
+{context_text}
+
+【候选表情包（编号. 描述【情绪】）】
+{candidates_text}
+
+要求：
+- 表情包的用途是强化或替代你刚那句话的语气，必须与当前语境和你刚说的话相衬；
+- 没有任何一张合适时必须选择不发（pick 填 0）——宁可不发，也不要发不相干的图；
+- 有得选就只发一张；不要因为「正好轮到掷点」就硬凑，不相干的图比不发更糟。
+
+{tail}"""

@@ -1,6 +1,6 @@
 """SQLite 持久层：SQLModel 表定义与异步数据操作（data 目录下的 candy.db）。
 
-九个表：
+十个表：
 - chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留；
                    is_command 标记命令插件产生的消息（补列与存量回填见
                    migrations.py 的启动迁移）。
@@ -21,6 +21,9 @@
 - sticker          表情包收藏（最小版）：同群按 (群, 内容指纹) 去重，
                    全局数量超上限时替换最久未使用的条目——本表只删记录，
                    图片文件的写入与删除由 stickers.StickerStore 负责。
+- sticker_meta     表情包收藏的审核与描述（vision 审核产出）：sticker_id
+                   唯一外键指向 sticker.id，description/emotion 供 smart
+                   模式模型选图；sticker 条目被淘汰时本表随同一事务级联删除。
 - schema_migration 已执行的迁移名单（见 migrations.py）：每个迁移按名字
                    只跑一次，启动建表后自动补跑未执行的迁移。
 
@@ -224,6 +227,28 @@ class StickerRow(SQLModel, table=True):
     last_used_time: float = Field(default=0.0, nullable=False)
 
 
+class StickerMetaRow(SQLModel, table=True):
+    """sticker_meta：表情包收藏的审核与描述（vision 审核产出，见 stickers.py）。
+
+    独立新表（create_all 自动建、不 ALTER sticker——见 CandyDatabase.
+    create_tables 的注释）；sticker_id 唯一并外键指向 sticker.id。
+    description（≤40 字）中立具体地描述图里在干什么，emotion 为情绪标签，
+    两者供 smart 模式模型按语境选图；只有审核通过（acceptable=true）的图
+    才会收藏，本表行随之只会是审核通过的结论，字段如实保留记录。
+    未经审核或审核调用失败的收藏没有本表行（无 meta），只参与随机抽发；
+    sticker 条目被淘汰时本表行在同一事务里级联删除（见 evict_stickers_over）。
+    """
+
+    __tablename__ = "sticker_meta"
+
+    id: int | None = Field(default=None, primary_key=True)
+    sticker_id: int = Field(foreign_key="sticker.id", nullable=False, unique=True)
+    description: str = Field(default="", nullable=False)
+    emotion: str = Field(default="", nullable=False)
+    acceptable: bool = Field(default=True, nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+
+
 @dataclass(frozen=True)
 class ImpressionEntry:
     """一条群印象（day 为 YYYY-MM-DD）。"""
@@ -264,6 +289,15 @@ class StickerEntry:
     path: str
     summary: str
     use_count: int
+
+
+@dataclass(frozen=True)
+class StickerMetaEntry:
+    """一条带审核描述 meta 的表情包收藏（smart 选图的候选）。"""
+
+    entry: StickerEntry
+    description: str
+    emotion: str
 
 
 def _set_sqlite_pragmas(dbapi_conn, _record) -> None:
@@ -860,8 +894,9 @@ class CandyDatabase:
 
     async def insert_sticker(
         self, group_id: int, sha256: str, path: str, summary: str, ts: float
-    ) -> bool:
-        """新增一条表情包收藏；同群已有相同内容指纹时返回 False（去重）。
+    ) -> int | None:
+        """新增一条表情包收藏，返回其主键 id（供 sticker_meta 挂靠）；
+        同群已有相同内容指纹时返回 None（去重）。
 
         last_used_time 以入库时间起步：刚收藏的图绝不因为「还没用过」
         被新来的收藏立刻挤掉，LRU 淘汰按「用过或收来」的最久时间排序。
@@ -882,8 +917,27 @@ class CandyDatabase:
                 await session.rollback()
                 if "unique constraint" not in str(exc.orig).lower():
                     raise  # 非唯一键冲突如实上抛
-                return False
-            return True
+                return None
+            return row.id
+
+    async def insert_sticker_meta(
+        self, sticker_id: int, description: str, emotion: str, ts: float
+    ) -> None:
+        """为一条收藏登记审核与描述 meta（sticker_meta 与 sticker 一对一）。
+
+        只在 vision 审核通过时调用；未经审核或审核失败的收藏没有本表行。
+        """
+        async with self._sessions() as session:
+            session.add(
+                StickerMetaRow(
+                    sticker_id=sticker_id,
+                    description=description,
+                    emotion=emotion,
+                    acceptable=True,
+                    created_ts=ts,
+                )
+            )
+            await session.commit()
 
     async def load_stickers(self, group_id: int) -> list[StickerEntry]:
         """某群收藏的全部表情包（顺序无所谓：抽发是随机的）。"""
@@ -916,13 +970,42 @@ class CandyDatabase:
             session.add(row)
             await session.commit()
 
+    async def load_stickers_with_meta(self, group_id: int) -> list[StickerMetaEntry]:
+        """某群收藏中有审核 meta 的条目（smart 选图候选），按「最久未使用」
+        优先排序（轮换候选池的排序键，与 LRU 淘汰同一套）。"""
+        stmt = (
+            select(StickerRow, StickerMetaRow)
+            .join(StickerMetaRow, StickerMetaRow.sticker_id == StickerRow.id)
+            .where(
+                StickerRow.group_id == group_id,
+                col(StickerMetaRow.description) != "",
+            )
+            .order_by(col(StickerRow.last_used_time), col(StickerRow.created_ts))
+        )
+        async with self._sessions() as session:
+            return [
+                StickerMetaEntry(
+                    entry=StickerEntry(
+                        id=row.id,
+                        group_id=row.group_id,
+                        sha256=row.sha256,
+                        path=row.path,
+                        summary=row.summary,
+                        use_count=row.use_count,
+                    ),
+                    description=meta.description,
+                    emotion=meta.emotion,
+                )
+                for row, meta in (await session.exec(stmt)).all()
+            ]
+
     async def evict_stickers_over(self, max_total: int) -> list[str]:
         """全局收藏超过 max_total 时按「最久未使用」删到上限，
         返回被删条目的相对文件路径（图片文件由调用方删除）。
 
         排序键 (last_used_time, created_ts)；last_used_time 以入库时间
         起步（见 insert_sticker），因此先淘汰「最久既没用过也没收进来」
-        的条目。
+        的条目。被删条目的审核 meta 在同一事务里级联删除。
         """
         async with self._sessions() as session:
             rows = list(
@@ -937,6 +1020,18 @@ class CandyDatabase:
             if overflow <= 0:
                 return []
             removed_paths: list[str] = []
+            removed_ids = [row.id for row in rows[:overflow]]
+            # 先删子表再删父表：SQLite 外键约束开启（见 _set_sqlite_pragmas），
+            # 顺序反了会触发 sticker_meta 的外键违例
+            meta_rows = (
+                await session.exec(
+                    select(StickerMetaRow).where(
+                        col(StickerMetaRow.sticker_id).in_(removed_ids)
+                    )
+                )
+            ).all()
+            for meta in meta_rows:
+                await session.delete(meta)
             for row in rows[:overflow]:
                 removed_paths.append(row.path)
                 await session.delete(row)

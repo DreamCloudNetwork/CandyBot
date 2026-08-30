@@ -1,18 +1,21 @@
 """表情包跟发链路的集成风格单测：真实 CandyBot 编排 + 假 SnowLuma/AI。
 
 覆盖：文字回复成功后的跟发与「[表情包]」占位写回、跟发前的挑图打字延迟、
-概率 0 关闭、收藏为空不发、发送失败不影响记账（复用 test_integration 的
-配置与假件基建；sleep 打桩手法沿用 test_bot_postprocess）。
+概率 0 关闭、收藏为空不发、发送失败不影响记账；以及任务 2 的 smart 链路
+（模型选图跟发、语境文本组装、选择不发作罢、选图失败退回随机、random 模式
+下模型完全不参与）（复用 test_integration 的配置与假件基建；sleep 打桩
+手法沿用 test_bot_postprocess）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from dataclasses import replace as dc_replace
 
 from candybot import bot as bot_module
-from candybot.ai import JudgeVerdict
+from candybot.ai import JudgeVerdict, StickerAssessment
 from candybot.bot import CandyBot
 from candybot.models import StickerSettings
 from candybot.postprocess import estimate_typing_time
@@ -241,5 +244,116 @@ async def test_sticker_send_failure_does_not_disturb_reply(tmp_path, monkeypatch
         assert not any(r.text == "[表情包]" for r in tail)  # 没发出去就不写占位
         # 护栏记账：发言间隔已归零（文字确实发出去了）
         assert bot._runtimes[42].msgs_since_reply == 0
+    finally:
+        await bot.stop()
+
+
+# ---------------------------------------------------------------- smart 选图（任务 2）
+
+
+class SmartFakeAI(FakeAI):
+    """FakeAI + 表情包审核/选图两个能力：pick 决定选图结果，记录全部调用。"""
+
+    def __init__(self, verdict: JudgeVerdict, *, pick=(0, "得意配得意"), pick_error=None):
+        super().__init__(verdict)
+        self.pick = pick
+        self.pick_error = pick_error
+        self.assess_calls: list[str] = []
+        self.pick_calls: list[tuple[str, list[tuple[str, str]]]] = []
+
+    async def assess_sticker(self, data_url: str):
+        self.assess_calls.append(data_url)
+        return StickerAssessment(True, "柴犬歪头疑惑", "无语")
+
+    async def pick_sticker(self, context_text, entries):
+        self.pick_calls.append((context_text, list(entries)))
+        if self.pick_error is not None:
+            raise self.pick_error
+        return self.pick
+
+
+async def test_smart_followup_sends_model_picked_sticker(tmp_path, monkeypatch):
+    """smart 命中：掷点后把语境与候选交给模型，跟发它选中的那张。"""
+    bot, _ = await _build(
+        tmp_path,
+        monkeypatch,
+        StickerSettings(send_probability=1.0, select_mode="smart"),
+    )
+    ai = SmartFakeAI(JudgeVerdict(9, "值得回"), pick=(0, "语境相衬"))
+    bot._ai = ai  # StickerStore 经回调现取，替换后立即可见
+    try:
+        url = await _collect_one(bot)  # 收藏走审核 → meta 入库
+        assert ai.assess_calls == [url]
+        await bot._on_event(group_event(1, "糖糖你好", at_me=True))
+        await wait_until(lambda: len(bot._snowluma.sent) == 2, timeout=3)
+
+        # 选图输入：最近聊天 + 明确标注的「刚发出的回复」，候选带描述与情绪
+        context, entries = ai.pick_calls[0]
+        assert "【你刚发出的】哈哈确实" in context
+        assert "用户1000" in context  # 触发消息（group_event 的 card 昵称）
+        assert entries == [("柴犬歪头疑惑", "无语")]
+        # 模型选中的就是那张有 meta 的收藏；发送、记账与占位写回链路不变
+        file_ref = bot._snowluma.sent[1][1][0]["data"]["file"]
+        assert base64.b64decode(file_ref[len("base64://"):]) == png_bytes(64, 64)
+        await _REAL_SLEEP(0.15)
+        (entry,) = await bot._memory.db.load_stickers(42)
+        assert entry.use_count == 1
+    finally:
+        await bot.stop()
+
+
+async def test_smart_model_declines_abstains(tmp_path, monkeypatch, caplog):
+    """模型回答「不发」：本次跟发作罢（只有文字那条发送），INFO 带理由。"""
+    bot, _ = await _build(
+        tmp_path,
+        monkeypatch,
+        StickerSettings(send_probability=1.0, select_mode="smart"),
+    )
+    ai = SmartFakeAI(JudgeVerdict(9, "值得回"), pick=(None, "没有一张和刚说的话相衬"))
+    bot._ai = ai
+    try:
+        await _collect_one(bot)
+        with caplog.at_level(logging.INFO):
+            await bot._on_event(group_event(1, "糖糖你好", at_me=True))
+            await wait_until(lambda: len(ai.pick_calls) == 1, timeout=3)
+            await _REAL_SLEEP(0.15)
+        assert len(bot._snowluma.sent) == 1  # 只发了文字
+        assert "不跟发表情包" in caplog.text and "没有一张和刚说的话相衬" in caplog.text
+    finally:
+        await bot.stop()
+
+
+async def test_smart_pick_failure_falls_back_to_random(tmp_path, monkeypatch, caplog):
+    """选图调用失败：WARNING 后退回一次随机抽发，表情包照发（与现状一致）。"""
+    bot, _ = await _build(
+        tmp_path,
+        monkeypatch,
+        StickerSettings(send_probability=1.0, select_mode="smart"),
+    )
+    ai = SmartFakeAI(JudgeVerdict(9, "值得回"), pick_error=RuntimeError("learning 挂了"))
+    bot._ai = ai
+    try:
+        await _collect_one(bot)
+        with caplog.at_level(logging.WARNING):
+            await bot._on_event(group_event(1, "糖糖你好", at_me=True))
+            await wait_until(lambda: len(bot._snowluma.sent) == 2, timeout=3)
+        assert bot._snowluma.sent[1][1][0]["type"] == "image"
+        assert "退回随机抽选" in caplog.text
+    finally:
+        await bot.stop()
+
+
+async def test_random_mode_never_calls_pick_sticker(tmp_path, monkeypatch):
+    """select_mode=random（默认）回归：有 meta 也不动模型选图，与改动前一致。"""
+    bot, _ = await _build(tmp_path, monkeypatch, StickerSettings(send_probability=1.0))
+    ai = SmartFakeAI(JudgeVerdict(9, "值得回"))
+    bot._ai = ai
+    try:
+        await _collect_one(bot)  # 收藏照常过审核入 meta
+        assert len(ai.assess_calls) == 1
+        await bot._on_event(group_event(1, "糖糖你好", at_me=True))
+        await wait_until(lambda: len(bot._snowluma.sent) == 2, timeout=3)
+        assert ai.pick_calls == []  # 掷点命中也走随机，不请求选图模型
+        assert bot._snowluma.sent[1][1][0]["type"] == "image"
     finally:
         await bot.stop()
