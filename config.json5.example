@@ -133,7 +133,7 @@
         "image_retention_days": 7,        // 聊天原图保留天数；超期降级为总结/占位符
     },
 
-    // 记忆与学习：每日群印象（中期记忆，注入 L2）、表达学习与黑话学习（后台任务，注入 L4）。
+    // 记忆与学习：每日群印象（中期记忆，注入 L2）、表达学习与黑话学习、人物长期记忆（后台任务，注入 L4）。
     // 整段可省略（全部走默认值）；所有学习任务在后台 asyncio 任务中执行，失败只记日志跳过本次。
     "learning": {
         "enabled": true,                  // 学习任务总开关
@@ -154,6 +154,13 @@
         "impression_text_budget": 6000,   // 每日印象总结送入的聊天文本字符预算
         "jargon_candidates_per_batch": 5, // 每批黑话学习实际做双路推断的候选数上限（每候选至少 3 次调用）
         "jargon_meaning_max_chars": 200,  // 黑话含义入库长度上限（防撑爆 L4）
+        // 人物长期记忆：随同一批后台学习抽取「关于群友的稳定事实」，回复前注入 L4 画像（见 README「人物记忆」）
+        "person_enabled": true,           // 人物记忆单项开关（关闭时学习批次与 L4 与引入前逐字节一致）
+        "person_fact_scope": "group",     // group = 事实只在学的群里注入；global = 同 QQ 号跨群可见（有社交风险，见 README）
+        "person_fact_max_inject_per_person": 4, // 单次回复每人最多注入的画像条数（人数上限 ≤3 固定）
+        "person_fact_half_life_days": 30, // 久不命中的事实的衰减半衰期（天）
+        "person_fact_min_weight": 0.25,   // 衰减后权重低于此值不再注入（行保留不删，被注入即刷新强化）
+        "person_self_review": false,      // 可选自审（默认关）：每条事实入库前多一次 learning 判定
     },
 
     // 输出层拟人化后处理：拆条发送、打字延迟、错别字与敷衍兜底、连发被打断后的重想（整段可省略，全部走默认值）

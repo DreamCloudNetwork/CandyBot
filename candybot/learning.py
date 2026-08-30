@@ -1,13 +1,19 @@
-"""后台学习服务：每日群印象（任务 A）、表达学习（任务 B）、黑话学习（任务 C）。
+"""后台学习服务：每日群印象（任务 A）、表达学习（任务 B）、黑话学习（任务 C）、
+人物长期记忆（任务 3：关于群友的稳定事实）。
 
-三类学习任务的全部 LLM 调用都发生在后台 asyncio 任务里，绝不阻塞每群
+各学习任务的全部 LLM 调用都发生在后台 asyncio 任务里，绝不阻塞每群
 决策队列；任一环节失败只记 warning 日志并跳过本次，不重试、不堆积
 （这是「后台任务可以容忍失败」的例外条款——主链路仍按错误完整暴露处理）。
 
-学习成果经 candy.db 持久化（group_impression / expressions / jargons 三表，
-表达条目的语义向量另存 expression_embedding 新表），使用侧约定：
+学习成果经 candy.db 持久化（group_impression / expressions / jargons /
+person_fact 四表，表达条目与人物的语义向量另存 expression_embedding /
+person_fact_embedding 新表），使用侧约定：
 - 群印象注入提示词 L2（天内字节级稳定，快照缓存在 GroupRuntime）；
-- 表达与黑话注入 L4（每次回复现取现注入，属易变信息）。
+- 表达与黑话注入 L4（每次回复现取现注入，属易变信息）；
+- 人物画像同样注入 L4（每轮回复前按「触发发送者→被@者→被回复者」取人、
+  按衰减后的检索权重取条目，整块标注内部参考；注入即刷新命中时间，
+  久不命中按半衰期衰减到 person_fact_min_weight 以下即不再触达模型——
+  行保留不删，防把陈旧玩笑当设定）。
 
 表达注入前的选取有两种方式（learning.expression_selection_mode）：
 weighted_random（默认）按权重随机抽取；vector 用 embedding 按当前聊天语境
@@ -31,10 +37,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import date, datetime, timedelta
 
 from .ai import AIClient
-from .database import ExpressionEntry, JargonEntry, pack_vector
+from .database import ExpressionEntry, JargonEntry, PersonFactEntry, pack_vector
 from .memory import MemoryManager, seconds_until_next_midnight
 from .models import (
     EXPRESSION_SELECTION_VECTOR,
+    PERSON_FACT_SCOPE_GLOBAL,
     ChatRecord,
     LearningSettings,
     Settings,
@@ -82,6 +89,68 @@ def day_bounds(day: date) -> tuple[float, float]:
     """某自然日的 [start_ts, end_ts) Unix 时间戳界（bot 的竞态防护共用）。"""
     start = datetime.combine(day, datetime.min.time()).timestamp()
     return start, start + 86400.0
+
+
+# ---------------------------------------------------------------- 人物长期记忆
+
+# 语义近重合并阈值：新抽到的 fact 与同一人已有事实 cosine 超过它就视为
+# 同一事实（累加 count、不新增行）。比表达召回的相似度下限严格得多——
+# 合并是写操作，误合两条不同事实不可逆，宁分勿合。
+PERSON_FACT_MERGE_SIMILARITY = 0.92
+# 每轮回复最多注入几个人物的画像（触发发送者 → 被 @ 的人 → 被回复者）。
+PERSON_FACT_MAX_TARGETS = 3
+# 全部目标画像行（「关于 X：- 事实 …」正文行，不含块标题与护栏行）的
+# 合计字符预算，超出从低分条目起舍弃。
+PERSON_FACT_BLOCK_CHAR_BUDGET = 200
+
+# 隐私硬拦截（提示词已明令不抽，这里是代码侧的第二道防线）：命中即整条
+# 丢弃并记 DEBUG。规则刻意保守——宁可错杀「是个大学生」这类擦边表述，
+# 也绝不让住址/学校全名/单位全称进入画像（宁缺勿错）。
+_PERSON_PRIVACY_RES = (
+    # 住址类：门牌/小区/宿舍等具体居住地线索
+    re.compile(r"住址|家庭地址|门牌|小区|宿舍|楼栋|单元房"),
+    # 证件与联系方式
+    re.compile(r"身份证|银行卡|微信号|QQ号|工号|手机号|电话号码"),
+    # 学校全名：带「在/就读/考上/毕业于」等指向具体校的措辞
+    re.compile(
+        r"(?:在|就读|转学|考[上入]|毕业)[\u4e00-\u9fffA-Za-z0-9·]{2,}"
+        r"(?:大学|学院|中学|小学|幼儿园)"
+    ),
+    # 「学校是/单位是」直陈具体校名单位名的句式
+    re.compile(r"(?:学校|单位)(?:是|为|叫)"),
+    # 工作单位全称
+    re.compile(
+        r"在[\u4e00-\u9fffA-Za-z0-9（）()·]{2,}"
+        r"(?:公司|集团|事务所|工厂|医院|银行|单位|机关)"
+    ),
+)
+
+
+def person_fact_privacy_rejected(fact: str) -> bool:
+    """事实文本是否命中隐私硬拦截（第二道防线，见 _PERSON_PRIVACY_RES）。"""
+    return any(pattern.search(fact) for pattern in _PERSON_PRIVACY_RES)
+
+
+def person_fact_score(
+    weight: float,
+    count: int,
+    last_hit_time: float,
+    created_ts: float,
+    now: float,
+    half_life_days: float,
+) -> float:
+    """人物事实的检索权重：weight × (1 + ln(1+count)) × 半衰期衰减。
+
+    衰减参照时间取 max(last_hit_time, created_ts)——从未注入过的新事实
+    按入库时间起步衰减，绝不可能拿 0 当「上次命中」永远满分；距参照时间
+    每过 half_life_days 天权重减半。log(1+count) 增益让反复学到的事实
+    更抗遗忘（count 至少为 1，ln2≈0.69 起步）。now 由调用方注入（测试
+    用假时钟验证半衰期边界）。
+    """
+    gain = 1.0 + math.log(1.0 + max(count, 1))
+    reference = max(last_hit_time, created_ts)
+    days = max(now - reference, 0.0) / 86400.0
+    return weight * gain * 0.5 ** (days / max(half_life_days, 1e-9))
 
 
 def _clip_records_for_impression(
@@ -186,7 +255,7 @@ class LearningService:
         ls = self._settings().learning
         if self._stopping or not ls.enabled:
             return
-        if not ls.expression_enabled and not ls.jargon_enabled:
+        if not (ls.expression_enabled or ls.jargon_enabled or ls.person_enabled):
             return
         batch_size = max(ls.expression_batch_size, 1)
         pending = self._pending.setdefault(group_id, [])
@@ -217,12 +286,14 @@ class LearningService:
                 del self._batch_tasks[gid]
 
     async def _learn_batch(self, group_id: int, batch: list[ChatRecord]) -> None:
-        """一批被淘汰消息：表达与黑话学习各自独立执行、互不牵连。"""
+        """一批被淘汰消息：表达、黑话与人物事实学习各自独立执行、互不牵连。"""
         ls = self._settings().learning
         if ls.expression_enabled:
             await self._guarded(self._learn_expressions(group_id, batch))
         if ls.jargon_enabled:
             await self._guarded(self._learn_jargons(group_id, batch))
+        if ls.person_enabled:
+            await self._guarded(self._learn_person_facts(group_id, batch))
 
     async def _guarded(self, coro: Awaitable[None]) -> None:
         """后台学习任务统一容错：失败只记 warning 并跳过本次。"""
@@ -309,6 +380,193 @@ class LearningService:
         return meaning_with_context[
             : self._settings().learning.jargon_meaning_max_chars
         ]
+
+    # ------------------------------------------------------ 任务 3：人物长期记忆
+
+    async def _learn_person_facts(self, group_id: int, batch: list[ChatRecord]) -> None:
+        """一批被淘汰消息：抽取关于群友的稳定事实并按人入库。
+
+        昵称→user_id 的挂接宁缺勿错：只在本批消息记录内按发言人昵称
+        **精确**匹配（is_self 记录不参与——绝不把事实挂到 bot 自己头上），
+        匹配不到或有重名歧义一律丢弃并记 DEBUG，绝不做模糊猜人。隐私
+        线索在提示词硬约束之外再过一道代码侧硬拦截（person_fact_privacy
+        _rejected）。配置了 models.embedding 时入库前先与同人已有事实做
+        语义近重合并（cosine > PERSON_FACT_MERGE_SIMILARITY 视为同一事实，
+        累加 count 不新增行）；未配置时退化为文本精确去重——向量语义
+        合并是增强路径，不是前提。
+        """
+        ls = self._settings().learning
+        chat_text = learning_chat_text(batch)
+        if not chat_text.strip():
+            return
+        candidates = await self._ai().learn_person_facts(chat_text)
+        if not candidates:
+            logger.debug("群 %d 人物事实学习：本批无可学内容", group_id)
+            return
+        logger.debug("群 %d 人物事实学习候选：%r", group_id, candidates)
+        speakers: dict[str, set[int]] = {}
+        for record in batch:
+            if not record.is_self:
+                speakers.setdefault(record.nickname, set()).add(record.user_id)
+        resolved: list[tuple[int, str, str]] = []  # (user_id, 昵称, fact)
+        seen: set[tuple[int, str]] = set()
+        ai = self._ai()
+        for nickname, fact in candidates:
+            if person_fact_privacy_rejected(fact):
+                logger.debug("群 %d 人物事实隐私硬拦截，丢弃：%r", group_id, fact)
+                continue
+            user_ids = speakers.get(nickname)
+            if not user_ids:
+                logger.debug(
+                    "群 %d 人物事实匹配不到本批发言人，丢弃：%s / %s",
+                    group_id, nickname, fact,
+                )
+                continue
+            if len(user_ids) > 1:
+                logger.debug(
+                    "群 %d 人物事实昵称重名歧义，丢弃：%s / %s",
+                    group_id, nickname, fact,
+                )
+                continue
+            user_id = next(iter(user_ids))
+            if (user_id, fact) in seen:
+                continue
+            seen.add((user_id, fact))
+            if ls.person_self_review and not await ai.review_person_fact(
+                nickname, fact
+            ):
+                logger.debug(
+                    "群 %d 人物事实自审拒收：%s / %s", group_id, nickname, fact
+                )
+                continue
+            resolved.append((user_id, nickname, fact))
+        if not resolved:
+            return
+        ts = time.time()
+        scope_group_id = (
+            None if ls.person_fact_scope == PERSON_FACT_SCOPE_GLOBAL else group_id
+        )
+        model = self._embedding_model_name()
+        if model is None:
+            # 未配置 embedding：文本精确去重（record_person_fact 先行查询）
+            for user_id, nickname, fact in resolved:
+                await self._memory.db.record_person_fact(
+                    scope_group_id, user_id, nickname, fact, ts
+                )
+        else:
+            await self._record_person_facts_merged(
+                scope_group_id, resolved, ts, model
+            )
+        logger.info(
+            "群 %d 人物事实学习：处理 %d 条（候选 %d 条）",
+            group_id, len(resolved), len(candidates),
+        )
+
+    async def _record_person_facts_merged(
+        self,
+        scope_group_id: int | None,
+        resolved: list[tuple[int, str, str]],
+        ts: float,
+        model: str,
+    ) -> int:
+        """带语义近重合并的入库路径：返回实际新增行数。
+
+        一次调用只发一轮 embed（本轮所有待算文本合并分片）：既算新事实
+        的向量，也顺手懒补同人已有事实里缺向量/出自旧模型的行——合并
+        比对反正要用它们的向量。新事实向量与同人已有向量 cosine 超过
+        PERSON_FACT_MERGE_SIMILARITY 即判同一事实：bump 已有行、不新增，
+        也无需再存新向量（比对用的就是那条已有行的向量）。
+        """
+        db = self._memory.db
+        # 按人分组；先收集全部待算文本（已有行缺向量 + 新事实），分片算完再落库
+        by_user: dict[int, list[tuple[str, str]]] = {}
+        for user_id, nickname, fact in resolved:
+            by_user.setdefault(user_id, []).append((nickname, fact))
+        rows_by_user: dict[int, list[PersonFactEntry]] = {}
+        vectors_by_user: dict[int, dict[int, list[float]]] = {}
+        texts: list[str] = []
+        lazy_row_ids: list[int] = []  # texts 前段：已有行懒补的 fact_id
+        for user_id in by_user:
+            rows = await db.load_person_facts(user_id, scope_group_id)
+            vectors = await db.load_person_fact_vectors(user_id, scope_group_id, model)
+            rows_by_user[user_id] = rows
+            vectors_by_user[user_id] = vectors
+            for row in rows:
+                if row.id not in vectors:
+                    texts.append(row.fact)
+                    lazy_row_ids.append(row.id)
+        new_offsets = list(range(len(texts), len(texts) + len(resolved)))
+        texts.extend(fact for _uid, _name, fact in resolved)
+        vectors = await self._embed_chunks(texts, model)
+        if len(vectors) != len(texts):
+            raise RuntimeError("人物事实 embedding 结果与请求条数不符")
+        # 先回填已有行的懒补向量（内存里供合并比对，并落库）
+        lazy_entries: list[tuple[int, bytes, int, str]] = []
+        for index, fact_id in enumerate(lazy_row_ids):
+            vector = vectors[index]
+            lazy_entries.append((fact_id, pack_vector(vector), len(vector), model))
+        # fact_id → 在 texts/向量结果里的位置（list.index 逐个扫描是 O(n²)，
+        # 一轮批量里已有行可能不少，用字典定位）
+        lazy_positions = {fact_id: index for index, fact_id in enumerate(lazy_row_ids)}
+        for user_id, rows in rows_by_user.items():
+            for row in rows:
+                position = lazy_positions.get(row.id)
+                if position is not None:
+                    vectors_by_user[user_id][row.id] = vectors[position]
+        if lazy_entries:
+            await db.upsert_person_fact_embeddings(lazy_entries, ts)
+        # 新事实逐条：近重合并或新增
+        created = 0
+        embed_rows: list[tuple[int, bytes, int, str]] = []
+        for slot, offset in zip(resolved, new_offsets):
+            user_id, nickname, fact = slot
+            vector = vectors[offset]
+            merged_id = None
+            for row in rows_by_user[user_id]:
+                existing = vectors_by_user[user_id].get(row.id)
+                if existing is None:
+                    continue
+                if _cosine_similarity(vector, existing) > PERSON_FACT_MERGE_SIMILARITY:
+                    merged_id = row.id
+                    break
+            if merged_id is not None:
+                await db.bump_person_fact(merged_id, nickname, ts)
+                continue
+            fact_id, is_new = await db.record_person_fact(
+                scope_group_id, user_id, nickname, fact, ts
+            )
+            if is_new:
+                created += 1
+                embed_rows.append((fact_id, pack_vector(vector), len(vector), model))
+                rows_by_user[user_id].append(
+                    PersonFactEntry(
+                        id=fact_id, group_id=scope_group_id, user_id=user_id,
+                        nickname=nickname, fact=fact, count=1, weight=1.0,
+                        hit_count=0, last_hit_time=ts, created_ts=ts,
+                    )
+                )
+                vectors_by_user[user_id][fact_id] = vector
+            else:
+                # 与同人已有行文本全同（懒补阶段已覆盖其向量）：合并语义同上
+                await db.upsert_person_fact_embeddings(
+                    [(fact_id, pack_vector(vector), len(vector), model)], ts
+                )
+        if embed_rows:
+            await db.upsert_person_fact_embeddings(embed_rows, ts)
+        return created
+
+    async def _embed_chunks(self, texts: list[str], model: str) -> list[list[float]]:
+        """分片批量 embed（每片一次调用，与表达向量补算同规格）。"""
+        out: list[list[float]] = []
+        for start in range(0, len(texts), _EMBED_BATCH_SIZE):
+            chunk = texts[start : start + _EMBED_BATCH_SIZE]
+            vectors = await self._ai().embed(chunk)
+            if len(vectors) != len(chunk):
+                raise RuntimeError(
+                    f"embedding 返回 {len(vectors)} 条向量，与本次发送的 {len(chunk)} 条文本不符"
+                )
+            out.extend(vectors)
+        return out
 
     # ------------------------------------------------------------ 任务 A：每日印象
 
@@ -407,11 +665,8 @@ class LearningService:
             recall = await self._vector_recall(group_id, candidates, recent, trigger, ls)
             if recall is not None:
                 if not recall:
-                    logger.debug(
-                        "群 %d 表达向量召回：全部候选低于相似度下限 %.2f，本次不注入",
-                        group_id,
-                        ls.expression_min_similarity,
-                    )
+                    # 空召回的具体成因（全部低于阈值 / 候选尚无向量）已在
+                    # _vector_recall 内记 DEBUG；两种都按「宁缺毋滥」不注入
                     return []
                 sims = recall
                 candidates = [c for c in candidates if c.id in recall]
@@ -601,11 +856,23 @@ class LearningService:
             "、".join(f'{entry.situation}→{entry.style}={sim:.3f}' for sim, entry in top)
             or "（无可比对向量）",
         )
-        return {
+        survivors = {
             entry.id: sim
             for sim, entry in top
             if sim >= ls.expression_min_similarity
         }
+        if not survivors:
+            # 空召回有两种成因，如实区分、别都写成「低于阈值」：
+            # - scored 为空＝该群候选一条向量都还没补算出来（后台补算在追），
+            #   是「还没得比」而非「语境无关」；
+            # - scored 非空但无一过阈值＝真的全部相似度不足（宁缺毋滥）。
+            reason = (
+                f"全部候选低于相似度下限 {ls.expression_min_similarity:.2f}"
+                if scored
+                else "该群候选尚无可用向量（补算进行中），无可比对条目"
+            )
+            logger.debug("群 %d 表达向量召回：%s，本次不注入", group_id, reason)
+        return survivors
 
     async def match_jargons(
         self, group_id: int, context: str, limit: int
@@ -641,3 +908,93 @@ class LearningService:
                 self._jargon_patterns.clear()
             self._jargon_patterns[term] = pattern
         return pattern
+
+    # -------------------------------------------------- 人物画像注入（使用侧）
+
+    async def pick_person_profiles(
+        self,
+        group_id: int,
+        targets: Sequence[tuple[int, str]],
+        *,
+        now: float | None = None,
+    ) -> list[tuple[str, list[str]]]:
+        """为本轮相关人物选取注入 L4 的画像：[(昵称, 事实列表)]。
+
+        targets 为按优先级排好序的 (user_id, 昵称)（触发发送者 → 被 @ 的
+        人 → 被回复消息的发送者，解析在 bot 侧完成），最多取前
+        PERSON_FACT_MAX_TARGETS 个去重后的人；每人取衰减检索权重
+        （person_fact_score）不低于 person_fact_min_weight 的 top
+        person_fact_max_inject_per_person 条，全部目标合计不超过
+        PERSON_FACT_BLOCK_CHAR_BUDGET 字（按「关于 X：- 事实 …」正文行
+        计，块标题与护栏行不计入预算）——超预算时从低分条目起舍弃。
+        一条都不过阈值的人整行不出现，全员都没有即返回空列表（调用方
+        据此整块不注入）。被选中的行刷新 last_hit_time 并累计 hit_count
+        （被使用=被强化）；now 可注入假时钟供测试验证衰减边界。
+
+        作用域（person_fact_scope）决定检索键：group 只取本群学的行，
+        global 取该 user_id 跨群的全部行（含历史上以 group 作用域学的行）。
+        """
+        ls = self._settings().learning
+        if not targets:
+            return []
+        stamp = time.time() if now is None else now
+        global_scope = ls.person_fact_scope == PERSON_FACT_SCOPE_GLOBAL
+        picked: list[tuple[str, list[str]]] = []
+        touched: list[int] = []
+        used_chars = 0
+        seen_users: set[int] = set()
+        for user_id, nickname in targets:
+            if len(picked) >= PERSON_FACT_MAX_TARGETS:
+                break
+            if user_id in seen_users:
+                continue
+            seen_users.add(user_id)
+            rows = await self._memory.db.load_person_facts(
+                user_id, None if global_scope else group_id
+            )
+            scored: list[tuple[float, PersonFactEntry]] = []
+            for row in rows:
+                score = person_fact_score(
+                    row.weight,
+                    row.count,
+                    row.last_hit_time,
+                    row.created_ts,
+                    stamp,
+                    ls.person_fact_half_life_days,
+                )
+                if score >= ls.person_fact_min_weight:
+                    scored.append((score, row))
+            # 分数高者优先；同分按入库先后（created_ts、id）稳定排序
+            scored.sort(key=lambda item: (-item[0], item[1].created_ts, item[1].id))
+            facts: list[PersonFactEntry] = []
+            for _score, row in scored[: ls.person_fact_max_inject_per_person]:
+                trial = [r.fact for r in facts] + [row.fact]
+                cost = person_profile_line_chars(nickname, trial)
+                if used_chars + cost > PERSON_FACT_BLOCK_CHAR_BUDGET:
+                    break  # 预算只够到这里：此人剩余条目与后面的人都舍弃
+                facts.append(row)
+            if not facts:
+                continue
+            used_chars += person_profile_line_chars(
+                nickname, [r.fact for r in facts]
+            )
+            picked.append((nickname, [row.fact for row in facts]))
+            touched.extend(row.id for row in facts)
+        if touched:
+            await self._memory.db.touch_person_facts(touched, stamp)
+        if picked:
+            logger.debug(
+                "群 %d L4 注入人物画像：%s",
+                group_id,
+                "、".join(f"{name}×{len(facts)}条" for name, facts in picked),
+            )
+        return picked
+
+
+def person_profile_line_chars(nickname: str, facts: Sequence[str]) -> int:
+    """一个人物画像正文行的渲染长度（「关于 X：- 事实1 - 事实2」整行），
+    与 prompts.person_profile_block 的渲染严格同式；块标题与护栏行不计入
+    合计字数预算。"""
+    if not facts:
+        return 0
+    return len(f"关于 {nickname}：" + " ".join(f"- {fact}" for fact in facts))

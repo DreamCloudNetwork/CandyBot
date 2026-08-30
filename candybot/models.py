@@ -123,12 +123,20 @@ class NormalizedMessage:
     （一次 vision 调用同时产出 summary/keep/sticker 与表情包审核结论）给出的
     StickerAssessment；仅在该图判定为表情包且审核通过时非 None，供收集侧
     免重复调用直接入 sticker_meta 表。其余模式恒为空（审核在收集路径内做）。
+
+    at_user_ids / reply_user_id + reply_nickname 是 normalize 解析 at/reply
+    段时顺带产出的结构化对象信息（不含机器人自己：@我/回复我已由
+    mentioned_me 表达）：人物画像注入据此确定「被 @ 的人」「被回复消息的
+    发送者」，bot 侧不再回头解析渲染后的文本。at_user_ids 按出现顺序去重。
     """
 
     record: ChatRecord
     mentioned_me: bool
     sticker_flags: tuple[bool, ...] = ()
     sticker_metas: tuple["StickerAssessment | None", ...] = ()
+    at_user_ids: tuple[int, ...] = ()
+    reply_user_id: int | None = None
+    reply_nickname: str = ""
 
 
 @dataclass(slots=True)
@@ -378,10 +386,17 @@ EXPRESSION_SELECTION_MODES = ("weighted_random", "vector")
 EXPRESSION_SELECTION_WEIGHTED_RANDOM = "weighted_random"
 EXPRESSION_SELECTION_VECTOR = "vector"
 
+# 人物事实的作用域（learning.person_fact_scope）：group（默认）事实只在学它
+# 的那个群注入（存储键带群号）；global 时同 user_id 跨群可见——跨群使用他人
+# 信息有社交风险，明说后才允许显式配置（见 README「人物记忆」）。
+PERSON_FACT_SCOPES = ("group", "global")
+PERSON_FACT_SCOPE_GROUP = "group"
+PERSON_FACT_SCOPE_GLOBAL = "global"
+
 
 @dataclass(frozen=True)
 class LearningSettings:
-    """记忆与学习机制（每日群印象、表达学习、黑话学习）的配置。
+    """记忆与学习机制（每日群印象、表达学习、黑话学习、人物长期记忆）的配置。
 
     总开关 enabled 关掉全部后台学习任务；impression_enabled /
     expression_enabled / jargon_enabled 分别控制单项。学习任务在后台
@@ -399,6 +414,15 @@ class LearningSettings:
     （一个都不过则本次不注入——宁缺毋滥）；
     jargon_max_entries：每群黑话条目上限，超限淘汰最久未命中的；
     jargon_max_inject：单次回复最多注入的命中黑话条数（L4，机械匹配）。
+
+    人物长期记忆（person_*，见 README「人物记忆」）：person_enabled 单项
+    开关（另受总开关 enabled 约束）；person_fact_scope 为事实作用域
+    （group 默认只在学的群里注入 / global 同 user_id 跨群可见，有社交风险）；
+    person_fact_max_inject_per_person 为回复前每人最多注入的画像条数；
+    person_fact_half_life_days 为久未命中事实的衰减半衰期（天）；
+    person_fact_min_weight 为衰减后权重的注入下限（低于它不再触达模型，
+    行保留不删）；person_self_review 为可选的入库自审（默认关，接口预留，
+    打开后每条候选多一次 learning 调用）。
     """
 
     enabled: bool = True
@@ -425,6 +449,15 @@ class LearningSettings:
     jargon_candidates_per_batch: int = 5
     # 黑话含义入库长度上限（防模型长篇大论撑爆 L4）。
     jargon_meaning_max_chars: int = 200
+    # ---- 人物长期记忆（person_*，关闭 person_enabled 时学习批次与 L4
+    # 组装和引入前逐字节一致）----
+    person_enabled: bool = True
+    person_fact_scope: str = PERSON_FACT_SCOPE_GROUP
+    person_fact_max_inject_per_person: int = 4
+    person_fact_half_life_days: float = 30.0
+    person_fact_min_weight: float = 0.25
+    # 可选自审（默认关）：打开后每条人物事实入库前多一次 learning 判定调用
+    person_self_review: bool = False
 
 
 # 敷衍池内置默认：回复过长或拆条后为空时随机抽取其一代替发送。
@@ -1130,6 +1163,31 @@ def load_settings(cfg: Any) -> Settings:
             'judge/reply 一致）：请补上该角色，或把模式改回 "weighted_random"'
         )
 
+    # 人物长期记忆参数（person_*）
+    person_fact_scope = (
+        _parse_str(learn_cfg, "person_fact_scope", PERSON_FACT_SCOPE_GROUP)
+        .strip()
+        .lower()
+    )
+    if person_fact_scope not in PERSON_FACT_SCOPES:
+        raise ValueError(
+            f"配置项 `learning.person_fact_scope` 应为 "
+            f"{' / '.join(PERSON_FACT_SCOPES)} 之一，实际是 {person_fact_scope!r}"
+        )
+    person_fact_half_life_days = _parse_float(learn_cfg, "person_fact_half_life_days", 30.0)
+    # 半衰期直接进指数衰减：inf/nan 让衰减恒 1 或恒 0，非正数让公式失效
+    if not math.isfinite(person_fact_half_life_days) or person_fact_half_life_days <= 0:
+        raise ValueError(
+            f"配置项 `learning.person_fact_half_life_days` 应为正有限数字，"
+            f"实际是 {person_fact_half_life_days!r}"
+        )
+    person_fact_min_weight = _parse_float(learn_cfg, "person_fact_min_weight", 0.25)
+    if not math.isfinite(person_fact_min_weight) or person_fact_min_weight < 0:
+        raise ValueError(
+            f"配置项 `learning.person_fact_min_weight` 应为非负有限数字，"
+            f"实际是 {person_fact_min_weight!r}"
+        )
+
     learning_settings = LearningSettings(
         enabled=_parse_bool(learn_cfg.get("enabled", True), "learning.enabled"),
         impression_enabled=_parse_bool(
@@ -1160,6 +1218,18 @@ def load_settings(cfg: Any) -> Settings:
             "jargon_candidates_per_batch", 5
         ),
         jargon_meaning_max_chars=_parse_positive_int("jargon_meaning_max_chars", 200),
+        person_enabled=_parse_bool(
+            learn_cfg.get("person_enabled", True), "learning.person_enabled"
+        ),
+        person_fact_scope=person_fact_scope,
+        person_fact_max_inject_per_person=_parse_positive_int(
+            "person_fact_max_inject_per_person", 4
+        ),
+        person_fact_half_life_days=person_fact_half_life_days,
+        person_fact_min_weight=person_fact_min_weight,
+        person_self_review=_parse_bool(
+            learn_cfg.get("person_self_review", False), "learning.person_self_review"
+        ),
     )
 
     # stickers 段可整体省略（全部走默认值）

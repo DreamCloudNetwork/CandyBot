@@ -142,6 +142,11 @@ async def normalize_group_message(
     mentioned_me = False
     parts: list[str] = []
     image_urls: list[str] = []
+    # at/reply 段的结构化解析结果（人物画像注入取人用，见 bot.py）：
+    # @ 的人按出现顺序去重；回复对象记录被回复消息发送者的 user_id 与昵称。
+    at_ids: list[int] = []
+    reply_user_id: int | None = None
+    reply_nickname = ""
 
     for seg in segments:
         if not isinstance(seg, dict):
@@ -165,13 +170,19 @@ async def normalize_group_message(
                     parts.append("@全体成员")
             elif target.isdigit():
                 parts.append(f"@QQ{target}")
+                uid = int(target)
+                if uid not in at_ids:
+                    at_ids.append(uid)
         elif seg_type == "reply":
-            ref_text, is_self_ref = await _resolve_reply(
+            ref_text, is_self_ref, ref_uid, ref_nick = await _resolve_reply(
                 data, find_by_message_id, self_qq, self_nickname
             )
             if ref_text:
                 parts.append(ref_text)
                 mentioned_me = mentioned_me or is_self_ref
+            if reply_user_id is None and ref_uid is not None:
+                reply_user_id = ref_uid
+                reply_nickname = ref_nick
         elif seg_type == "image":
             if multimodal.mode != "describe":
                 parts.append("[图片]")
@@ -310,35 +321,38 @@ async def normalize_group_message(
         mentioned_me=mentioned_me,
         sticker_flags=sticker_flags,
         sticker_metas=tuple(sticker_metas),
+        at_user_ids=tuple(at_ids),
+        reply_user_id=reply_user_id,
+        reply_nickname=reply_nickname,
     )
 
 
 async def _resolve_reply(
     reply_data: dict, find_by_message_id, self_qq: int, self_nickname: str = "糖糖"
-) -> tuple[str | None, bool]:
-    """构造回复引用文本，返回 (文本, 是否引用了机器人自己的消息)。"""
+) -> tuple[str | None, bool, int | None, str]:
+    """构造回复引用文本，返回 (文本, 是否引用了机器人自己的消息,
+    被回复消息发送者 user_id, 其昵称)。引用 bot 自己时后两者为 None/空
+    （mentioned_me 已表达这层信息，人物画像也不该挂到 bot 头上）。"""
     try:
         ref_id = int(reply_data.get("id"))
     except (TypeError, ValueError):
-        return None, False
+        return None, False, None, ""
     try:
         referenced = await find_by_message_id(ref_id)
     except Exception:  # 记忆层异常不该影响消息解析
         referenced = None
     if referenced is not None:
         if referenced.is_self:
-            return f"[回复{self_nickname}]", True
+            return f"[回复{self_nickname}]", True, None, ""
         snippet = referenced.text.replace("\n", " ")[:50]
-        ref_label = (
-            f"{referenced.nickname}({referenced.user_id})"
-            if referenced.nickname
-            else f"QQ{referenced.user_id}"
-        )
-        return f"[回复 {ref_label}：{snippet}]", False
+        label_nick = referenced.nickname or f"QQ{referenced.user_id}"
+        ref_label = f"{referenced.nickname}({referenced.user_id})" if referenced.nickname else f"QQ{referenced.user_id}"
+        return f"[回复 {ref_label}：{snippet}]", False, referenced.user_id, label_nick
     # 记忆里找不到（可能早于启动），只能靠 user_id 判断
     ref_user = str(reply_data.get("user_id", ""))
     if ref_user.isdigit():
         is_self = int(ref_user) == self_qq
         label = self_nickname if is_self else f"QQ{ref_user}"
-        return f"[回复 {label}]", is_self
-    return "[回复消息]", False
+        target = None if is_self else int(ref_user)
+        return f"[回复 {label}]", is_self, target, "" if is_self else f"QQ{ref_user}"
+    return "[回复消息]", False, None, ""

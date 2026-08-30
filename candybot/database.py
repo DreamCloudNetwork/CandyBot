@@ -1,6 +1,6 @@
 """SQLite 持久层：SQLModel 表定义与异步数据操作（data 目录下的 candy.db）。
 
-十个表：
+十二个表：
 - chat_history     每条群聊消息（含机器人自己发出的）；文本历史全量保留；
                    is_command 标记命令插件产生的消息（补列与存量回填见
                    migrations.py 的启动迁移）。
@@ -18,6 +18,14 @@
                    模型名（模型变更即视为向量过期，由后台补算重算）。
 - jargons          黑话词条：term + meaning，同群去重，超出条目上限时
                    淘汰最久未命中的条目。
+- person_fact      人物长期记忆：关于某个群友的稳定事实（按人存储，带
+                   权重与最近命中时间，久不命中按半衰期衰减、只是不再
+                   触达模型，行保留不删便于审计/复活）。scope 为 group 时
+                   带群号，global 时 group_id 为 NULL（跨群可见）。
+- person_fact_embedding person_fact 的语义向量：独立新表（不 ALTER
+                   person_fact），fact_id 唯一外键；结构照
+                   expression_embedding，用于入库前的语义近重合并
+                   （cosine 超过阈值的视为同一事实，累加 count 不新增行）。
 - sticker          表情包收藏（最小版）：同群按 (群, 内容指纹) 去重，
                    全局数量超上限时替换最久未使用的条目——本表只删记录，
                    图片文件的写入与删除由 stickers.StickerStore 负责。
@@ -205,6 +213,55 @@ class JargonRow(SQLModel, table=True):
     last_hit_time: float = Field(default=0.0, nullable=False)
 
 
+class PersonFactRow(SQLModel, table=True):
+    """person_fact：关于某个群友的稳定事实（人物长期记忆，见 learning.py）。
+
+    scope 为 group 时 group_id 带学它的群号；global 时为 NULL（同 user_id
+    跨群可见）。唯一约束按 (group_id, user_id, fact 文本)：同文本重复学到
+    只累加 count、刷新时间与昵称——注意 SQLite 的 UNIQUE 把 NULL 视为互
+    不相等，global（group_id=NULL）行不被库级约束兜住，去重以
+    record_person_fact 的先行查询为准（与 expressions 同一套写法）。
+    weight 为存储权重（默认 1.0），检索时再乘 log(1+count) 增益与半衰期
+    衰减（见 learning.person_fact_score）；行永不删除，衰减到阈值以下
+    只是不再触达模型。nickname 只是最近一次学到的展示用名字。
+    """
+
+    __tablename__ = "person_fact"
+    __table_args__ = (UniqueConstraint("group_id", "user_id", "fact"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    group_id: int | None = Field(default=None, nullable=True, index=True)
+    user_id: int = Field(nullable=False, index=True)
+    nickname: str = Field(default="", nullable=False)
+    fact: str = Field(nullable=False)
+    count: int = Field(default=1, nullable=False)
+    weight: float = Field(default=1.0, nullable=False)
+    hit_count: int = Field(default=0, nullable=False)
+    last_hit_time: float = Field(default=0.0, nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+
+
+class PersonFactEmbeddingRow(SQLModel, table=True):
+    """person_fact_embedding：人物事实的语义向量（入库前语义近重合并）。
+
+    结构照 expression_embedding：独立新表（create_all 自动建、不改
+    person_fact），fact_id 唯一并外键指向 person_fact.id，vector 为
+    float32 小端打包字节（pack_vector），model 记录产生它的 embedding
+    模型名（模型变更即视为过期，学习入库时懒算重算）。与表达向量不同，
+    这里的向量只服务于写入侧的近重合并，读取侧（画像注入）不做检索，
+    因此不维护常驻内存缓存，用时现查。
+    """
+
+    __tablename__ = "person_fact_embedding"
+
+    id: int | None = Field(default=None, primary_key=True)
+    fact_id: int = Field(foreign_key="person_fact.id", nullable=False, unique=True)
+    vector: bytes = Field(nullable=False)
+    dim: int = Field(default=0, nullable=False)
+    model: str = Field(default="", nullable=False)
+    created_ts: float = Field(default=0.0, nullable=False)
+
+
 class StickerRow(SQLModel, table=True):
     """sticker：表情包收藏（最小版）。
 
@@ -277,6 +334,22 @@ class JargonEntry:
     meaning: str
     count: int
     last_hit_time: float
+
+
+@dataclass(frozen=True)
+class PersonFactEntry:
+    """一条人物事实。weight 为存储权重，检索权重另算（见 learning）。"""
+
+    id: int
+    group_id: int | None
+    user_id: int
+    nickname: str
+    fact: str
+    count: int
+    weight: float
+    hit_count: int
+    last_hit_time: float
+    created_ts: float
 
 
 @dataclass(frozen=True)
@@ -888,6 +961,166 @@ class CandyDatabase:
                 if row is not None:
                     row.last_hit_time = ts
                     session.add(row)
+            await session.commit()
+
+    # ------------------------------------------------------------ 人物长期记忆
+
+    async def load_person_facts(
+        self, user_id: int, group_id: int | None
+    ) -> list[PersonFactEntry]:
+        """某个人的全部人物事实。group_id 为具体群号时只取该群学的
+        （scope=group 检索键）；为 None 时取跨群全部（scope=global 检索键，
+        含 group_id 有值的历史行——切换作用域不丢存量）。"""
+        async with self._sessions() as session:
+            stmt = select(PersonFactRow).where(PersonFactRow.user_id == user_id)
+            if group_id is not None:
+                stmt = stmt.where(PersonFactRow.group_id == group_id)
+            rows = (await session.exec(stmt)).all()
+            return [
+                PersonFactEntry(
+                    id=row.id,
+                    group_id=row.group_id,
+                    user_id=row.user_id,
+                    nickname=row.nickname,
+                    fact=row.fact,
+                    count=row.count,
+                    weight=row.weight,
+                    hit_count=row.hit_count,
+                    last_hit_time=row.last_hit_time,
+                    created_ts=row.created_ts,
+                )
+                for row in rows
+            ]
+
+    async def record_person_fact(
+        self, group_id: int | None, user_id: int, nickname: str, fact: str, ts: float
+    ) -> tuple[int, bool]:
+        """记录一条人物事实，返回 (行 id, 是否新建)。
+
+        同 (scope 键, user_id, 文本) 已有行时不新增：只累加 count、刷新
+        最近命中时间与展示昵称（重复学到＝再次被强化，见
+        learning.person_fact_score 对 last_hit_time 的引用）。global 作用
+        域下 group_id 为 NULL，SQLite 唯一约束不兜 NULL 相等，去重完全
+        依赖这里的先行查询（串行后台批次内无并发竞争）。
+        """
+        async with self._sessions() as session:
+            stmt = select(PersonFactRow).where(
+                PersonFactRow.user_id == user_id, PersonFactRow.fact == fact
+            )
+            if group_id is None:
+                stmt = stmt.where(col(PersonFactRow.group_id).is_(None))
+            else:
+                stmt = stmt.where(PersonFactRow.group_id == group_id)
+            row = (await session.exec(stmt)).first()
+            if row is None:
+                row = PersonFactRow(
+                    group_id=group_id,
+                    user_id=user_id,
+                    nickname=nickname,
+                    fact=fact,
+                    count=1,
+                    weight=1.0,
+                    created_ts=ts,
+                    last_hit_time=ts,
+                )
+                session.add(row)
+                await session.commit()
+                return int(row.id), True
+            await self._bump_person_fact_row(session, row, nickname, ts)
+            return int(row.id), False
+
+    async def bump_person_fact(
+        self, fact_id: int, nickname: str, ts: float
+    ) -> None:
+        """语义近重合并：命中已有行时累加 count、刷新时间与昵称（不新增行）。"""
+        async with self._sessions() as session:
+            row = await session.get(PersonFactRow, fact_id)
+            if row is None:  # 行不该存在即失踪：静默跳过本条合并
+                return
+            await self._bump_person_fact_row(session, row, nickname, ts)
+
+    async def _bump_person_fact_row(
+        self,
+        session: SQLModelAsyncSession,
+        row: PersonFactRow,
+        nickname: str,
+        ts: float,
+    ) -> None:
+        row.count += 1
+        if nickname:
+            row.nickname = nickname
+        row.last_hit_time = ts
+        session.add(row)
+        await session.commit()
+
+    async def touch_person_facts(self, ids: Sequence[int], ts: float) -> None:
+        """画像被注入即刷新最近命中时间并累计命中数（被使用=被强化）。"""
+        if not ids:
+            return
+        async with self._sessions() as session:
+            for row_id in ids:
+                row = await session.get(PersonFactRow, row_id)
+                if row is not None:
+                    row.last_hit_time = ts
+                    row.hit_count += 1
+                    session.add(row)
+            await session.commit()
+
+    async def load_person_fact_vectors(
+        self, user_id: int, group_id: int | None, model: str
+    ) -> dict[int, list[float]]:
+        """某人事实的现存向量 {fact_id: 向量}：只取与当前模型一致的
+        （旧模型向量视为缺失，由学习入库路径懒算重算）；group_id 语义同
+        load_person_facts。"""
+        stmt = (
+            select(
+                PersonFactEmbeddingRow.fact_id,
+                PersonFactEmbeddingRow.vector,
+                PersonFactEmbeddingRow.dim,
+            )
+            .join(PersonFactRow, PersonFactRow.id == PersonFactEmbeddingRow.fact_id)
+            .where(
+                PersonFactRow.user_id == user_id,
+                PersonFactEmbeddingRow.model == model,
+            )
+        )
+        if group_id is not None:
+            stmt = stmt.where(PersonFactRow.group_id == group_id)
+        async with self._sessions() as session:
+            return {
+                fact_id: unpack_vector(blob, dim)
+                for fact_id, blob, dim in (await session.exec(stmt)).all()
+            }
+
+    async def upsert_person_fact_embeddings(
+        self, entries: Sequence[tuple[int, bytes, int, str]], ts: float | None = None
+    ) -> None:
+        """批量写入/覆盖人物事实向量。entries 为
+        (fact_id, pack_vector 字节, 维数, embedding 模型名)。"""
+        if not entries:
+            return
+        stamp = time.time() if ts is None else ts
+        ids = [fact_id for fact_id, _v, _d, _m in entries]
+        async with self._sessions() as session:
+            existing = {
+                row.fact_id: row
+                for row in (
+                    await session.exec(
+                        select(PersonFactEmbeddingRow).where(
+                            col(PersonFactEmbeddingRow.fact_id).in_(ids)
+                        )
+                    )
+                ).all()
+            }
+            for fact_id, vector, dim, model in entries:
+                row = existing.get(fact_id)
+                if row is None:
+                    row = PersonFactEmbeddingRow(fact_id=fact_id)
+                row.vector = vector
+                row.dim = dim
+                row.model = model
+                row.created_ts = stamp
+                session.add(row)
             await session.commit()
 
     # ------------------------------------------------------------ 表情包收藏

@@ -839,6 +839,50 @@ class CandyBot:
             )
         return expression_hints, jargon_hints
 
+    async def _person_profile_hints(
+        self, group_id: int, msg: NormalizedMessage, recent: list[ChatRecord]
+    ) -> list[tuple[str, list[str]]]:
+        """L4 人物画像注入准备（任务 3）：确定目标人物并选取事实。
+
+        目标优先级：触发消息发送者 → 被 @ 的人 → 被回复消息的发送者
+        （≤3、按人去重，截取与衰减检索都在 learning.pick_person_profiles
+        里做）。被 @ 与被回复对象直接用 normalize 的结构化解析结果
+        （at_user_ids / reply_user_id），不回头解析渲染后的文本；昵称
+        仅展示用，优先从近期上下文里同 user_id 的群友取，取不到退化为
+        「QQ号」。机器人自己永不作为目标（@我/回复我已由 mentioned_me
+        表达，画像也不许挂到 bot 头上）。
+
+        辅助能力：任何失败只记日志、退化为不注入，绝不阻断回复本身。
+        """
+        ls = self._settings.learning
+        if not ls.enabled or not ls.person_enabled:
+            return []
+        self_qq = self._settings.bot.self_qq
+        nicknames: dict[int, str] = {}
+        for r in recent:
+            if not r.is_self and r.user_id != self_qq and r.nickname:
+                nicknames.setdefault(r.user_id, r.nickname)
+        targets: list[tuple[int, str]] = []
+        record = msg.record
+        if record.user_id != self_qq:
+            targets.append((record.user_id, record.nickname or f"QQ{record.user_id}"))
+        for uid in msg.at_user_ids:
+            if uid != self_qq:
+                targets.append((uid, nicknames.get(uid) or f"QQ{uid}"))
+        if msg.reply_user_id is not None and msg.reply_user_id != self_qq:
+            targets.append(
+                (msg.reply_user_id, msg.reply_nickname or f"QQ{msg.reply_user_id}")
+            )
+        if not targets:
+            return []
+        try:
+            return await self._learning.pick_person_profiles(group_id, targets)
+        except Exception:
+            logger.warning(
+                "群 %d 人物画像注入准备失败，本次跳过注入", group_id, exc_info=True
+            )
+            return []
+
     async def _decide_and_reply(
         self, group_id: int, msg: NormalizedMessage, *, observe: bool = False
     ) -> None:
@@ -870,14 +914,16 @@ class CandyBot:
         # L4 学习注入每轮决策只算一次（见本方法 docstring），初稿与
         # 新鲜度重生成共享同一组 hints；失败容错在 _learning_hints 内部，
         # 退化为不注入
-        expression_hints, jargon_hints = await self._learning_hints(
-            group_id,
-            memory.model_tail(
-                profile.context_size,
-                include_commands=self._settings.plugins.include_commands_in_history,
-            ),
-            trigger=msg.record,  # 表达 vector 检索的语境与缓存键（加权随机模式忽略）
+        recent = memory.model_tail(
+            profile.context_size,
+            include_commands=self._settings.plugins.include_commands_in_history,
         )
+        expression_hints, jargon_hints = await self._learning_hints(
+            group_id, recent, trigger=msg.record,  # 表达 vector 检索的语境与缓存键（加权随机模式忽略）
+        )
+        # 人物画像（任务 3）同为每轮一次：选取即刷新命中记录（被使用=被
+        # 强化），重生成再选一遍就是二次强化；同为辅助能力，失败退化为不注入
+        person_hints = await self._person_profile_hints(group_id, msg, recent)
         # 一轮连发最多几次「被打断后重想」（generation.max_reconsider_per_burst）：
         # 每次重想是一回额外的 reply 模型调用，预算用尽后剩下的腹稿按原计划
         # 发完，防止病态刷屏把发送环节变成无限往返。
@@ -945,6 +991,7 @@ class CandyBot:
             decision,
             expression_hints,
             jargon_hints,
+            person_hints,
         )
         if not reply_text:
             logger.info("群 %d 回复生成为空，放弃发送", group_id)
@@ -976,6 +1023,7 @@ class CandyBot:
                     decision,
                     expression_hints,
                     jargon_hints,
+                    person_hints,
                 )
                 if regenerated:
                     reply_text = regenerated
@@ -1129,12 +1177,14 @@ class CandyBot:
         decision: Decision,
         expression_hints: list[tuple[str, str]],
         jargon_hints: list[tuple[str, str]],
+        person_hints: list[tuple[str, list[str]]] | None = None,
     ) -> str | None:
         """生成回复并处理其中的图片生命周期操作。
 
         expression_hints / jargon_hints 是本轮决策的 L4 学习注入内容，由
         _decide_and_reply 调 _learning_hints 计算一次后传入：新鲜度重生成
         再次进入本方法时复用同一组 hints，绝不二次抽样、二次刷新表达条目。
+        person_hints（人物画像，_person_profile_hints 每轮算一次）同理。
 
         首稿通过 send_reply 工具参数携带 drop/recall 操作：立即把操作落到
         记忆；若发生过成功的召回（模型想重新查看某张旧图），重建上下文后
@@ -1191,6 +1241,7 @@ class CandyBot:
                 expression_hints=expression_hints,
                 jargon_hints=jargon_hints,
                 repetition_warning=repetition,
+                person_hints=person_hints or (),
             )
             if draft is None or not draft.text:
                 return None

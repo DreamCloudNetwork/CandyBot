@@ -111,7 +111,7 @@ class FakeAI:
                              current_message, now_text, *, forced=False,
                              engaged=False, score=None, reason="",
                              expression_hints=(), jargon_hints=(),
-                             repetition_warning=False):
+                             repetition_warning=False, person_hints=()):
         self.reply_calls.append({
             "static_system": static_system,
             "runtime_system": runtime_system,
@@ -125,6 +125,9 @@ class FakeAI:
             "expression_hints": list(expression_hints),
             "jargon_hints": list(jargon_hints),
             "repetition_warning": repetition_warning,
+            "person_hints": [
+                (name, list(facts)) for name, facts in person_hints
+            ],
         })
         return ReplyDraft("哈哈确实")
 

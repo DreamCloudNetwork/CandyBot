@@ -12,8 +12,8 @@ L3 历史层          只追加、从头整块淘汰的群聊记录，映射为�
                    入库后永不改写，前缀缓存的只追加性质不受影响；
                    direct 多模态的回复调用中，回合可按图片展示形态附原图块）；
 L4 user·指令层     即时信息（精确时间、触发类型、冷却状态、计分、学习注入的
-                   表达/黑话参考、重复回复提醒、临时随机风格、AI 味拦截重写
-                   要求）与本次指令。
+                   表达/黑话参考、人物画像、重复回复提醒、临时随机风格、
+                   AI 味拦截重写要求）与本次指令。
 
 任何时刻都不得把易变字段（秒级时间、计数、分数）塞进 L1/L2，也不得重排或
 重新格式化历史消息——否则其后的缓存全部失效。
@@ -428,6 +428,26 @@ def jargon_hint_block(hints: Sequence[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def person_profile_block(hints: Sequence[tuple[str, Sequence[str]]]) -> str:
+    """L4 人物画像块：本轮相关人物的长期记忆事实（decay 后过阈值的条目）。
+
+    hints 为 (昵称, 事实列表) 序列、按目标优先级排序；每人一行
+    「关于 X：- 事实1 - 事实2」。整块标注为内部参考并带护栏：不得向群友
+    逐字复述或点名宣读，与当前对话冲突时以当前对话为准（画像可能陈旧或
+    有误，当前语境永远优先）。调用方保证非空才传入（一条不过阈值时整块
+    不出现）。
+    """
+    lines = ["【人物画像-内部参考】"]
+    for nickname, facts in hints:
+        rendered = " ".join(f"- {fact}" for fact in facts)
+        lines.append(f"关于 {nickname}：{rendered}")
+    lines.append(
+        "（以下仅供你理解对方，不要向群友逐字复述或点名宣读；"
+        "与当前对话冲突时以当前对话为准。）"
+    )
+    return "\n".join(lines)
+
+
 def repetition_warning_block() -> str:
     """L4 重复提醒块：判定本次很可能在重复自己刚发过的话时注入。"""
     return "【重复提醒】你刚刚已经回复过这条消息，不要和之前的发言重复。"
@@ -462,11 +482,15 @@ def final_user_prompt_reply(
     jargon_hints: Sequence[tuple[str, str]] = (),
     repetition_warning: bool = False,
     temporary_style: str | None = None,
+    person_hints: Sequence[tuple[str, Sequence[str]]] = (),
 ) -> str:
     """L4(reply)：触发原因说明 + 表达/黑话参考（可选） + 重复提醒（可选） + 回复指令。
 
     expression_hints / jargon_hints 是每次回复都可能变化的易变信息，
     只进 L4；两者都为空时输出与引入学习机制之前字节级一致。
+
+    person_hints 为人物长期记忆画像（(昵称, 事实列表)，与表达/黑话参考
+    并列注入）；空时为 None 语义——输出与引入人物记忆之前字节级一致。
 
     repetition_warning=True 时（bot 层判定目标消息之后已有自己的发言、
     对方也没再开口，见 bot._already_replied_to）在【需要回应的消息】之后
@@ -505,6 +529,8 @@ def final_user_prompt_reply(
         parts.append(expression_hint_block(expression_hints))
     if jargon_hints:
         parts.append(jargon_hint_block(jargon_hints))
+    if person_hints:
+        parts.append(person_profile_block(person_hints))
     style = (temporary_style or "").strip()
     if style:
         parts.append(temporary_style_block(style))
@@ -755,6 +781,64 @@ def jargon_compare_inference_prompt(meaning_with_context: str, meaning_alone: st
 
 以 JSON 格式输出，不要输出其他任何内容：
 {{"is_similar": true或false, "reason": "判断理由"}}"""
+
+
+def person_learning_prompt(chat_text: str) -> str:
+    """人物事实抽取指令（任务 3）：从被淘汰的群聊记录里抽取关于群友的
+    稳定事实。硬性规则全部写进提示词：宁缺勿错，绝不硬凑。"""
+    return f"""{chat_text}
+
+（以上是某 QQ 群一段聊天记录，「昵称(QQ号)：内容」逐条给出，前缀为【你自己】的是你本人的发言。）
+
+请从上面这段群聊中抽取**关于其他群友的稳定事实**，用于长期记忆。要求：
+
+1. 只抽取关于其他群友的事实，绝不抽取关于【你自己】的事实；
+2. 只抽长期成立的稳定信息，限这几类：
+   - 身份：学生（如「小明是大三学生，正在考研」）、职业、所在城市；
+   - 长期好恶：如「小红喜欢玩原神」「小刚讨厌吃香菜」；
+   - 群友之间的人际关系：如「小明和小红是室友」；
+   - 与【你自己】有长期意义的约定：如「小美和糖糖约好周末开黑」；
+3. 坚决排除以下内容，出现即不要抽取：
+   - 一时的情绪、单个玩笑、寒暄客套、随口一说；
+   - 转述的网上的话、别人的段子、新闻里的信息；
+   - 任何八卦性隐私：家庭住址、学校全名、工作单位全称、身份证号、
+     手机号、微信号等一律绝不抽取（说「是个学生」可以，说「在某某大学」不行）；
+4. 每条 fact 必须自包含：不用「他/她/这个人」等代词，以主语人名开头，
+   不超过 30 个字；一句话只承载一个事实；
+5. nickname 填这条事实**关于谁**——必须使用聊天里出现过的该群友昵称原文
+   （不带 QQ 号）；拿不准是谁就不要输出这条；
+6. 这段聊天里学不到符合上述要求的稳定事实时，输出空数组 []——
+   宁缺勿错，绝不为凑数编造或放宽标准。
+
+输出要求：
+请仅输出 JSON 数组，不要输出重复内容，不要输出代码块标记。每个元素为一个对象：
+
+[
+  {{"nickname": "小明", "fact": "小明是大三学生，正在准备考研"}},
+  {{"nickname": "小红", "fact": "小红喜欢喝蜜雪冰城"}}
+]
+
+字段说明：
+- nickname：这条事实关于的群友昵称（聊天里出现过的原文）
+- fact：不超过 30 字的自包含陈述句
+
+输出 JSON："""
+
+
+def person_fact_evaluation_prompt(nickname: str, fact: str) -> str:
+    """人物事实可选自审指令（person_self_review，默认关）：把关入库条目
+    是否稳定、非隐私、非玩笑。接口对齐 expression_evaluation_prompt。"""
+    return f"""请评估以下关于群友「{nickname}」的长期记忆事实是否合适入库：
+事实：{fact}
+
+请从以下方面进行评估：
+- 是否是这段对话支撑得起的**稳定事实**（身份、长期好恶、人际关系、长期约定），
+  而不是一时情绪、玩笑、寒暄或转述的网上的话；
+- 是否涉及八卦性隐私（家庭住址、学校全名、工作单位全称、证件号、联系方式等）；
+- 表述是否自包含（带主语人名、不用代词、不超过 30 字）。
+
+请以JSON格式输出评估结果，不要输出其他任何内容：
+{{"suitable": true或false, "reason": "评估理由（如果不合适，请说明原因）"}}"""
 
 
 # ------------------------------------------------ 表情包 smart 选图提示词

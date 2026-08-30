@@ -1,5 +1,5 @@
 """OpenAI 兼容 API 的调用角色：judge（打分）、reply（回复）、vision（转述）、
-learning（群印象/表达/黑话等后台学习任务，未配置时继承 judge 的模型）、
+learning（群印象/表达/黑话/人物事实等后台学习任务，未配置时继承 judge 的模型）、
 embedding（表达语义检索的文本向量化，可选角色，只走 /embeddings 接口）。
 
 每个角色可以来自不同提供商（各自的 base_url / api_key），并可单独配置
@@ -53,6 +53,8 @@ from .prompts import (
     jargon_extraction_prompt,
     jargon_inference_alone_prompt,
     jargon_inference_with_context_prompt,
+    person_fact_evaluation_prompt,
+    person_learning_prompt,
     reply_history_turns,
     sticker_pick_prompt,
 )
@@ -729,6 +731,7 @@ class AIClient:
         expression_hints: Sequence[tuple[str, str]] = (),
         jargon_hints: Sequence[tuple[str, str]] = (),
         repetition_warning: bool = False,
+        person_hints: Sequence[tuple[str, Sequence[str]]] = (),
     ) -> ReplyDraft | None:
         """回复模型生成一句群聊回应；direct 模式下历史与当前消息可携带图片块。
 
@@ -738,7 +741,9 @@ class AIClient:
         expression_hints / jargon_hints 为学习机制产出的注入条目（见
         prompts.final_user_prompt_reply），属于每次回复都可变的易变信息，
         只进 L4 指令层。repetition_warning 同理：bot 层判定很可能在重复
-        刚才的发言时为 True，L4 注入重复提醒。
+        刚才的发言时为 True，L4 注入重复提醒。person_hints 为人物长期记忆
+        画像（(昵称, 事实列表)，learning.pick_person_profiles 产出），同为
+        易变信息只进 L4；为空时输出与引入人物记忆之前字节级一致。
 
         风格多样性与内容拦截两层附加处理（注入都只进 L4，reconsider_reply
         均不走这两层）：
@@ -768,6 +773,7 @@ class AIClient:
                 jargon_hints=jargon_hints,
                 repetition_warning=repetition_warning,
                 temporary_style=temporary_style,
+                person_hints=person_hints,
             )
             return "\n\n".join([text, *retry_notes]) if retry_notes else text
 
@@ -1350,6 +1356,55 @@ class AIClient:
         if isinstance(parsed, dict):
             return parsed.get("suitable") is True
         logger.warning("表达自审输出无法解析：%r", text[:200])
+        return False
+
+    async def learn_person_facts(self, chat_text: str) -> list[tuple[str, str]]:
+        """任务 3：从被淘汰的聊天记录中抽取关于群友的稳定事实。
+
+        返回 (该事实关于谁的昵称, fact) 列表。提示词硬性要求宁缺勿错；
+        解析层再兜一道：昵称与事实都非空才收，**超长的整条丢弃**——
+        fact 截半会产出误导画像的残句，昵称截断还可能撞上另一个人的
+        30 字前缀造成误挂（宁缺勿错），故一律不裁剪（上限均取 30 字，
+        fact 提示词已要求，昵称按 QQ 群名片上限量级）。最多取 10 条。
+        学不到（输出不可解析/空数组）返回空列表。
+        """
+        text = await self._learning_call(
+            person_learning_prompt(chat_text), default_max_tokens=_LEARN_MAX_TOKENS
+        )
+        parsed = _extract_json(text)
+        if not isinstance(parsed, list):
+            if text:
+                logger.warning("人物事实学习输出无法解析：%r", text[:200])
+            return []
+        out: list[tuple[str, str]] = []
+        dropped = 0
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            nickname = str(item.get("nickname") or "").strip()
+            fact = str(item.get("fact") or "").strip()
+            if not nickname or not fact:
+                continue
+            # 超长整条丢弃，不裁剪（见本方法 docstring：宁缺勿错）
+            if len(nickname) > 30 or len(fact) > 30:
+                dropped += 1
+                continue
+            out.append((nickname, fact))
+        if dropped:
+            logger.debug("人物事实学习：丢弃超长候选 %d 条", dropped)
+        return out[:10]
+
+    async def review_person_fact(self, nickname: str, fact: str) -> bool:
+        """任务 3 可选自审（person_self_review，默认关）：只有明确
+        suitable=true 才通过（歧义一律拒收，与表达自审同口径）。"""
+        text = await self._learning_call(
+            person_fact_evaluation_prompt(nickname, fact),
+            default_max_tokens=_REVIEW_MAX_TOKENS,
+        )
+        parsed = _extract_json(text)
+        if isinstance(parsed, dict):
+            return parsed.get("suitable") is True
+        logger.warning("人物事实自审输出无法解析：%r", text[:200])
         return False
 
     async def extract_jargon_terms(self, chat_text: str) -> list[str]:
